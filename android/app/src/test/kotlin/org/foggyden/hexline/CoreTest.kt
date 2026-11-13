@@ -8,6 +8,6 @@ class CoreTest {
     @Test
     fun theCoreAnswersThroughItsBindings() {
         val version = coreVersion()
-        assertTrue(version, Regex("""\d+\.\d+\.\d+""").matches(version + "x"))
+        assertTrue(version, Regex("""\d+\.\d+\.\d+""").matches(version))
     }
 }
