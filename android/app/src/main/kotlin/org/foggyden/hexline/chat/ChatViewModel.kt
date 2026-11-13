@@ -32,14 +32,14 @@ class ChatViewModel : ViewModel() {
         login: String?,
         password: String?,
     ) {
-        if (state.value.link == Link.Connecting || state.value.link == Link.Live) return
+        if (state.value.link.let { it == Link.Connecting || it == Link.Live || it is Link.Reconnecting }) return
         state.value = ChatState(link = Link.Connecting)
         connection?.close()
         val conn = ServerConnection(url, sink)
         connection = conn
         viewModelScope.launch {
             try {
-                conn.login(login, password)
+                conn.login(login, password, null)
                 loadEarlier()
             } catch (e: CoreException) {
                 state.update { it.copy(link = Link.Ended(why(e))) }
@@ -88,9 +88,10 @@ class ChatViewModel : ViewModel() {
     }
 
     // The scope is already cancelled here, so nothing suspends: hang up and
-    // let the core finish on its own threads.
+    // let the core finish on its own threads. Logged out, since nothing
+    // keeps the session to resume yet.
     override fun onCleared() {
-        connection?.hangUp()
+        connection?.hangUp(true)
         connection?.close()
         connection = null
     }
@@ -98,13 +99,7 @@ class ChatViewModel : ViewModel() {
     private fun why(e: CoreException): Why =
         when (e) {
             is CoreException.Connect -> Why.Unreachable
-            is CoreException.Refused ->
-                when (e.code) {
-                    "login_failed" -> Why.WrongPassword
-                    "banned" -> Why.Banned
-                    "server_full" -> Why.Full
-                    else -> Why.Refused(e.code)
-                }
+            is CoreException.Refused -> refusal(e.code)
             is CoreException.Protocol -> Why.NotUnderstood
             is CoreException.Closed, is CoreException.Busy -> Why.Lost
         }

@@ -8,6 +8,7 @@
     <string name="connect">Connect</string>
     <string name="connecting">Connecting…</string>
     <string name="disconnect">Leave</string>
+    <string name="reconnecting">Reconnecting…</string>
     <string name="people">People (%1$d)</string>
     <string name="say_something">Say something</string>
     <string name="send">Send</string>

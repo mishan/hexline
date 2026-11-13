@@ -28,6 +28,17 @@ sealed interface Why {
     ) : Why
 }
 
+/** A server's refusal, as the person is told it. */
+fun refusal(code: String): Why =
+    when (code) {
+        "login_failed" -> Why.WrongPassword
+        "kicked" -> Why.Kicked
+        "replaced" -> Why.Replaced
+        "banned" -> Why.Banned
+        "server_full" -> Why.Full
+        else -> Why.Refused(code)
+    }
+
 /** Where the connection stands, as the screen shows it. */
 sealed interface Link {
     data object Idle : Link
@@ -35,6 +46,11 @@ sealed interface Link {
     data object Connecting : Link
 
     data object Live : Link
+
+    /** The link went and the core is getting it back: still the chat. */
+    data class Reconnecting(
+        val attempt: UInt,
+    ) : Link
 
     /** Ended: `why` for the person, null when they ended it themselves. */
     data class Ended(
@@ -85,6 +101,8 @@ data class ChatState(
     val kicked: Boolean = false,
     /** The person chose to leave: the close that follows is no failure. */
     val leaving: Boolean = false,
+    /** What the server said when it would not take the session back. */
+    val refused: String? = null,
     private val nextKey: Long = 0,
 ) {
     private val shownIds: Set<ULong> by lazy { entries.mapNotNullTo(HashSet()) { (it as? Entry.Line)?.line?.id } }
@@ -110,6 +128,9 @@ data class ChatState(
             is CoreUpdate.Notice -> if (update.room == null) appended { Entry.Notice(it, update.text) } else this
             is CoreUpdate.Broadcast -> appended { Entry.Broadcast(it, update.nick, update.text) }
             is CoreUpdate.Kicked -> copy(kicked = true)
+            is CoreUpdate.Reconnecting -> copy(link = Link.Reconnecting(update.attempt))
+            is CoreUpdate.Reconnected -> copy(link = Link.Live)
+            is CoreUpdate.Refused -> copy(refused = update.code)
             is CoreUpdate.Closed ->
                 copy(
                     link =
@@ -118,6 +139,7 @@ data class ChatState(
                                 kicked -> Why.Kicked
                                 update.replaced -> Why.Replaced
                                 leaving -> null
+                                refused != null -> refusal(refused)
                                 else -> Why.Lost
                             },
                         ),

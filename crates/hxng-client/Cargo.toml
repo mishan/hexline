@@ -12,7 +12,7 @@ publish = false
 # The driver: a WebSocket over TLS, run on tokio.
 tokio = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls", "dep:rustls-platform-verifier"]
 # The tests against a real hxd, named by HXD_BIN.
-live-tests = ["tokio", "tokio/process"]
+live-tests = ["tokio", "tokio/process", "tokio/io-util"]
 
 [dependencies]
 serde = { workspace = true }

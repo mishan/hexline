@@ -18,7 +18,7 @@ class ConnectionTest {
     fun aServerThatIsNotThereIsAConnectError() {
         val port = ServerSocket(0).use { it.localPort }
         val connection = ServerConnection("ws://127.0.0.1:$port/ng", Nowhere)
-        val error = runCatching { runBlocking { connection.login("alice", "pw") } }.exceptionOrNull()
+        val error = runCatching { runBlocking { connection.login("alice", "pw", null) } }.exceptionOrNull()
         assertTrue("$error", error is CoreException.Connect)
     }
 }

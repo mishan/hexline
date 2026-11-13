@@ -40,6 +40,9 @@ const HANDSHAKE: Duration = Duration::from_secs(20);
 /// connection as a slow consumer, which is the bound the protocol wants
 /// rather than this process's memory.
 const UPDATES: usize = 1024;
+/// How long a close is given to be sent: a link too dead to take it is
+/// dropped instead.
+const CLOSING: Duration = Duration::from_secs(5);
 
 /// How a connection begins.
 #[derive(Debug, Clone)]
@@ -247,7 +250,7 @@ async fn run(
             () = sleep_until(deadline) => break,
             // Nobody is listening: the app dropped its updates.
             () = updates.closed() => {
-                let _ = ws.close(None).await;
+                let _ = timeout(CLOSING, ws.close(None)).await;
                 code = u16::from(CloseCode::Normal);
                 break;
             }
@@ -256,7 +259,7 @@ async fn run(
                     Ok(Output::Event { seq, ev, data }) => {
                         deadline = Instant::now() + SILENCE;
                         if updates.send(Update::Event { seq, ev, data }).await.is_err() {
-                            let _ = ws.close(None).await;
+                            let _ = timeout(CLOSING, ws.close(None)).await;
                             code = u16::from(CloseCode::Normal);
                             break;
                         }
@@ -286,7 +289,7 @@ async fn run(
                     Ok(_) => {}
                     Err(e) => {
                         error = Some(e);
-                        let _ = ws.close(None).await;
+                        let _ = timeout(CLOSING, ws.close(None)).await;
                         break;
                     }
                 },
@@ -296,7 +299,7 @@ async fn run(
                         reason = f.reason.to_string();
                     }
                     // Answered, so the server sees a close and not a drop.
-                    let _ = ws.close(None).await;
+                    let _ = timeout(CLOSING, ws.close(None)).await;
                     break;
                 }
                 // A ping, pong or binary frame says the link is alive.
@@ -305,7 +308,7 @@ async fn run(
             },
             cmd = cmds.recv() => {
                 let Some(cmd) = cmd.filter(|c| !matches!(c, Cmd::Close)) else {
-                    let _ = ws.close(None).await;
+                    let _ = timeout(CLOSING, ws.close(None)).await;
                     code = u16::from(CloseCode::Normal);
                     break;
                 };
@@ -321,7 +324,7 @@ async fn run(
                     Cmd::Close => unreachable!("handled above"),
                 };
                 waiters.insert(id, waiter);
-                if ws.send(Message::text(frame)).await.is_err() {
+                if !matches!(timeout(SILENCE, ws.send(Message::text(frame))).await, Ok(Ok(()))) {
                     break;
                 }
             }
