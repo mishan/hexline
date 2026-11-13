@@ -400,6 +400,9 @@ impl ServerConnection {
                         } => Some(*logout),
                         _ => {
                             let info = link.info.clone();
+                            // Before the answer: a request made as soon as
+                            // login returns has a link to go on.
+                            *shared.client.lock().unwrap() = Some(link.client.clone());
                             let (control, rx) = mpsc::unbounded_channel();
                             let (done_tx, done) = watch::channel(());
                             RUNTIME.spawn(async move {
