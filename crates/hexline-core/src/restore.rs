@@ -144,7 +144,7 @@ async fn restore(
         ),
     };
     let successor = Card::parse(&card).ok().and_then(|c| c.successor);
-    let (card, attested) = match reattest(&http, &reg, &register, &id, handle, successor).await {
+    let (card, attested) = match reattest(&http, &reg, &register, &id, handle, successor).await? {
         Some(attestation) => (with_attestation(&id, &card, &attestation)?, true),
         None => (card, false),
     };
@@ -246,7 +246,9 @@ async fn discovered(
     )
     .await?;
     if status == 429 {
-        return Err(CoreError::RateLimited { retry_after: None });
+        return Err(CoreError::RateLimited {
+            retry_after: retry_after(&body),
+        });
     }
     let doc = (status == 200)
         .then(|| serde_json::from_slice::<Value>(&body).ok())
@@ -283,7 +285,8 @@ async fn discovered(
 /// identity key is in hand to ask for it (§6.1's reissue): the card a
 /// server is shown carries it, and with none a server's default policy
 /// lets the identity in as a guest alone. `None` if the registrar would
-/// not reissue, which leaves the card as it was.
+/// not reissue, which leaves the card as it was; asked too often, the
+/// restore waits, since a device restored now would be let in as a guest.
 async fn reattest(
     http: &hxng_client::reqwest::Client,
     reg: &Registrar,
@@ -291,7 +294,7 @@ async fn reattest(
     id: &IdentityKey,
     handle: &str,
     successor: Option<[u8; 32]>,
-) -> Option<Vec<u8>> {
+) -> Result<Option<Vec<u8>>, CoreError> {
     // The commitment the registrar holds is the card's: a request that
     // dropped it would be refused.
     let request = RegisterRequest {
@@ -303,16 +306,25 @@ async fn reattest(
         proof: None,
     }
     .sign(id)
-    .ok()?;
-    let reply = auth::post(http, register, Some(json!({ "request": b64(&request) })))
-        .await
-        .ok()?;
-    let signed = bytes(&reply, "attestation").ok()?;
-    let att = Attestation::parse(&signed).ok()?;
-    (att.identity == id.public()
-        && att.registrar == reg.host
-        && reg.keys.contains(&att.registrar_key))
-    .then_some(signed)
+    .map_err(|e| protocol(&e.to_string()))?;
+    let reply = match auth::post(http, register, Some(json!({ "request": b64(&request) }))).await {
+        Ok(reply) => reply,
+        Err(e) => {
+            return match CoreError::from(e) {
+                limited @ CoreError::RateLimited { .. } => Err(limited),
+                _ => Ok(None),
+            }
+        }
+    };
+    let Ok(signed) = bytes(&reply, "attestation") else {
+        return Ok(None);
+    };
+    let ours = Attestation::parse(&signed).is_ok_and(|att| {
+        att.identity == id.public()
+            && att.registrar == reg.host
+            && reg.keys.contains(&att.registrar_key)
+    });
+    Ok(ours.then_some(signed))
 }
 
 /// `card` re-signed with `attestation` in place of any other for the
@@ -357,9 +369,20 @@ async fn card_kept(
         200 if Card::parse(&body).is_ok_and(|c| c.identity == *identity) => Ok(Some(body)),
         200 => Err(protocol("the registrar's card is not this identity's")),
         404 => Ok(None),
-        429 => Err(CoreError::RateLimited { retry_after: None }),
+        429 => Err(CoreError::RateLimited {
+            retry_after: retry_after(&body),
+        }),
         _ => Err(refused("server_error")),
     }
+}
+
+/// The wait a 429's body asks for, flat or under `error` as the registrar
+/// and the ng port each put it.
+fn retry_after(body: &[u8]) -> Option<u64> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    v.get("retry_after")
+        .or_else(|| v.get("error").and_then(|e| e.get("retry_after")))
+        .and_then(Value::as_u64)
 }
 
 /// Now, less the clock skew a server allows: a phone's clock ahead of the
@@ -416,6 +439,22 @@ fn protocol(detail: &str) -> CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_429s_wait_is_read_wherever_its_body_puts_it() {
+        let cases: [(&[u8], Option<u64>); 4] = [
+            (br#"{"error":"rate_limited","retry_after":60}"#, Some(60)),
+            (
+                br#"{"error":{"code":"rate_limited","retry_after":5}}"#,
+                Some(5),
+            ),
+            (br#"{"error":"rate_limited"}"#, None),
+            (b"Too many requests", None),
+        ];
+        for (body, want) in cases {
+            assert_eq!(retry_after(body), want, "{}", String::from_utf8_lossy(body));
+        }
+    }
 
     #[test]
     fn a_registrar_is_reached_at_an_origin_and_plain_http_only_here() {
