@@ -383,3 +383,9 @@ Slices, in order:
 
 Identity's HTTP steps use `reqwest` with rustls on `ring`, handed the
 same platform-verified config as the WebSocket.
+
+Identity login is allowed over plain `ws://` (decided 2026-11-13), as a
+password login is: the proof is bound to the host, so the device key is
+not exposed, but the one-use token is. Over `ws://` to another machine
+the auth body says `downstream: "cleartext"`, so the session is not
+shown to others as encrypted.
