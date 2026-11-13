@@ -7,7 +7,9 @@ mod model;
 #[cfg(target_os = "android")]
 mod tls;
 
-pub use connection::{CoreError, CoreUpdate, LoginInfo, ServerConnection, UpdateSink};
+pub use connection::{
+    CoreError, CoreUpdate, DeviceIdentity, LoginInfo, ServerConnection, UpdateSink,
+};
 pub use model::{ChatLine, HistoryPage, Status, User};
 
 uniffi::setup_scaffolding!();

@@ -25,6 +25,7 @@ use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 use crate::{
     ErrorReply, LoginParams, Lost, Output, ProtocolError, Resumable, Session, StateError, SyncOk,
+    Token,
 };
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -135,6 +136,29 @@ pub async fn connect(
     start: &Start,
     tls: Option<Arc<rustls::ClientConfig>>,
 ) -> Result<(Client, Output, Updates), Error> {
+    connect_with(url, start, tls, None).await
+}
+
+/// [`connect`], presenting `token` on the upgrade (hotline-ng-auth.md
+/// §7.1): the socket is the identity's that [`crate::auth`] proved.
+pub async fn connect_with(
+    url: &str,
+    start: &Start,
+    tls: Option<Arc<rustls::ClientConfig>>,
+    token: Option<&Token>,
+) -> Result<(Client, Output, Updates), Error> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut upgrade = url
+        .into_client_request()
+        .map_err(|e| Error::Connect(e.to_string()))?;
+    if let Some(token) = token {
+        let mut bearer: tokio_tungstenite::tungstenite::http::HeaderValue =
+            format!("Bearer {}", token.expose())
+                .parse()
+                .map_err(|_| Error::Connect("the token is not a header value".into()))?;
+        bearer.set_sensitive(true);
+        upgrade.headers_mut().insert("authorization", bearer);
+    }
     let tls = match tls {
         Some(t) => Some(t),
         None if url.starts_with("wss:") => Some(platform_tls()?),
@@ -154,7 +178,7 @@ pub async fn connect(
     };
     let handshake = async {
         let (mut ws, _) = tokio_tungstenite::connect_async_tls_with_config(
-            url,
+            upgrade,
             None,
             false,
             tls.map(Connector::Rustls),

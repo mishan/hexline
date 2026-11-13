@@ -355,3 +355,31 @@ flavor: the `fdroid` build has none.
    parameters are fixed; a put names its registrar.
 5. Milestones: M1 password login, chat and resume; then identity, push,
    news and the rest.
+
+## 9. Milestone 2: identity (decided 2026-11-13)
+
+Tier: critical. Mutation testing on the core's identity code and a
+security pass close the milestone.
+
+Slices, in order:
+
+1. **Identity login in the core.** Discovery of the HTTP base from the
+   ng URL. A challenge, then the server's signature on it for the host
+   addressed, checked before anything is signed. Then the device's
+   login proof, `/identity/auth`, and the token presented on the
+   upgrade. Every new login proves the device again. A resume does not.
+2. **Device keys at rest:** seeds made in Rust, wrapped under Key A,
+   with cert, card and handle beside them.
+3. **Envelope mode,** the first way onto a phone: handle and passphrase
+   (or recovery code), salt lookup, fetch, unwrap, mint the device's own
+   cert, drop the identity seed. Renewal asks again.
+4. **Identity in the UI:** a server's sign-in choice, account linking,
+   "revoked", renewal, and screens that need `manage`.
+5. **Enrolled-device mode** by typed code. A QR scanner (ZXing core,
+   Apache-2.0) comes later.
+6. **Holder mode:** 6a Key B behind a per-use prompt; 6b creation with
+   the successor and recovery codes; 6c self-renewal and revoking lost
+   devices.
+
+Identity's HTTP steps use `reqwest` with rustls on `ring`, handed the
+same platform-verified config as the WebSocket.

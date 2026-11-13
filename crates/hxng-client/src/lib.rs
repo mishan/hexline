@@ -6,6 +6,8 @@
 //! is found where it happens rather than as a roster that drifted.
 
 #[cfg(feature = "tokio")]
+pub mod auth;
+#[cfg(feature = "tokio")]
 pub mod driver;
 mod frame;
 mod handshake;
