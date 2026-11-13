@@ -2,4 +2,14 @@
 <resources>
     <string name="app_name">Hexline</string>
     <string name="core_version">Core %1$s</string>
+    <string name="server_address">Server (ws:// or wss://)</string>
+    <string name="login">Login</string>
+    <string name="password">Password</string>
+    <string name="connect">Connect</string>
+    <string name="connecting">Connecting…</string>
+    <string name="disconnect">Leave</string>
+    <string name="people">People (%1$d)</string>
+    <string name="say_something">Say something</string>
+    <string name="send">Send</string>
+    <string name="line_removed">(removed)</string>
 </resources>
