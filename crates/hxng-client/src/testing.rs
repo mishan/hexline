@@ -103,6 +103,23 @@ impl Server {
         identity: Option<(&str, &str)>,
         registrar: bool,
     ) -> Server {
+        // A port found free is free only until it is bound: another test's
+        // server may take it first. Each try is on fresh ports, and taken
+        // only once the server there is this one.
+        for _ in 0..5 {
+            if let Some(server) = Server::try_launch(accounts, grace, identity, registrar).await {
+                return server;
+            }
+        }
+        panic!("hxd never came up on ports of its own");
+    }
+
+    async fn try_launch(
+        accounts: &[&str],
+        grace: u64,
+        identity: Option<(&str, &str)>,
+        registrar: bool,
+    ) -> Option<Server> {
         let bin = std::env::var("HXD_BIN").expect(
             "HXD_BIN must name an hxd binary for the live tests (`make test-live` sets it)",
         );
@@ -164,7 +181,7 @@ impl Server {
             .kill_on_drop(true)
             .spawn()
             .unwrap_or_else(|e| panic!("{bin}: {e}"));
-        let server = Server {
+        let mut server = Server {
             _proc: proc,
             _dir: TempDir(dir),
             url: format!("ws://127.0.0.1:{ng}/ng"),
@@ -172,10 +189,17 @@ impl Server {
             http: format!("http://127.0.0.1:{ng}"),
             proxy: Mutex::new(Some(proxy)),
         };
+        let http = crate::auth::http_client(&server.http, None).unwrap();
+        let discovery = format!("{}/.well-known/hotline", server.http);
         for _ in 0..200 {
-            if let Ok(s) = tokio::net::TcpStream::connect(("127.0.0.1", ng)).await {
-                drop(s);
-                return server;
+            // Gone: it lost a port to another test's server.
+            if server._proc.try_wait().ok().flatten().is_some() {
+                return None;
+            }
+            if let Ok((200, body)) = crate::auth::get(&http, &discovery).await {
+                let doc: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                // Another test's server, on the port this one was to have.
+                return (doc["name"] == name.as_str()).then_some(server);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
