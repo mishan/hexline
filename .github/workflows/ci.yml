@@ -1,6 +1,6 @@
 # Hexline CI: the Rust core's format, lints and tests; the app's format,
-# lint, JVM tests and both flavors' builds; and, on main alone while the
-# repository is private, the instrumented tests on an emulator.
+# lint, JVM tests and both flavors' builds; and the instrumented tests on
+# an emulator.
 
 name: CI
 
@@ -75,9 +75,7 @@ jobs:
         working-directory: android
         run: ./gradlew --no-daemon ktlintCheck :app:lintFdroidDebug :app:lintPlayDebug :app:testFdroidDebugUnitTest :app:assembleFdroidDebug :app:assemblePlayDebug
 
-  # Emulator minutes are the costly ones on a private repository.
   emulator:
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
