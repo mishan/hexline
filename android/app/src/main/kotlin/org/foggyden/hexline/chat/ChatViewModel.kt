@@ -34,6 +34,7 @@ class ChatViewModel : ViewModel() {
     ) {
         if (state.value.link == Link.Connecting || state.value.link == Link.Live) return
         state.value = ChatState(link = Link.Connecting)
+        connection?.close()
         val conn = ServerConnection(url, sink)
         connection = conn
         viewModelScope.launch {
@@ -41,7 +42,7 @@ class ChatViewModel : ViewModel() {
                 conn.login(login, password)
                 loadEarlier()
             } catch (e: CoreException) {
-                state.update { it.copy(link = Link.Ended(describe(e))) }
+                state.update { it.copy(link = Link.Ended(why(e))) }
             }
         }
     }
@@ -53,7 +54,7 @@ class ChatViewModel : ViewModel() {
             try {
                 conn.chat(text)
             } catch (e: CoreException) {
-                state.update { it.copy(entries = it.entries + Entry.Notice("Not sent: ${describe(e)}")) }
+                state.update { it.notSent(why(e)) }
             }
         }
     }
@@ -62,15 +63,18 @@ class ChatViewModel : ViewModel() {
 
     fun loadEarlier() {
         val conn = connection ?: return
-        if (loading || !state.value.earlierToLoad) return
+        if (loading || !state.value.earlierToLoad || state.value.link != Link.Live) return
         loading = true
         viewModelScope.launch {
             try {
                 val page = conn.history(state.value.oldestId, null, PAGE)
                 state.update { it.withEarlier(page.lines, page.hasMore) }
             } catch (e: CoreException) {
-                // A server without history has none to load; that is not news.
-                state.update { it.copy(earlierToLoad = false) }
+                // A server that keeps no history has none to load; anything
+                // else is worth trying again when the reader scrolls back.
+                if (e is CoreException.Refused && e.code == "not_available") {
+                    state.update { it.copy(earlierToLoad = false) }
+                }
             } finally {
                 loading = false
             }
@@ -79,26 +83,30 @@ class ChatViewModel : ViewModel() {
 
     fun disconnect() {
         val conn = connection ?: return
+        state.update { it.copy(leaving = true) }
         viewModelScope.launch { conn.disconnect() }
     }
 
+    // The scope is already cancelled here, so nothing suspends: hang up and
+    // let the core finish on its own threads.
     override fun onCleared() {
-        connection?.let { conn -> viewModelScope.launch { conn.disconnect() } }
+        connection?.hangUp()
+        connection?.close()
+        connection = null
     }
 
-    private fun describe(e: CoreException): String =
+    private fun why(e: CoreException): Why =
         when (e) {
-            is CoreException.Connect -> "The server could not be reached."
+            is CoreException.Connect -> Why.Unreachable
             is CoreException.Refused ->
                 when (e.code) {
-                    "login_failed" -> "Wrong login or password."
-                    "banned" -> "You are banned from this server."
-                    "server_full" -> "The server is full."
-                    else -> "The server said no (${e.code})."
+                    "login_failed" -> Why.WrongPassword
+                    "banned" -> Why.Banned
+                    "server_full" -> Why.Full
+                    else -> Why.Refused(e.code)
                 }
-            is CoreException.Protocol -> "The server sent something this app does not understand."
-            is CoreException.Closed -> "Not connected."
-            is CoreException.Busy -> "Already connected."
+            is CoreException.Protocol -> Why.NotUnderstood
+            is CoreException.Closed, is CoreException.Busy -> Why.Lost
         }
 
     private companion object {

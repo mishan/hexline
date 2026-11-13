@@ -12,4 +12,19 @@
     <string name="say_something">Say something</string>
     <string name="send">Send</string>
     <string name="line_removed">(removed)</string>
+    <string name="action">* %1$s %2$s</string>
+    <string name="broadcast">%1$s: %2$s</string>
+    <string name="not_sent">Not sent: %1$s</string>
+    <string name="you">(you)</string>
+    <string name="away">away</string>
+    <string name="admin">administrator</string>
+    <string name="why_kicked">You were disconnected by the server.</string>
+    <string name="why_replaced">This session was opened somewhere else.</string>
+    <string name="why_lost">The connection was lost.</string>
+    <string name="why_unreachable">The server could not be reached.</string>
+    <string name="why_wrong_password">Wrong login or password.</string>
+    <string name="why_banned">You are banned from this server.</string>
+    <string name="why_full">The server is full.</string>
+    <string name="why_not_understood">The server sent something this app does not understand.</string>
+    <string name="why_refused">The server said no (%1$s).</string>
 </resources>

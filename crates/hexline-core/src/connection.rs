@@ -309,6 +309,17 @@ impl ServerConnection {
             let _ = pump.await;
         }
     }
+
+    /// Ends the connection without waiting: for a caller with no time
+    /// left, such as an app whose screen is going away. The last update is
+    /// still delivered, on a core thread.
+    pub fn hang_up(&self) {
+        if let State::Live { client, .. } =
+            std::mem::replace(&mut *self.state.lock().unwrap(), State::Idle)
+        {
+            client.close();
+        }
+    }
 }
 
 impl ServerConnection {
