@@ -82,8 +82,17 @@ class ChatStateTest {
                 live.after(CoreUpdate.Closed(false, true)) to Why.Replaced,
                 live.after(CoreUpdate.Closed(true, false)) to Why.Lost,
                 live.copy(leaving = true).after(CoreUpdate.Closed(true, false)) to null,
+                live.after(CoreUpdate.Refused("login_failed"), CoreUpdate.Closed(false, false)) to Why.WrongPassword,
             )
         for ((s, why) in cases) assertEquals(Link.Ended(why), s.link)
+    }
+
+    @Test
+    fun aLinkBeingGotBackIsStillTheChatUntilItIsBack() {
+        val s = live.after(CoreUpdate.Reconnecting(2u))
+        assertEquals(Link.Reconnecting(2u), s.link)
+        assertEquals(live.users, s.users)
+        assertEquals(Link.Live, s.after(CoreUpdate.Reconnected(false)).link)
     }
 
     @Test

@@ -161,6 +161,16 @@ fun ChatScreen(
                     .consumeWindowInsets(padding)
                     .imePadding(),
             ) {
+                if (state.link is Link.Reconnecting) {
+                    Text(
+                        stringResource(R.string.reconnecting),
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(8.dp)
+                            .semantics { liveRegion = LiveRegionMode.Polite },
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                }
                 Transcript(state, onLoadEarlier, Modifier.weight(1f))
                 Composer(onSend)
             }

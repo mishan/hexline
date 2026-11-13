@@ -27,7 +27,7 @@ class MainActivity : ComponentActivity() {
 fun Hexline(chat: ChatViewModel) {
     val state by chat.chat.collectAsStateWithLifecycle()
     when (val link = state.link) {
-        Link.Live -> ChatScreen(state, chat::send, chat::loadEarlier, chat::disconnect)
+        Link.Live, is Link.Reconnecting -> ChatScreen(state, chat::send, chat::loadEarlier, chat::disconnect)
         else ->
             ConnectScreen(
                 error = (link as? Link.Ended)?.why,
