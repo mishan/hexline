@@ -92,6 +92,11 @@ impl Server {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        panic!("hxd did not listen on {ng}");
+        let log = std::fs::read_to_string(server._dir.0.join("hxd.log")).unwrap_or_default();
+        let tail: Vec<&str> = log.lines().rev().take(20).collect();
+        panic!(
+            "hxd did not listen on {ng}; its log ends:\n{}",
+            tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+        );
     }
 }
