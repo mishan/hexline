@@ -21,6 +21,8 @@ pub struct Server {
     pub url: String,
     /// The ng port.
     pub addr: SocketAddr,
+    /// Its HTTP base, where identity and the registrar answer.
+    pub http: String,
     /// The listener a [`Proxy`] in front of it takes, bound from the start
     /// so no other test's server can take its port; an identity server
     /// answers as its host too, so a device proved through it is proved
@@ -66,24 +68,35 @@ impl Server {
 
     /// As [`Server::start`], with detached sessions kept `grace` seconds.
     pub async fn with_grace(accounts: &[&str], grace: u64) -> Server {
-        Server::launch(accounts, grace, None).await
+        Server::launch(accounts, grace, None, false).await
     }
 
     /// As [`Server::with_grace`], taking identity logins at the host it
     /// listens on and its proxy's: from any identity, registrar or none,
     /// made an account of its own when the client asks for one.
     pub async fn with_identity(accounts: &[&str], grace: u64) -> Server {
-        Server::launch(accounts, grace, Some(("allow", "create"))).await
+        Server::launch(accounts, grace, Some(("allow", "create")), false).await
+    }
+
+    /// As [`Server::with_identity`], and a registrar at host `127.0.0.1`
+    /// that anyone may register a handle at and that keeps envelopes.
+    pub async fn with_registrar(accounts: &[&str]) -> Server {
+        Server::launch(accounts, 300, Some(("allow", "create")), true).await
     }
 
     /// As [`Server::with_identity`], under the default policy: an identity
     /// no registrar vouches for, or one with no account, logs in as a guest.
     pub async fn with_guest_identity(accounts: &[&str]) -> Server {
-        Server::launch(accounts, 300, Some(("guest", "guest"))).await
+        Server::launch(accounts, 300, Some(("guest", "guest")), false).await
     }
 
     /// `identity` is the `unattested` and `new_accounts` policies.
-    async fn launch(accounts: &[&str], grace: u64, identity: Option<(&str, &str)>) -> Server {
+    async fn launch(
+        accounts: &[&str],
+        grace: u64,
+        identity: Option<(&str, &str)>,
+        registrar: bool,
+    ) -> Server {
         let bin = std::env::var("HXD_BIN").expect(
             "HXD_BIN must name an hxd binary for the live tests (`make test-live` sets it)",
         );
@@ -116,6 +129,12 @@ impl Server {
                          unattested = \"{unattested}\"\nnew_accounts = \"{new_accounts}\"\n"
                     ),
                     None => String::new(),
+                } + if registrar {
+                    "[registrar]\nhost = \"127.0.0.1\"\nkey = \"registrar.key\"\n\
+                     store = \"registrar.db\"\ninvites = \"invites\"\nsignup = \"open\"\n\
+                     envelopes = true\nenvelope_secret = \"envelope.secret\"\n"
+                } else {
+                    ""
                 }
             ),
         )
@@ -134,6 +153,7 @@ impl Server {
             _dir: TempDir(dir),
             url: format!("ws://127.0.0.1:{ng}/ng"),
             addr: SocketAddr::from(([127, 0, 0, 1], ng)),
+            http: format!("http://127.0.0.1:{ng}"),
             proxy: Mutex::new(Some(proxy)),
         };
         for _ in 0..200 {
@@ -285,4 +305,55 @@ async fn mangle_first(
         first[at..at + needle.len()].copy_from_slice(b"x-stripped-by:");
     }
     server.write_all(&first).await
+}
+
+/// Register `handle` for a new identity at `server`'s registrar and put
+/// its key there sealed under `secret`, as `hlid register` and `hlid
+/// backup` would.
+pub async fn back_up(
+    server: &Server,
+    handle: &str,
+    secret: &hl_identity::envelope::Secret<'_>,
+) -> hl_identity::IdentityKey {
+    use hl_identity::{EnvelopePut, IdentityKey, KeyEnvelope, RegisterRequest};
+    let b64 = |b: &[u8]| {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let id = IdentityKey::generate();
+    let http = crate::auth::http_client(&server.http, None).unwrap();
+    let register = RegisterRequest {
+        identity: id.public(),
+        registrar: "127.0.0.1".into(),
+        handle: handle.into(),
+        time: now,
+        successor: None,
+        proof: None,
+    };
+    let req = serde_json::json!({ "request": b64(&register.sign(&id).unwrap()) });
+    crate::auth::post(
+        &http,
+        &format!("{}/registrar/register", server.http),
+        Some(req),
+    )
+    .await
+    .unwrap();
+    let (envelope, keys) = KeyEnvelope::seal(&id, secret).unwrap();
+    let put = EnvelopePut::store(&id, "127.0.0.1", now, &envelope, &keys).unwrap();
+    let resp = http
+        .put(format!("{}/registrar/envelopes", server.http))
+        .json(&serde_json::json!({ "request": b64(&put) }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "{}",
+        resp.text().await.unwrap_or_default()
+    );
+    id
 }

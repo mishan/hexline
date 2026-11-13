@@ -5,6 +5,7 @@
 mod connection;
 mod identity;
 mod model;
+mod restore;
 #[cfg(target_os = "android")]
 mod tls;
 
@@ -13,6 +14,7 @@ pub use connection::{
 };
 pub use identity::{cert_for_device, cert_info, new_device, CertInfo, NewDevice};
 pub use model::{ChatLine, HistoryPage, Status, User};
+pub use restore::{restore_identity, Restored, SecretKind};
 
 uniffi::setup_scaffolding!();
 

@@ -303,6 +303,7 @@ class ChatViewModel(
             is CoreException.Connect -> Why.Unreachable
             is CoreException.Refused -> refusal(e.code)
             is CoreException.Protocol -> Why.NotUnderstood
+            is CoreException.RateLimited -> Why.Refused("rate_limited")
             is CoreException.Closed, is CoreException.Busy -> Why.Lost
         }
 

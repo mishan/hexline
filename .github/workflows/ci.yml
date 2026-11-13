@@ -33,11 +33,13 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo test -p hxng-client --features tokio --locked --lib
 
-  # The driver against hxd's last release, built from its tag.
+  # The driver against hxd, built from a commit of its main: the
+  # registrar's envelopes the identity tests need are in no release yet.
+  # Moved forward deliberately, as hxd-ng moves the pins it relies on.
   live:
     runs-on: ubuntu-latest
     env:
-      HXD_TAG: v0.3.0
+      HXD_REV: 760645198bb66a526bcaded822b51096427edbbc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
@@ -46,10 +48,10 @@ jobs:
         id: hxd
         with:
           path: ~/.hxd
-          key: hxd-${{ env.HXD_TAG }}-inbox-${{ runner.os }}-${{ env.ImageOS }}
+          key: hxd-${{ env.HXD_REV }}-inbox-${{ runner.os }}-${{ env.ImageOS }}
       - if: steps.hxd.outputs.cache-hit != 'true'
         # inbox brings the SQLite store the tests' chat history is kept in.
-        run: cargo install --locked --no-default-features --features inbox --git https://github.com/mishan/hxd-ng --tag "$HXD_TAG" hxd --root ~/.hxd
+        run: cargo install --locked --no-default-features --features inbox --git https://github.com/mishan/hxd-ng --rev "$HXD_REV" hxd --root ~/.hxd
       - run: HXD_BIN=~/.hxd/bin/hxd make test-live
 
   android:
