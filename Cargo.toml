@@ -12,6 +12,8 @@ uniffi = "0.32"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zeroize = "1"
+# hxd-ng's pin, advanced with it.
+hl-identity = { git = "https://github.com/mishan/hx-libs.git", rev = "8cb5063c644972051492b1e1eab55e636f18a77d" }
 
 # What every phone downloads, so it is built small.
 [profile.release]

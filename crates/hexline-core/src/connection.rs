@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
+use hxng_client::auth::{self, Device};
 use hxng_client::driver::{self, Client, Start, Update, Updates};
 use hxng_client::{LoginParams, Output, Resumable, Token};
 use serde_json::{json, Value};
@@ -87,6 +88,10 @@ struct Kept {
     /// Begun with no credentials: logging in again without any is the same
     /// guest, where for an account it would be someone else.
     guest: bool,
+    /// The identity the session is, and what the server made of it, for a
+    /// session an identity logged in to.
+    fingerprint: Option<String>,
+    outcome: Option<String>,
 }
 
 impl Kept {
@@ -101,6 +106,8 @@ impl Kept {
             "self_uid": self.self_uid,
             "caps": self.caps,
             "guest": self.guest,
+            "fingerprint": self.fingerprint,
+            "outcome": self.outcome,
         })
         .to_string()
         .into_bytes()
@@ -127,6 +134,9 @@ impl Kept {
                 .filter_map(|c| c.as_str().map(str::to_owned))
                 .collect(),
             guest: v.get("guest")?.as_bool()?,
+            // Absent from a session saved before identities were.
+            fingerprint: text("fingerprint"),
+            outcome: text("outcome"),
         })
     }
 }
@@ -165,6 +175,10 @@ pub struct LoginInfo {
     /// Whether the server lets this session survive a lost connection
     /// (§2); the core resumes it when it can.
     pub can_resume: bool,
+    /// The identity this session is, and what the server made of it
+    /// (hotline-ng-identity.md §5.3), when it logged in as one.
+    pub fingerprint: Option<String>,
+    pub outcome: Option<String>,
 }
 
 /// What the app is told, in order.
@@ -224,6 +238,9 @@ pub enum CoreUpdate {
     /// lines said meanwhile are history's to fill in.
     Reconnected {
         gap: bool,
+        /// After a fresh login, what it was: the server may have made of an
+        /// identity something else than before (hotline-ng-identity.md §5.3).
+        info: Option<LoginInfo>,
     },
     /// The server refused to take the session back, with its `code`: the
     /// `Closed` that follows is for good.
@@ -360,6 +377,41 @@ impl ServerConnection {
         password: Option<String>,
         saved: Option<Vec<u8>>,
     ) -> Result<LoginInfo, CoreError> {
+        let params = LoginParams {
+            login,
+            password,
+            ..LoginParams::default()
+        };
+        self.start(Credentials::Password(params), saved).await
+    }
+
+    /// Log in as an identity, proving `device` to the server first
+    /// (hotline-ng-auth.md §6.2), or with `saved` resume that session. The
+    /// device is proved again for each new login, and never for a resume.
+    /// With `create`, a server whose policy allows it makes an account for
+    /// an identity it has none for.
+    pub async fn login_identity(
+        &self,
+        device: DeviceIdentity,
+        create: bool,
+        saved: Option<Vec<u8>>,
+    ) -> Result<LoginInfo, CoreError> {
+        let (device, fingerprint) = device.open()?;
+        let creds = Credentials::Identity {
+            device: Box::new(device),
+            create,
+            fingerprint,
+        };
+        self.start(creds, saved).await
+    }
+}
+
+impl ServerConnection {
+    async fn start(
+        &self,
+        creds: Credentials,
+        saved: Option<Vec<u8>>,
+    ) -> Result<LoginInfo, CoreError> {
         {
             let mut phase = self.life.phase.lock().unwrap();
             match &*phase {
@@ -368,17 +420,12 @@ impl ServerConnection {
                 _ => *phase = Phase::Connecting { ending: None },
             }
         }
-        let params = LoginParams {
-            login,
-            password,
-            ..LoginParams::default()
-        };
         let (url, shared, life) = (self.url.clone(), self.shared.clone(), self.life.clone());
         // On the core's runtime, so the phase is settled even if the app
         // stops waiting for the answer.
         RUNTIME
             .spawn(async move {
-                let made = begin(&url, &params, saved.as_deref()).await;
+                let made = begin(&url, &creds, saved.as_deref()).await;
                 let settle = |phase: Phase| {
                     *life.phase.lock().unwrap() = phase;
                     life.changed.notify_waiters();
@@ -406,7 +453,7 @@ impl ServerConnection {
                             let (control, rx) = mpsc::unbounded_channel();
                             let (done_tx, done) = watch::channel(());
                             RUNTIME.spawn(async move {
-                                supervise(url, params, link, shared, rx).await;
+                                supervise(url, creds, link, shared, rx).await;
                                 drop(done_tx);
                             });
                             *phase = Phase::Running(Supervisor { control, done });
@@ -425,7 +472,10 @@ impl ServerConnection {
             .await
             .expect("a login does not panic")
     }
+}
 
+#[uniffi::export(async_runtime = "tokio")]
+impl ServerConnection {
     pub async fn chat(&self, text: String) -> Result<(), CoreError> {
         let client = self.client()?;
         RUNTIME
@@ -539,10 +589,11 @@ impl ServerConnection {
 
     /// What resumes this session after the app is restarted: bytes to keep
     /// as a secret, since they hold the session's token, and to hand back
-    /// to [`ServerConnection::login`]. `None` once the session cannot be
-    /// resumed. As of the last batch the app has returned from, never
-    /// ahead of it: one taken while a batch is being handed over resumes
-    /// before that batch, which comes again, its lines with their ids.
+    /// to [`ServerConnection::login`] or [`ServerConnection::login_identity`].
+    /// `None` once the session cannot be resumed. As of the last batch the
+    /// app has returned from, never ahead of it: one taken while a batch is
+    /// being handed over resumes before that batch, which comes again, its
+    /// lines with their ids.
     pub fn saved(&self) -> Option<Vec<u8>> {
         self.shared.kept.lock().unwrap().as_ref().map(Kept::encode)
     }
@@ -577,6 +628,8 @@ struct Link {
     guest: bool,
     /// Events were missed: the session is new, or was synced.
     gap: bool,
+    /// Made by a login, not a resume.
+    fresh: bool,
 }
 
 /// A resume refused for good, where a login may still do.
@@ -585,26 +638,161 @@ fn gone(code: &str) -> bool {
 }
 
 /// The first link: the saved session resumed, or a login.
-async fn begin(url: &str, params: &LoginParams, saved: Option<&[u8]>) -> Result<Link, CoreError> {
+async fn begin(url: &str, creds: &Credentials, saved: Option<&[u8]>) -> Result<Link, CoreError> {
     let kept = saved.map(Kept::decode);
-    if matches!(kept, Some(None)) && params.login.is_none() {
+    if matches!(kept, Some(None)) && !creds.may_log_in_again(false) {
         return Err(CoreError::Refused {
             code: "session_expired".into(),
             detail: "the saved session does not read".into(),
         });
     }
-    if let Some(kept) = kept.flatten() {
+    // A saved session another identity's, or a password's for an
+    // identity, is not this login's to resume: it logs in afresh.
+    if let Some(kept) = kept
+        .flatten()
+        .filter(|k| k.fingerprint.as_deref() == creds.fingerprint())
+    {
         let start = Start::Resume(kept.resumable.clone());
-        match establish(url, &start, Some(&kept), true).await {
+        match establish(url, &start, Some(&kept), true, None).await {
             Err(CoreError::Refused { code, detail }) if gone(&code) => {
-                if params.login.is_none() && !kept.guest {
+                if !creds.may_log_in_again(kept.guest) {
                     return Err(CoreError::Refused { code, detail });
                 }
             }
             other => return other,
         }
     }
-    establish(url, &Start::Login(params.clone()), None, false).await
+    log_in(url, creds).await
+}
+
+fn identity_field(self_user: &Value, key: &str) -> Option<String> {
+    self_user
+        .get("identity")
+        .and_then(|i| i.get(key))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// How a connection logs in, kept for its life to log in again.
+enum Credentials {
+    Password(LoginParams),
+    Identity {
+        device: Box<Device>,
+        create: bool,
+        /// The identity the device's certificate is for.
+        fingerprint: String,
+    },
+}
+
+impl Credentials {
+    /// Whether a lapsed session may be logged in again with these: an
+    /// identity always, a password if there is a login, and none only for
+    /// a session that was a guest's to begin with.
+    /// The identity these credentials log in as, if any.
+    fn fingerprint(&self) -> Option<&str> {
+        match self {
+            Credentials::Password(_) => None,
+            Credentials::Identity { fingerprint, .. } => Some(fingerprint),
+        }
+    }
+
+    fn may_log_in_again(&self, guest: bool) -> bool {
+        match self {
+            Credentials::Password(p) => p.login.is_some() || guest,
+            Credentials::Identity { .. } => true,
+        }
+    }
+}
+
+/// A new login: a password's, or an identity's on a socket its device
+/// was just proved for.
+async fn log_in(url: &str, creds: &Credentials) -> Result<Link, CoreError> {
+    match creds {
+        Credentials::Password(p) => {
+            establish(url, &Start::Login(p.clone()), None, false, None).await
+        }
+        Credentials::Identity {
+            device,
+            create,
+            fingerprint,
+        } => {
+            let start = Start::Login(LoginParams::default());
+            // A challenge lapsed between its two requests, or a token the
+            // upgrade refused (a server restarted, a slow link): proved
+            // once more, then taken as the answer.
+            let mut again = true;
+            let mut link = loop {
+                let tried = async {
+                    let token = auth::identity_token(url, device, *create, None).await?;
+                    establish(url, &start, None, false, Some(&token)).await
+                }
+                .await;
+                match tried {
+                    Err(CoreError::Refused { code, .. })
+                        if again
+                            && matches!(code.as_str(), "unknown_challenge" | "token_refused") =>
+                    {
+                        again = false
+                    }
+                    other => break other?,
+                }
+            };
+            // The session the server made is the identity's, or the token
+            // never reached it (a front that strips `Authorization` lets
+            // the upgrade in unauthenticated) and this is someone else.
+            if link.info.fingerprint.as_deref() != Some(fingerprint) {
+                link.client.close();
+                return Err(CoreError::Refused {
+                    code: "identity_not_honored".into(),
+                    detail: "the server did not log this session in as the identity proved".into(),
+                });
+            }
+            // No login named, but no guest's either: the identity logs in again.
+            link.guest = false;
+            if let Some(k) = link.kept.as_mut() {
+                k.guest = false;
+            }
+            Ok(link)
+        }
+    }
+}
+
+/// A device's keys as the app holds them: the 32-byte seed its key is
+/// made from, the certificate its identity signed, and the identity's card.
+/// The seed is as secret as a password. The core wipes the copy it keeps;
+/// the copies the FFI makes on the way are not wiped, nor is the array the
+/// app handed over unless the app wipes it. Seeds made in the core will
+/// end the crossing.
+#[derive(uniffi::Record)]
+pub struct DeviceIdentity {
+    pub device_seed: Vec<u8>,
+    pub cert: Vec<u8>,
+    pub card: Vec<u8>,
+}
+
+impl DeviceIdentity {
+    /// The device, and the fingerprint of the identity its certificate is for.
+    fn open(self) -> Result<(Device, String), CoreError> {
+        // Wrapped first, so every way out wipes it.
+        let seed = zeroize::Zeroizing::new(self.device_seed);
+        let seed: &[u8; 32] = seed
+            .as_slice()
+            .try_into()
+            .map_err(|_| CoreError::Protocol {
+                detail: "a device seed is 32 bytes".into(),
+            })?;
+        let fingerprint = hl_identity::DeviceCert::parse(&self.cert)
+            .map(|c| hl_identity::Fingerprint::of(&c.identity).to_string())
+            .map_err(|e| CoreError::Protocol {
+                detail: format!("the device certificate does not read: {e}"),
+            })?;
+        let device = Device {
+            key: hl_identity::DeviceKey::from_seed(seed),
+            cert: self.cert,
+            card: self.card,
+        };
+        Ok((device, fingerprint))
+    }
 }
 
 /// Open a link and make it whole: a login's roster, or after a resume a
@@ -615,8 +803,9 @@ async fn establish(
     start: &Start,
     known: Option<&Kept>,
     cold: bool,
+    token: Option<&Token>,
 ) -> Result<Link, CoreError> {
-    let (client, answer, mut updates) = driver::connect(url, start, None).await?;
+    let (client, answer, mut updates) = driver::connect_with(url, start, None, token).await?;
     let uid = |user: &Value| {
         User::from_json(user)
             .map(|u| u.uid)
@@ -638,12 +827,16 @@ async fn establish(
             self_uid,
             caps: k.caps.clone(),
             guest: k.guest,
+            fingerprint: k.fingerprint.clone(),
+            outcome: k.outcome.clone(),
         })
     };
     let info = |name: String| LoginInfo {
         server_name: name,
         caps: known.map(|k| k.caps.clone()).unwrap_or_default(),
         can_resume: true,
+        fingerprint: known.and_then(|k| k.fingerprint.clone()),
+        outcome: known.and_then(|k| k.outcome.clone()),
     };
     let guest = known.is_some_and(|k| k.guest);
     match answer {
@@ -660,6 +853,8 @@ async fn establish(
                     server_name: ok.server.name.clone(),
                     caps: ok.caps.clone(),
                     can_resume: ok.detach.is_some(),
+                    fingerprint: identity_field(&ok.self_user, "fingerprint"),
+                    outcome: identity_field(&ok.self_user, "outcome"),
                 },
                 kept: ok.detach.is_some().then(|| Kept {
                     resumable: Resumable {
@@ -671,9 +866,12 @@ async fn establish(
                     self_uid,
                     caps: ok.caps.clone(),
                     guest,
+                    fingerprint: identity_field(&ok.self_user, "fingerprint"),
+                    outcome: identity_field(&ok.self_user, "outcome"),
                 }),
                 guest,
                 gap: true,
+                fresh: true,
                 client,
                 updates,
             })
@@ -694,6 +892,7 @@ async fn establish(
                 kept: resumed(last_seq, self_uid),
                 guest,
                 gap: must_sync,
+                fresh: false,
                 client,
                 updates,
             })
@@ -709,6 +908,7 @@ async fn establish(
                 kept: resumed(last_seq, self_uid),
                 guest,
                 gap: true,
+                fresh: false,
                 client,
                 updates,
             })
@@ -802,7 +1002,7 @@ enum Ended {
 
 async fn supervise(
     url: String,
-    params: LoginParams,
+    creds: Credentials,
     mut link: Link,
     shared: Arc<Shared>,
     mut control: mpsc::UnboundedReceiver<Control>,
@@ -863,11 +1063,15 @@ async fn supervise(
             }
             last_try = Some(Instant::now());
             let known = shared.kept.lock().unwrap().clone();
-            let start = match &known {
-                Some(k) => Start::Resume(k.resumable.clone()),
-                None => Start::Login(params.clone()),
+            let tried = async {
+                match &known {
+                    Some(k) => {
+                        let start = Start::Resume(k.resumable.clone());
+                        establish(&url, &start, Some(k), false, None).await
+                    }
+                    None => log_in(&url, &creds).await,
+                }
             };
-            let tried = establish(&url, &start, known.as_ref(), false);
             tokio::pin!(tried);
             let tried = loop {
                 tokio::select! {
@@ -892,7 +1096,7 @@ async fn supervise(
                     // Let go while the link was down: log in again, now,
                     // if that is still this person.
                     *shared.kept.lock().unwrap() = None;
-                    if params.login.is_some() || guest {
+                    if creds.may_log_in_again(guest) {
                         delay = Duration::ZERO;
                         continue;
                     }
@@ -1037,7 +1241,13 @@ async fn pump(
     let mut first = std::mem::take(&mut link.first);
     let mut kicked = first.iter().any(|u| matches!(u, CoreUpdate::Kicked));
     if announce {
-        first.insert(0, CoreUpdate::Reconnected { gap: link.gap });
+        first.insert(
+            0,
+            CoreUpdate::Reconnected {
+                gap: link.gap,
+                info: link.fresh.then(|| link.info.clone()),
+            },
+        );
     }
     if !shared.deliver(first) {
         link.client.close();
@@ -1211,6 +1421,8 @@ mod tests {
             self_uid: 3,
             caps: vec!["history".into()],
             guest: false,
+            fingerprint: Some("hl1qexample".into()),
+            outcome: Some("linked".into()),
         };
         let back = Kept::decode(&kept.encode()).unwrap();
         assert_eq!(back.encode(), kept.encode());

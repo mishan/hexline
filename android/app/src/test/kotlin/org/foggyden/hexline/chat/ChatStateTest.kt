@@ -91,9 +91,9 @@ class ChatStateTest {
     @Test
     fun aGapIsFilledFromTheNewestLineBeforeItInOrderAndOnce() {
         val before = live.after(CoreUpdate.Chat(line(10, "before")))
-        assertNull(before.after(CoreUpdate.Reconnected(false)).fillAfter)
+        assertNull(before.after(CoreUpdate.Reconnected(false, null)).fillAfter)
         // Line 13 arrives live once the link is back; 11 to 13 were said meanwhile.
-        val back = before.after(CoreUpdate.Reconnected(true), CoreUpdate.Chat(line(13, "live")))
+        val back = before.after(CoreUpdate.Reconnected(true, null), CoreUpdate.Chat(line(13, "live")))
         assertEquals(10uL, back.fillAfter)
         val page = back.withLater(listOf(line(11, "missed"), line(12, "missed too")), hasMore = true)
         assertEquals(listOf("before", "missed", "missed too", "live"), shown(page))
@@ -113,16 +113,16 @@ class ChatStateTest {
 
     @Test
     fun aSecondGapWhileTheFirstIsFillingFillsFromTheEarlier() {
-        val first = live.after(CoreUpdate.Chat(line(10, "before")), CoreUpdate.Reconnected(true))
-        val second = first.after(CoreUpdate.Chat(line(20, "live")), CoreUpdate.Reconnected(true))
+        val first = live.after(CoreUpdate.Chat(line(10, "before")), CoreUpdate.Reconnected(true, null))
+        val second = first.after(CoreUpdate.Chat(line(20, "live")), CoreUpdate.Reconnected(true, null))
         assertEquals(10uL, second.fillAfter)
-        assertNull("no line, no gap to fill", live.after(CoreUpdate.Reconnected(true)).fillAfter)
+        assertNull("no line, no gap to fill", live.after(CoreUpdate.Reconnected(true, null)).fillAfter)
     }
 
     @Test
     fun aGapTooLongToFillIsMarkedWhereItIs() {
         val back =
-            live.after(CoreUpdate.Chat(line(10, "before")), CoreUpdate.Reconnected(true), CoreUpdate.Chat(line(900, "live")))
+            live.after(CoreUpdate.Chat(line(10, "before")), CoreUpdate.Reconnected(true, null), CoreUpdate.Chat(line(900, "live")))
         val page = back.withLater(listOf(line(11, "missed")), hasMore = true)
         val marked = page.withMissed()
         assertEquals(listOf("before", "missed", "missed more", "live"), shown(marked))
@@ -139,7 +139,7 @@ class ChatStateTest {
         val s = live.after(CoreUpdate.Reconnecting(2u))
         assertEquals(Link.Reconnecting(2u), s.link)
         assertEquals(live.users, s.users)
-        assertEquals(Link.Live, s.after(CoreUpdate.Reconnected(false)).link)
+        assertEquals(Link.Live, s.after(CoreUpdate.Reconnected(false, null)).link)
     }
 
     @Test

@@ -10,7 +10,7 @@ publish = false
 
 [features]
 # The driver: a WebSocket over TLS, run on tokio.
-tokio = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls", "dep:rustls-platform-verifier"]
+tokio = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls", "dep:rustls-platform-verifier", "dep:reqwest", "dep:hl-identity", "dep:base64"]
 # The tests against a real hxd, named by HXD_BIN.
 live-tests = ["tokio", "tokio/process", "tokio/io-util"]
 
@@ -26,6 +26,10 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 # The platform's own trust store, user-installed CAs included.
 rustls-platform-verifier = { version = "0.7", optional = true }
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["sink", "std"] }
+# Identity's HTTP steps (challenge, auth), over the same rustls config.
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls-no-provider", "json"] }
+hl-identity = { workspace = true, optional = true }
+base64 = { version = "0.23", optional = true }
 
 [dev-dependencies]
 proptest = "1"

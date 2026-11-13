@@ -6,8 +6,9 @@
 
 use std::time::Duration;
 
-use hxng_client::driver::{connect, Client, Error, Start, Update, Updates};
-use hxng_client::testing::Server;
+use hxng_client::auth::identity_token;
+use hxng_client::driver::{connect, connect_with, Client, Error, Start, Update, Updates};
+use hxng_client::testing::{device, Server};
 use hxng_client::{LoginParams, Output};
 use serde_json::{json, Value};
 use tokio::time::timeout;
@@ -109,5 +110,56 @@ async fn a_wrong_password_is_refused() {
             assert!(r.resumable.is_none());
         }
         other => panic!("{:?}", other.map(|(_, o, _)| o)),
+    }
+}
+
+#[tokio::test]
+async fn an_identity_proves_its_device_and_logs_in_on_the_socket_that_proved_it() {
+    let server = Server::with_identity(&[], 300).await;
+    let (id, alice) = device("Alice");
+    let token = identity_token(&server.url, &alice, true, None)
+        .await
+        .unwrap();
+    let anyone = Start::Login(LoginParams::default());
+    let (_client, answer, _heard) = connect_with(&server.url, &anyone, None, Some(&token))
+        .await
+        .unwrap();
+    let Output::LoggedIn(ok) = answer else {
+        panic!("{answer:?}")
+    };
+    let fingerprint = hl_identity::Fingerprint::of(&id.public()).to_string();
+    assert_eq!(
+        ok.self_user["identity"]["fingerprint"], fingerprint,
+        "{:?}",
+        ok.self_user
+    );
+
+    // One upgrade a token: the second is refused, not let in as a guest.
+    match connect_with(&server.url, &anyone, None, Some(&token)).await {
+        Err(Error::Refused(r)) => assert_eq!(r.error.code, "token_refused"),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+}
+
+#[tokio::test]
+async fn an_identity_is_refused_by_its_code() {
+    let plain = Server::start(&[]).await;
+    let with = Server::with_identity(&[], 300).await;
+    let (_, alice) = device("Alice");
+    let (_, mallory) = device("Mallory");
+    // Alice's card with a certificate another identity signed.
+    let forged = hxng_client::auth::Device {
+        key: mallory.key,
+        cert: mallory.cert,
+        card: alice.card.clone(),
+    };
+    for (url, who, want) in [
+        (&plain.url, &alice, "not_available"),
+        (&with.url, &forged, "bad_proof"),
+    ] {
+        match identity_token(url, who, true, None).await {
+            Err(Error::Refused(r)) => assert_eq!(r.error.code, want, "{}", r.error.text),
+            other => panic!("{want}: {:?}", other.map(|_| ())),
+        }
     }
 }

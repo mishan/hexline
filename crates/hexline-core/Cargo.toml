@@ -20,6 +20,8 @@ uniffi = { workspace = true, features = ["tokio"] }
 hxng-client = { path = "../hxng-client", features = ["tokio"] }
 tokio = { version = "1.54", features = ["rt-multi-thread", "sync"] }
 serde_json = { workspace = true }
+zeroize = { workspace = true }
+hl-identity = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # The platform verifier calls Android's trust manager through the JVM, and
