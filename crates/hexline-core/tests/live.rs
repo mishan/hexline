@@ -261,6 +261,12 @@ async fn a_lost_link_is_resumed_and_what_was_missed_replayed() {
     let proxy = Proxy::to(&server).await;
     let (alice, sink) = logged_in(&proxy.url, "alice").await;
     let (bob, bob_sink) = logged_in(&server.url, "bob").await;
+    // Severed only once alice has what was sent her: an event lost in
+    // flight is one the server cannot replay, and answers with a resync.
+    sink.heard("bob joining", |u| {
+        matches!(u, CoreUpdate::UserJoined { .. })
+    })
+    .await;
     proxy.refuse(true);
     proxy.sever();
     bob_sink
