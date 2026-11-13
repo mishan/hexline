@@ -10,6 +10,8 @@ pub mod driver;
 mod frame;
 mod handshake;
 mod session;
+#[cfg(feature = "live-tests")]
+pub mod testing;
 
 use std::fmt;
 

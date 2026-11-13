@@ -1,3 +1,5 @@
 [bindings.kotlin]
 package_name = "org.foggyden.hexline.core"
 cdylib_name = "hexline_core"
+# Cleaners that work below API 33, where java.lang.ref.Cleaner arrived.
+android = true

@@ -11,5 +11,21 @@ publish = false
 # cdylib for the app (and the JVM tests), lib for the bindgen and Rust tests.
 crate-type = ["cdylib", "lib"]
 
+[features]
+# The tests against a real hxd, named by HXD_BIN.
+live-tests = ["hxng-client/live-tests"]
+
 [dependencies]
-uniffi = { workspace = true }
+uniffi = { workspace = true, features = ["tokio"] }
+hxng-client = { path = "../hxng-client", features = ["tokio"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "sync"] }
+serde_json = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# The platform verifier calls Android's trust manager through the JVM, and
+# is handed the app's context once, at startup.
+jni = { version = "0.22", default-features = false }
+rustls-platform-verifier = "0.7"
+
+[dev-dependencies]
+tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "time"] }
