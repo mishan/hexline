@@ -7,7 +7,8 @@
 
 use hl_identity::envelope::{Kdf, Keys, Kind, Secret};
 use hl_identity::{
-    caps, Card, DeviceCert, DeviceKey, Fingerprint, IdentityKey, KeyEnvelope, RecoveryCode,
+    caps, cbor, Attestation, Card, DeviceCert, DeviceKey, Fingerprint, IdentityKey, KeyEnvelope,
+    RecoveryCode, RegisterRequest,
 };
 use hxng_client::auth;
 use hxng_client::reqwest::Url;
@@ -35,6 +36,10 @@ pub struct Restored {
     /// and commits to no successor; the identity's other devices may show
     /// another.
     pub new_card: bool,
+    /// The card carries an attestation the registrar issued just now.
+    /// Without one, a server whose policy wants one lets the identity in
+    /// as a guest.
+    pub attested: bool,
 }
 
 /// How long a device made from an envelope is certified for: the
@@ -84,7 +89,9 @@ async fn restore(
         ),
     };
     let http = auth::http_client(base.as_str(), None)?;
-    let envelopes = endpoint(&base, &discovered(&http, &base).await?)?;
+    let reg = discovered(&http, &base).await?;
+    let envelopes = endpoint(&base, &reg.envelopes)?;
+    let register = endpoint(&base, &reg.register)?;
 
     // The salt first: the registrar answers every handle with one.
     let params = auth::post(
@@ -115,7 +122,8 @@ async fn restore(
         .map_err(|_| protocol("the identity is not 32 bytes"))?;
     let envelope = KeyEnvelope::parse(&bytes(&reply, "envelope")?)
         .map_err(|e| protocol(&format!("the envelope: {e}")))?;
-    // Before the key is opened, so it is held for its two signatures alone.
+    // Before the key is opened: it is held for its signatures and the
+    // reissue alone.
     let kept_card = card_kept(&http, &base, &identity).await?;
 
     let id = envelope
@@ -135,6 +143,11 @@ async fn restore(
             true,
         ),
     };
+    let successor = Card::parse(&card).ok().and_then(|c| c.successor);
+    let (card, attested) = match reattest(&http, &reg, &register, &id, handle, successor).await {
+        Some(attestation) => (with_attestation(&id, &card, &attestation)?, true),
+        None => (card, false),
+    };
     let fingerprint = id.fingerprint().to_string();
     drop(id);
     Ok(Restored {
@@ -143,6 +156,7 @@ async fn restore(
         card,
         fingerprint,
         new_card,
+        attested,
     })
 }
 
@@ -212,8 +226,20 @@ fn endpoint(base: &Url, path: &str) -> Result<String, CoreError> {
     Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
-/// The registrar's envelopes path, from its discovery document.
-async fn discovered(http: &hxng_client::reqwest::Client, base: &Url) -> Result<String, CoreError> {
+/// What a registrar's discovery document says of it.
+struct Registrar {
+    host: String,
+    /// Its key, and any it is retiring: what an attestation may be signed by.
+    keys: Vec<[u8; 32]>,
+    envelopes: String,
+    register: String,
+}
+
+/// The registrar, from its discovery document.
+async fn discovered(
+    http: &hxng_client::reqwest::Client,
+    base: &Url,
+) -> Result<Registrar, CoreError> {
     let (status, body) = auth::get(
         http,
         base.join("/.well-known/hotline").expect("a path").as_str(),
@@ -229,12 +255,92 @@ async fn discovered(http: &hxng_client::reqwest::Client, base: &Url) -> Result<S
     let block = doc
         .get("registrar")
         .ok_or_else(|| refused("not_a_registrar"))?;
-    block
-        .get("endpoints")
-        .and_then(|e| e.get("envelopes"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| refused("no_envelopes"))
+    let text = |v: Option<&Value>| v.and_then(Value::as_str).map(str::to_owned);
+    let key = |v: &Value| -> Option<[u8; 32]> { bytes(v, "key").ok()?.try_into().ok() };
+    let endpoints = block.get("endpoints");
+    let keys: Vec<[u8; 32]> = key(block)
+        .into_iter()
+        .chain(
+            block
+                .get("retiring")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(key),
+        )
+        .collect();
+    Ok(Registrar {
+        host: text(block.get("host")).ok_or_else(|| refused("not_a_registrar"))?,
+        envelopes: text(endpoints.and_then(|e| e.get("envelopes")))
+            .ok_or_else(|| refused("no_envelopes"))?,
+        register: text(endpoints.and_then(|e| e.get("register")))
+            .ok_or_else(|| refused("not_a_registrar"))?,
+        keys,
+    })
+}
+
+/// A fresh attestation for `handle` from the registrar, while the
+/// identity key is in hand to ask for it (§6.1's reissue): the card a
+/// server is shown carries it, and with none a server's default policy
+/// lets the identity in as a guest alone. `None` if the registrar would
+/// not reissue, which leaves the card as it was.
+async fn reattest(
+    http: &hxng_client::reqwest::Client,
+    reg: &Registrar,
+    register: &str,
+    id: &IdentityKey,
+    handle: &str,
+    successor: Option<[u8; 32]>,
+) -> Option<Vec<u8>> {
+    // The commitment the registrar holds is the card's: a request that
+    // dropped it would be refused.
+    let request = RegisterRequest {
+        identity: id.public(),
+        registrar: reg.host.clone(),
+        handle: handle.to_owned(),
+        time: now(),
+        successor,
+        proof: None,
+    }
+    .sign(id)
+    .ok()?;
+    let reply = auth::post(http, register, Some(json!({ "request": b64(&request) })))
+        .await
+        .ok()?;
+    let signed = bytes(&reply, "attestation").ok()?;
+    let att = Attestation::parse(&signed).ok()?;
+    (att.identity == id.public()
+        && att.registrar == reg.host
+        && reg.keys.contains(&att.registrar_key))
+    .then_some(signed)
+}
+
+/// `card` re-signed with `attestation` in place of any other for the
+/// same handle at the same registrar, every other kept as signed.
+fn with_attestation(
+    id: &IdentityKey,
+    card: &[u8],
+    attestation: &[u8],
+) -> Result<Vec<u8>, CoreError> {
+    let parsed = Card::parse(card).map_err(|e| protocol(&format!("the card: {e}")))?;
+    let new = Attestation::parse(attestation).map_err(|e| protocol(&e.to_string()))?;
+    let mut kept = match cbor::decode_canonical(card)
+        .map_err(|e| protocol(&e.to_string()))?
+        .get("attestations")
+    {
+        Some(cbor::Value::Array(items)) => items.clone(),
+        _ => Vec::new(),
+    };
+    kept.retain(|v| {
+        !(matches!(v.get("registrar"), Some(cbor::Value::Text(h)) if *h == new.registrar)
+            && matches!(v.get("handle"), Some(cbor::Value::Text(h)) if *h == new.handle))
+    });
+    kept.push(cbor::decode_canonical(attestation).map_err(|e| protocol(&e.to_string()))?);
+    let mut next = parsed.clone();
+    next.updated = issued().max(parsed.updated + 1);
+    let signed = next.sign(id, kept).map_err(|e| protocol(&e.to_string()))?;
+    Card::parse(&signed).map_err(|e| protocol(&e.to_string()))?;
+    Ok(signed)
 }
 
 /// The identity's card as the registrar keeps it: `None` only when it

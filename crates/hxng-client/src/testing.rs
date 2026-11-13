@@ -84,6 +84,12 @@ impl Server {
         Server::launch(accounts, 300, Some(("allow", "create")), true).await
     }
 
+    /// As [`Server::with_registrar`], under the default policy for an
+    /// identity no registrar vouches for: a guest.
+    pub async fn with_registrar_vouching(accounts: &[&str]) -> Server {
+        Server::launch(accounts, 300, Some(("guest", "create")), true).await
+    }
+
     /// As [`Server::with_identity`], under the default policy: an identity
     /// no registrar vouches for, or one with no account, logs in as a guest.
     pub async fn with_guest_identity(accounts: &[&str]) -> Server {
@@ -126,7 +132,17 @@ impl Server {
                 match identity {
                     Some((unattested, new_accounts)) => format!(
                         "[identity]\nhosts = [\"127.0.0.1:{ng}\", \"127.0.0.1:{proxy_port}\"]\n\
-                         unattested = \"{unattested}\"\nnew_accounts = \"{new_accounts}\"\n"
+                         unattested = \"{unattested}\"\nnew_accounts = \"{new_accounts}\"\n{}",
+                        // Its own registrar's attestations, on the key that
+                        // registrar publishes, fetched where it listens.
+                        if registrar {
+                            format!(
+                                "trusted_registrars = [\"127.0.0.1\"]\n\
+                                 registrar_urls = {{ \"127.0.0.1\" = \"http://127.0.0.1:{ng}\" }}\n"
+                            )
+                        } else {
+                            String::new()
+                        }
                     ),
                     None => String::new(),
                 } + if registrar {
