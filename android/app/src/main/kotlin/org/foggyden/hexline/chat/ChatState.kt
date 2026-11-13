@@ -202,7 +202,7 @@ data class ChatState(
     fun withMissed(): ChatState {
         val after = fillAfter ?: return this
         val at = entries.indexOfFirst { e -> (e as? Entry.Line)?.line?.id?.let { it > after } == true }
-        val marked = entries.toMutableList().apply { add(size, Entry.Missed(nextKey)) }
+        val marked = entries.toMutableList().apply { add(if (at < 0) size else at, Entry.Missed(nextKey)) }
         return copy(entries = marked, nextKey = nextKey + 1, fillAfter = null)
     }
 
