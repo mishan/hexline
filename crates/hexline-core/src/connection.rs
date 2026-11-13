@@ -29,7 +29,7 @@ use crate::model::{ChatLine, HistoryPage, User};
 /// is one thread, shared with whatever else polls through it; this one is
 /// the core's, so the app's callbacks and its calls never wait on each
 /// other's thread.
-static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+pub(crate) static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("hexline-core")
@@ -72,6 +72,9 @@ pub enum CoreError {
     Closed,
     /// Logged in, or logging in, already: one connection at a time.
     Busy,
+    /// Asked too often: try again after `retry_after` seconds, where the
+    /// server said. A registrar's lockout of a handle answers so too.
+    RateLimited { retry_after: Option<u64> },
 }
 
 /// What resumes the session, kept while the connection lives and handed
@@ -148,6 +151,7 @@ impl std::fmt::Display for CoreError {
             CoreError::Refused { code, detail } => write!(f, "{code}: {detail}"),
             CoreError::Closed => f.write_str("not connected"),
             CoreError::Busy => f.write_str("already connected"),
+            CoreError::RateLimited { .. } => f.write_str("asked too often"),
         }
     }
 }
@@ -156,6 +160,9 @@ impl From<driver::Error> for CoreError {
     fn from(e: driver::Error) -> Self {
         match e {
             driver::Error::Connect(detail) => CoreError::Connect { detail },
+            driver::Error::Refused(r) if r.error.code == "rate_limited" => CoreError::RateLimited {
+                retry_after: r.error.retry_after,
+            },
             driver::Error::Refused(r) => CoreError::Refused {
                 code: r.error.code,
                 detail: r.error.text,

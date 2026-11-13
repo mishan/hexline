@@ -7,6 +7,9 @@
 
 #[cfg(feature = "tokio")]
 pub mod auth;
+/// The HTTP client [`auth::http_client`] makes, for its callers to name.
+#[cfg(feature = "tokio")]
+pub use reqwest;
 #[cfg(feature = "tokio")]
 pub mod driver;
 mod frame;

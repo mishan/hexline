@@ -43,21 +43,7 @@ pub async fn identity_token(
     tls: Option<Arc<rustls::ClientConfig>>,
 ) -> Result<Token, Error> {
     let (base, host) = base_of(url)?;
-    // Our rustls config even for http: reqwest has no provider of its own.
-    let tls = match tls {
-        Some(t) => t,
-        None => platform_tls()?,
-    };
-    // No redirects: one could carry the proof and the token to another
-    // scheme or port. No proxies: the upgrade goes direct, so these do too.
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .tls_backend_preconfigured(Arc::unwrap_or_clone(tls))
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .https_only(base.starts_with("https:"))
-        .build()
-        .map_err(|e| Error::Connect(e.to_string()))?;
+    let http = http_client(&base, tls)?;
 
     let challenge = post(&http, &format!("{base}/identity/challenge"), None).await?;
     let (nonce, server_key) = vouched(&challenge, &host, now())?;
@@ -136,6 +122,40 @@ fn vouched(reply: &Value, host: &str, now: u64) -> Result<([u8; 32], PublicKey),
     }
 }
 
+/// An HTTP client for identity's requests to `base`: our rustls config
+/// even for http, since reqwest has no provider of its own; no redirects,
+/// one of which could carry a proof, a token or a secret to another
+/// scheme or port; no proxies, as the upgrade goes direct; and https
+/// alone for an https base.
+pub fn http_client(
+    base: &str,
+    tls: Option<Arc<rustls::ClientConfig>>,
+) -> Result<reqwest::Client, Error> {
+    let tls = match tls {
+        Some(t) => t,
+        None => platform_tls()?,
+    };
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .tls_backend_preconfigured(Arc::unwrap_or_clone(tls))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .https_only(base.starts_with("https:"))
+        .build()
+        .map_err(|e| Error::Connect(e.to_string()))
+}
+
+/// GET `url`: its status and its body, bounded.
+pub async fn get(http: &reqwest::Client, url: &str) -> Result<(u16, Vec<u8>), Error> {
+    let resp = http
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| Error::Connect(e.to_string()))?;
+    let status = resp.status().as_u16();
+    Ok((status, bounded(resp).await?))
+}
+
 /// Whether `host` (in [`canonical_host`] form) is this machine.
 fn loopback(host: &str) -> bool {
     let name = match host.strip_prefix('[') {
@@ -166,7 +186,10 @@ fn base_of(url: &str) -> Result<(String, String), Error> {
     Ok((format!("{scheme}://{authority}"), host))
 }
 
-async fn post(http: &reqwest::Client, url: &str, body: Option<Value>) -> Result<Value, Error> {
+/// POST `body` to `url` and read the JSON reply; a refusal comes back as
+/// [`Error::Refused`] with the server's code, or by status where there is
+/// none (§6.2).
+pub async fn post(http: &reqwest::Client, url: &str, body: Option<Value>) -> Result<Value, Error> {
     let req = http.post(url);
     let req = match body {
         Some(b) => req.json(&b),
@@ -177,7 +200,7 @@ async fn post(http: &reqwest::Client, url: &str, body: Option<Value>) -> Result<
         .await
         .map_err(|e| Error::Connect(e.to_string()))?;
     let status = resp.status();
-    let text = bounded(resp).await?;
+    let text = String::from_utf8_lossy(&bounded(resp).await?).into_owned();
     if status.is_success() {
         return serde_json::from_str(&text).map_err(|_| protocol("a reply that is not JSON"));
     }
@@ -215,7 +238,7 @@ async fn post(http: &reqwest::Client, url: &str, body: Option<Value>) -> Result<
 
 /// What a reply says, read no further than any of these replies reaches:
 /// a captive portal or a hostile server streaming more is cut off.
-async fn bounded(mut resp: reqwest::Response) -> Result<String, Error> {
+async fn bounded(mut resp: reqwest::Response) -> Result<Vec<u8>, Error> {
     const MOST: usize = 64 * 1024;
     let mut body = Vec::new();
     while let Some(chunk) = resp
@@ -230,7 +253,7 @@ async fn bounded(mut resp: reqwest::Response) -> Result<String, Error> {
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(String::from_utf8_lossy(&body).into_owned())
+    Ok(body)
 }
 
 fn refused(code: &str, text: &str) -> Error {

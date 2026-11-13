@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hexline_core::{CoreError, CoreUpdate, DeviceIdentity, ServerConnection, Status, UpdateSink};
-use hxng_client::testing::{device, Proxy, Server};
+use hxng_client::testing::{back_up, device, Proxy, Server};
 use serde_json::Value;
 
 #[derive(Default)]
@@ -719,4 +719,156 @@ async fn an_identitys_session_resumes_as_itself_and_another_identitys_is_not_res
         saved_field(&bob.saved().unwrap(), "session"),
         saved_field(&saved, "session")
     );
+}
+
+#[tokio::test]
+async fn an_identity_kept_at_a_registrar_is_restored_to_a_device_that_logs_in() {
+    use hexline_core::{cert_for_device, restore_identity, SecretKind};
+    use hl_identity::envelope::Secret;
+    use hl_identity::RecoveryCode;
+    let server = Server::with_registrar(&[]).await;
+    let alice = back_up(&server, "alice", &Secret::Passphrase("correct horse")).await;
+    let code = RecoveryCode::generate();
+    let bob = back_up(&server, "bob", &Secret::RecoveryCode(&code)).await;
+
+    for (handle, kind, secret, id) in [
+        (
+            "alice",
+            SecretKind::Passphrase,
+            "correct horse".to_string(),
+            &alice,
+        ),
+        (
+            "bob",
+            SecretKind::RecoveryCode,
+            code.display().to_string(),
+            &bob,
+        ),
+    ] {
+        let restored = restore_identity(
+            server.http.clone(),
+            handle.into(),
+            kind,
+            secret,
+            "Pixel".into(),
+        )
+        .await
+        .unwrap();
+        let fingerprint = hl_identity::Fingerprint::of(&id.public()).to_string();
+        assert_eq!(restored.fingerprint, fingerprint);
+        assert!(restored.new_card, "the registrar keeps no card for it");
+        assert!(restored.attested, "the card carries a fresh attestation");
+        let info = cert_for_device(
+            restored.cert.clone(),
+            restored.card.clone(),
+            restored.seed.clone(),
+        )
+        .unwrap();
+        assert_eq!(info.fingerprint, fingerprint);
+        assert!(info.can_login && info.can_manage && !info.can_vouch);
+        assert_eq!(info.name.as_deref(), Some("Pixel"));
+
+        let conn = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
+        let device = DeviceIdentity {
+            device_seed: restored.seed,
+            cert: restored.cert,
+            card: restored.card,
+        };
+        let login = conn.login_identity(device, true, None).await.unwrap();
+        assert_eq!(login.fingerprint, Some(fingerprint));
+    }
+}
+
+#[tokio::test]
+async fn a_wrong_secret_and_a_handle_with_no_envelope_are_answered_alike() {
+    use hexline_core::{restore_identity, SecretKind};
+    use hl_identity::envelope::Secret;
+    let server = Server::with_registrar(&[]).await;
+    back_up(&server, "alice", &Secret::Passphrase("correct horse")).await;
+    for (handle, secret) in [("alice", "wrong horse"), ("nobody", "correct horse")] {
+        match restore_identity(
+            server.http.clone(),
+            handle.into(),
+            SecretKind::Passphrase,
+            secret.into(),
+            "Pixel".into(),
+        )
+        .await
+        {
+            Err(CoreError::Refused { code, .. }) => assert_eq!(code, "not_found", "{handle}"),
+            other => panic!("{handle}: {:?}", other.map(|r| r.fingerprint)),
+        }
+    }
+}
+
+#[tokio::test]
+async fn what_would_be_refused_anyway_is_refused_before_the_registrar_is_asked() {
+    use hexline_core::{restore_identity, SecretKind};
+    // Nothing listens here: a refusal that asked it would be a connect error.
+    let nowhere = "http://127.0.0.1:9".to_string();
+    for (kind, secret, name, want) in [
+        (SecretKind::Passphrase, "  ", "Pixel", "bad_passphrase"),
+        (
+            SecretKind::RecoveryCode,
+            "not a code",
+            "Pixel",
+            "bad_recovery_code",
+        ),
+        (
+            SecretKind::Passphrase,
+            "correct horse",
+            " Pixel",
+            "bad_device_name",
+        ),
+    ] {
+        match restore_identity(
+            nowhere.clone(),
+            "alice".into(),
+            kind,
+            secret.into(),
+            name.into(),
+        )
+        .await
+        {
+            Err(CoreError::Refused { code, .. }) => assert_eq!(code, want),
+            other => panic!("{want}: {:?}", other.map(|r| r.fingerprint)),
+        }
+    }
+    match restore_identity(
+        "http://192.0.2.1".into(),
+        "alice".into(),
+        SecretKind::Passphrase,
+        "x".into(),
+        "Pixel".into(),
+    )
+    .await
+    {
+        Err(CoreError::Refused { code, .. }) => assert_eq!(code, "bad_registrar"),
+        other => panic!("{:?}", other.map(|r| r.fingerprint)),
+    }
+}
+
+#[tokio::test]
+async fn a_restored_device_is_vouched_for_where_unattested_identities_are_guests() {
+    use hexline_core::{restore_identity, SecretKind};
+    use hl_identity::envelope::Secret;
+    let server = Server::with_registrar_vouching(&[]).await;
+    back_up(&server, "alice", &Secret::Passphrase("correct horse")).await;
+    let restored = restore_identity(
+        server.http.clone(),
+        "alice".into(),
+        SecretKind::Passphrase,
+        "correct horse".into(),
+        "Pixel".into(),
+    )
+    .await
+    .unwrap();
+    let conn = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
+    let device = DeviceIdentity {
+        device_seed: restored.seed,
+        cert: restored.cert,
+        card: restored.card,
+    };
+    let info = conn.login_identity(device, true, None).await.unwrap();
+    assert_eq!(info.outcome.as_deref(), Some("created"), "{info:?}");
 }
