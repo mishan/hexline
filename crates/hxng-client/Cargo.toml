@@ -8,10 +8,25 @@ rust-version = "1.85"
 description = "The client side of the Hotline-ng wire: frames, the handshake, replies and the event sequence, with no I/O of its own"
 publish = false
 
+[features]
+# The driver: a WebSocket over TLS, run on tokio.
+tokio = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls", "dep:rustls-platform-verifier"]
+# The tests against a real hxd, named by HXD_BIN.
+live-tests = ["tokio"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 zeroize = { workspace = true }
+tokio = { version = "1.54", optional = true, features = ["rt", "macros", "sync", "net", "time"] }
+# ring, not aws-lc-rs: aws-lc-rs needs cmake and a C toolchain per Android
+# target, which F-Droid's builders make painful.
+tokio-tungstenite = { version = "0.30", optional = true, default-features = false, features = ["connect", "__rustls-tls"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# The platform's own trust store, user-installed CAs included.
+rustls-platform-verifier = { version = "0.7", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["sink", "std"] }
 
 [dev-dependencies]
 proptest = "1"
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "process", "time", "test-util"] }
