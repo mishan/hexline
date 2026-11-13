@@ -1,0 +1,5 @@
+#!/bin/sh
+# The fast checks, before a commit: `ln -s ../../scripts/pre-commit .git/hooks/`.
+# ktlint runs through Gradle, too slow for a hook; CI and `make fmt-check` have it.
+set -e
+cargo fmt --all --check
