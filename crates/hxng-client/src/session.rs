@@ -117,7 +117,8 @@ impl Session {
     }
 
     /// The frame carries the password, and [`Session::resume`]'s the token,
-    /// so both are wiped once sent.
+    /// so the string is wiped when dropped; copies a transport makes of it
+    /// are the transport's.
     pub fn login(&mut self, params: &LoginParams) -> Result<Zeroizing<String>, StateError> {
         self.begin(Pending::Login, "login", json!(params))
     }

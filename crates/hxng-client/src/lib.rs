@@ -5,6 +5,8 @@
 //! and refuses a frame that breaks it, so that a gap or a misplaced reply
 //! is found where it happens rather than as a roster that drifted.
 
+#[cfg(feature = "tokio")]
+pub mod driver;
 mod frame;
 mod handshake;
 mod session;
