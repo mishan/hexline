@@ -94,9 +94,13 @@ enum Cmd {
     Sync {
         answer: oneshot::Sender<Result<Result<SyncOk, ErrorReply>, Error>>,
     },
+    Close,
 }
 
-/// A live connection. Dropping it closes the socket.
+/// A live connection, shared by cloning. Dropping the last clone closes
+/// the socket; [`Client::close`] closes it whoever else holds one, failing
+/// what they await.
+#[derive(Clone)]
 pub struct Client {
     cmds: mpsc::UnboundedSender<Cmd>,
 }
@@ -198,6 +202,10 @@ impl Client {
         wait.await.map_err(|_| Error::Closed)?
     }
 
+    pub fn close(&self) {
+        let _ = self.cmds.send(Cmd::Close);
+    }
+
     /// The roster whole and the seq to continue from (§6.3).
     pub async fn sync(&self) -> Result<Result<SyncOk, ErrorReply>, Error> {
         let (answer, wait) = oneshot::channel();
@@ -237,6 +245,12 @@ async fn run(
     loop {
         tokio::select! {
             () = sleep_until(deadline) => break,
+            // Nobody is listening: the app dropped its updates.
+            () = updates.closed() => {
+                let _ = ws.close(None).await;
+                code = u16::from(CloseCode::Normal);
+                break;
+            }
             msg = ws.next() => match msg {
                 Some(Ok(Message::Text(t))) => match session.receive(&t) {
                     Ok(Output::Event { seq, ev, data }) => {
@@ -290,7 +304,7 @@ async fn run(
                 Some(Err(_)) | None => break,
             },
             cmd = cmds.recv() => {
-                let Some(cmd) = cmd else {
+                let Some(cmd) = cmd.filter(|c| !matches!(c, Cmd::Close)) else {
                     let _ = ws.close(None).await;
                     code = u16::from(CloseCode::Normal);
                     break;
@@ -304,6 +318,7 @@ async fn run(
                         Ok((id, frame)) => { syncs.push_back(id); (id, frame, Waiter::Sync(answer)) }
                         Err(e) => { let _ = answer.send(Err(Error::Rejected(e))); continue; }
                     },
+                    Cmd::Close => unreachable!("handled above"),
                 };
                 waiters.insert(id, waiter);
                 if ws.send(Message::text(frame)).await.is_err() {

@@ -22,6 +22,15 @@ val buildCore by tasks.registering(Exec::class) {
     outputs.dir(layout.buildDirectory.dir("rust"))
 }
 
+// The verifier's Kotlin half must be the version its crate was built
+// against, which is whatever Cargo.lock resolved.
+val rustlsVerifierVersion: String =
+    providers.fileContents(rootProject.layout.projectDirectory.file("../Cargo.lock")).asText.get().lines().let { lines ->
+        val at = lines.indexOfFirst { it == "name = \"rustls-platform-verifier-android\"" }
+        require(at >= 0) { "rustls-platform-verifier-android is not in Cargo.lock" }
+        lines[at + 1].substringAfter('"').substringBefore('"')
+    }
+
 android {
     namespace = "org.foggyden.hexline"
     compileSdk {
@@ -72,6 +81,9 @@ android {
     testOptions {
         // The JVM tests call the core through the same bindings, loaded
         // from a build for the host.
+        // The bindings ask Build.VERSION which cleaner to use; on the JVM
+        // the stub answers 0 and they take JNA's.
+        unitTests.isReturnDefaultValues = true
         unitTests.all {
             it.dependsOn(buildCore)
             it.systemProperty(
@@ -98,6 +110,8 @@ dependencies {
     implementation(libs.compose.material3)
     implementation(libs.activity.compose)
     implementation("${libs.jna.get()}@aar")
+    implementation(libs.coroutines)
+    implementation(libs.rustls.platform.verifier) { version { strictly(rustlsVerifierVersion) } }
 
     testImplementation(libs.junit)
     testImplementation(libs.jna)

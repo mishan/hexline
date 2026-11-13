@@ -26,6 +26,7 @@ test:
 # The driver against a real hxd, the binary HXD_BIN names.
 test-live:
 	cargo test -p hxng-client --features live-tests --locked --test live
+	cargo test -p hexline-core --features live-tests --locked --test live
 
 build:
 	$(GRADLE) :app:assembleFdroidDebug :app:assemblePlayDebug

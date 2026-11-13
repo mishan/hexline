@@ -28,4 +28,15 @@ if ! "$adb" get-state >/dev/null 2>&1; then
     done
 fi
 
+results=app/build/outputs/androidTest-results/connected
+rm -rf "$results"
 ./gradlew --no-daemon :app:connectedFdroidDebugAndroidTest
+
+# The Android Gradle plugin records a run whose app crashed as a failed
+# test in its results and still reports the build successful, so the
+# results are what decide.
+if grep -rqE 'failures="[1-9]|errors="[1-9]' "$results" || ! grep -rq '<testcase' "$results"; then
+    grep -rh '<failure' "$results" | head -5 >&2
+    echo "instrumented tests failed" >&2
+    exit 1
+fi
