@@ -46,9 +46,10 @@ jobs:
         id: hxd
         with:
           path: ~/.hxd
-          key: hxd-${{ env.HXD_TAG }}-${{ runner.os }}-${{ env.ImageOS }}
+          key: hxd-${{ env.HXD_TAG }}-inbox-${{ runner.os }}-${{ env.ImageOS }}
       - if: steps.hxd.outputs.cache-hit != 'true'
-        run: cargo install --locked --no-default-features --git https://github.com/mishan/hxd-ng --tag "$HXD_TAG" hxd --root ~/.hxd
+        # inbox brings the SQLite store the tests' chat history is kept in.
+        run: cargo install --locked --no-default-features --features inbox --git https://github.com/mishan/hxd-ng --tag "$HXD_TAG" hxd --root ~/.hxd
       - run: HXD_BIN=~/.hxd/bin/hxd make test-live
 
   android:

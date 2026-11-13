@@ -37,7 +37,7 @@ fn free_port() -> u16 {
 
 fn account(name: &str) -> String {
     format!(
-        "name = \"{name}\"\npassword = \"pw-{name}\"\n[access]\nread_chat = true\nsend_chat = true\nsend_msgs = true\n"
+        "name = \"{name}\"\npassword = \"pw-{name}\"\n[access]\nread_chat = true\nread_chat_history = true\nsend_chat = true\nsend_msgs = true\n"
     )
 }
 
@@ -66,7 +66,8 @@ impl Server {
                 "[server]\nbind = \"127.0.0.1:{legacy}\"\nname = \"{name}\"\n\
                  [paths]\naccounts = \"accounts\"\n\
                  [ng]\nbind = \"127.0.0.1:{ng}\"\n\
-                 [limits]\nng_requests = 0\nreconnect_seconds = 0\n"
+                 [limits]\nng_requests = 0\nreconnect_seconds = 0\n\
+                 [history]\ndb = \"history.db\"\n"
             ),
         )
         .unwrap();
@@ -91,6 +92,11 @@ impl Server {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        panic!("hxd did not listen on {ng}");
+        let log = std::fs::read_to_string(server._dir.0.join("hxd.log")).unwrap_or_default();
+        let tail: Vec<&str> = log.lines().rev().take(20).collect();
+        panic!(
+            "hxd did not listen on {ng}; its log ends:\n{}",
+            tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+        );
     }
 }

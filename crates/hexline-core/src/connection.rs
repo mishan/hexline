@@ -6,8 +6,10 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use hxng_client::driver::{self, Client, Start, Update, Updates};
 use hxng_client::{LoginParams, Output};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::runtime::Runtime;
+
+use crate::model::{ChatLine, HistoryPage, User};
 
 /// The runtime every connection's task and pump runs on. uniffi's own
 /// is one thread, shared with whatever else polls through it; this one is
@@ -72,19 +74,56 @@ impl From<driver::Error> for CoreError {
 #[derive(Debug, uniffi::Record)]
 pub struct LoginInfo {
     pub server_name: String,
-    pub subject: String,
     pub caps: Vec<String>,
     /// Whether the server lets this session survive a lost connection
     /// (§2). Resuming it is the app's to do, from slice 6 on.
     pub can_resume: bool,
 }
 
-/// What the app is told, in order. Payloads are the event's JSON until
-/// the slices that render them type them.
+/// What the app is told, in order.
 #[derive(Debug, uniffi::Enum)]
 pub enum CoreUpdate {
-    Event {
-        seq: u64,
+    /// Everyone present, this session included, and the subject: the
+    /// first update of every connection, and again whole whenever the
+    /// server says the app's copy may be behind. Every update after it
+    /// applies to it, so none can arrive about a roster not yet had.
+    Roster {
+        self_uid: u16,
+        users: Vec<User>,
+        subject: String,
+    },
+    UserJoined {
+        user: User,
+    },
+    UserChanged {
+        user: User,
+    },
+    UserParted {
+        uid: u16,
+    },
+    Chat {
+        line: ChatLine,
+    },
+    /// The lobby's subject, or with `room` a room's topic.
+    Subject {
+        subject: String,
+        room: Option<u64>,
+    },
+    /// A server notice, such as a kick's announcement.
+    Notice {
+        text: String,
+        room: Option<u64>,
+    },
+    /// An administrator's message to everyone.
+    Broadcast {
+        nick: String,
+        text: String,
+    },
+    /// This session was kicked: the `Closed` after it is not to be resumed.
+    Kicked,
+    /// An event this build does not show yet, as its JSON: still in order,
+    /// so nothing after it is told out of turn.
+    Other {
         ev: String,
         data: String,
     },
@@ -163,10 +202,22 @@ impl ServerConnection {
         let mut state = self.state.lock().unwrap();
         let ok = match connected {
             Ok((client, Output::LoggedIn(ok), updates)) => {
+                let Some(me) = User::from_json(&ok.self_user) else {
+                    *state = State::Idle;
+                    return Err(CoreError::Protocol {
+                        detail: "the login's own user does not read".into(),
+                    });
+                };
+                let roster = CoreUpdate::Roster {
+                    self_uid: me.uid,
+                    users: ok.users.iter().filter_map(User::from_json).collect(),
+                    subject: ok.server.subject.clone(),
+                };
                 let generation = self
                     .generations
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let pump = RUNTIME.spawn(pump(
+                    roster,
                     updates,
                     self.sink.clone(),
                     self.state.clone(),
@@ -192,7 +243,6 @@ impl ServerConnection {
         };
         Ok(LoginInfo {
             server_name: ok.server.name,
-            subject: ok.server.subject,
             caps: ok.caps,
             can_resume: ok.detach.is_some(),
         })
@@ -209,6 +259,43 @@ impl ServerConnection {
                 code: e.code,
                 detail: e.text,
             })
+    }
+
+    /// A page of lobby lines, oldest first, by line id: the newest `limit`
+    /// below `before` (or the newest of all), scrolling back; or with
+    /// `after`, the oldest `limit` above it, catching up after a gap.
+    /// `has_more` says more lie beyond the page in the direction it went.
+    /// `not_available` where the server keeps no history.
+    pub async fn history(
+        &self,
+        before: Option<u64>,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<HistoryPage, CoreError> {
+        let client = self.client()?;
+        let mut params = json!({ "limit": limit.clamp(1, 200) });
+        if let Some(before) = before {
+            params["before"] = json!(before);
+        }
+        if let Some(after) = after {
+            params["after"] = json!(after);
+        }
+        let ok = RUNTIME
+            .spawn(async move { client.request("history", params).await })
+            .await
+            .expect("a request does not panic")?
+            .map_err(|e| CoreError::Refused {
+                code: e.code,
+                detail: e.text,
+            })?;
+        Ok(HistoryPage {
+            lines: ok
+                .get("lines")
+                .and_then(Value::as_array)
+                .map(|ls| ls.iter().filter_map(ChatLine::from_json).collect())
+                .unwrap_or_default(),
+            has_more: ok.get("has_more").and_then(Value::as_bool).unwrap_or(false),
+        })
     }
 
     /// Drops the connection; the session detaches if it may. Not `close`,
@@ -236,11 +323,15 @@ impl ServerConnection {
 /// Hands the app its updates a batch at a time until the connection
 /// ends, then leaves the connection free for the next login.
 async fn pump(
+    first: CoreUpdate,
     mut updates: Updates,
     sink: Arc<dyn UpdateSink>,
     state: Arc<Mutex<State>>,
     generation: u64,
 ) {
+    if catch_unwind(AssertUnwindSafe(|| sink.deliver(vec![first]))).is_err() {
+        return;
+    }
     let mut batch = Vec::with_capacity(BATCH);
     while updates.recv_many(&mut batch, BATCH).await > 0 {
         let done = batch.iter().any(|u| matches!(u, Update::Closed { .. }));
@@ -261,14 +352,92 @@ async fn pump(
 
 fn core_update(u: Update) -> CoreUpdate {
     match u {
-        Update::Event { seq, ev, data } => CoreUpdate::Event {
-            seq,
-            ev,
-            data: data.to_string(),
-        },
+        Update::Event { ev, data, .. } => event(ev, data),
         Update::Closed { lost, .. } => CoreUpdate::Closed {
             can_resume: lost.resumable.is_some(),
             replaced: lost.replaced,
         },
+    }
+}
+
+/// One event as the app is told it; one this build cannot read as what it
+/// says it is goes on as `Other`, rather than missing.
+fn event(ev: String, data: Value) -> CoreUpdate {
+    let user = || data.get("user").and_then(User::from_json);
+    let text = |k| data.get(k).and_then(Value::as_str).map(str::to_owned);
+    let room = data.get("room").and_then(Value::as_u64).filter(|&r| r != 0);
+    let typed = match ev.as_str() {
+        "user_joined" => user().map(|user| CoreUpdate::UserJoined { user }),
+        "user_changed" => user().map(|user| CoreUpdate::UserChanged { user }),
+        "user_parted" => data
+            .get("uid")
+            .and_then(Value::as_u64)
+            .and_then(|u| u16::try_from(u).ok())
+            .map(|uid| CoreUpdate::UserParted { uid }),
+        "chat" => ChatLine::from_json(&data).map(|line| CoreUpdate::Chat { line }),
+        "subject" => text("subject").map(|subject| CoreUpdate::Subject { subject, room }),
+        "notice" => text("text").map(|text| CoreUpdate::Notice { text, room }),
+        "broadcast" => data
+            .get("from")
+            .and_then(|f| f.get("nick"))
+            .and_then(Value::as_str)
+            .zip(text("text"))
+            .map(|(nick, text)| CoreUpdate::Broadcast {
+                nick: nick.to_owned(),
+                text,
+            }),
+        "kicked" => Some(CoreUpdate::Kicked),
+        _ => None,
+    };
+    typed.unwrap_or_else(|| CoreUpdate::Other {
+        ev,
+        data: data.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn events_are_typed_or_passed_on_as_themselves() {
+        let user = json!({ "uid": 3, "nick": "Alice" });
+        let cases: Vec<(&str, Value, &str)> = vec![
+            ("user_joined", json!({ "user": user }), "UserJoined"),
+            ("user_changed", json!({ "user": user }), "UserChanged"),
+            ("user_parted", json!({ "uid": 3 }), "UserParted"),
+            ("user_parted", json!({ "uid": 70000 }), "Other"),
+            (
+                "chat",
+                json!({ "from": { "uid": 3, "nick": "Alice" }, "text": "hi", "at": 1 }),
+                "Chat",
+            ),
+            ("subject", json!({ "subject": "welcome" }), "Subject"),
+            (
+                "notice",
+                json!({ "text": "alice was kicked", "room": 4 }),
+                "Notice",
+            ),
+            (
+                "broadcast",
+                json!({ "from": { "uid": 1, "nick": "admin" }, "text": "restart at 5" }),
+                "Broadcast",
+            ),
+            ("kicked", json!({}), "Kicked"),
+            ("msg", json!({ "text": "later" }), "Other"),
+            (
+                "user_joined",
+                json!({ "user": { "nick": "no uid" } }),
+                "Other",
+            ),
+        ];
+        for (ev, data, want) in cases {
+            let got = format!("{:?}", event(ev.into(), data.clone()));
+            assert!(got.starts_with(want), "{ev} {data}: {got}");
+        }
+        assert!(matches!(
+            event("subject".into(), json!({ "subject": "topic", "room": 4 })),
+            CoreUpdate::Subject { room: Some(4), .. }
+        ));
     }
 }
