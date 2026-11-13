@@ -88,6 +88,10 @@ struct Kept {
     /// Begun with no credentials: logging in again without any is the same
     /// guest, where for an account it would be someone else.
     guest: bool,
+    /// The identity the session is, and what the server made of it, for a
+    /// session an identity logged in to.
+    fingerprint: Option<String>,
+    outcome: Option<String>,
 }
 
 impl Kept {
@@ -102,6 +106,8 @@ impl Kept {
             "self_uid": self.self_uid,
             "caps": self.caps,
             "guest": self.guest,
+            "fingerprint": self.fingerprint,
+            "outcome": self.outcome,
         })
         .to_string()
         .into_bytes()
@@ -128,6 +134,9 @@ impl Kept {
                 .filter_map(|c| c.as_str().map(str::to_owned))
                 .collect(),
             guest: v.get("guest")?.as_bool()?,
+            // Absent from a session saved before identities were.
+            fingerprint: text("fingerprint"),
+            outcome: text("outcome"),
         })
     }
 }
@@ -229,6 +238,9 @@ pub enum CoreUpdate {
     /// lines said meanwhile are history's to fill in.
     Reconnected {
         gap: bool,
+        /// After a fresh login, what it was: the server may have made of an
+        /// identity something else than before (hotline-ng-identity.md §5.3).
+        info: Option<LoginInfo>,
     },
     /// The server refused to take the session back, with its `code`: the
     /// `Closed` that follows is for good.
@@ -577,10 +589,11 @@ impl ServerConnection {
 
     /// What resumes this session after the app is restarted: bytes to keep
     /// as a secret, since they hold the session's token, and to hand back
-    /// to [`ServerConnection::login`]. `None` once the session cannot be
-    /// resumed. As of the last batch the app has returned from, never
-    /// ahead of it: one taken while a batch is being handed over resumes
-    /// before that batch, which comes again, its lines with their ids.
+    /// to [`ServerConnection::login`] or [`ServerConnection::login_identity`].
+    /// `None` once the session cannot be resumed. As of the last batch the
+    /// app has returned from, never ahead of it: one taken while a batch is
+    /// being handed over resumes before that batch, which comes again, its
+    /// lines with their ids.
     pub fn saved(&self) -> Option<Vec<u8>> {
         self.shared.kept.lock().unwrap().as_ref().map(Kept::encode)
     }
@@ -615,6 +628,8 @@ struct Link {
     guest: bool,
     /// Events were missed: the session is new, or was synced.
     gap: bool,
+    /// Made by a login, not a resume.
+    fresh: bool,
 }
 
 /// A resume refused for good, where a login may still do.
@@ -631,7 +646,12 @@ async fn begin(url: &str, creds: &Credentials, saved: Option<&[u8]>) -> Result<L
             detail: "the saved session does not read".into(),
         });
     }
-    if let Some(kept) = kept.flatten() {
+    // A saved session another identity's, or a password's for an
+    // identity, is not this login's to resume: it logs in afresh.
+    if let Some(kept) = kept
+        .flatten()
+        .filter(|k| k.fingerprint.as_deref() == creds.fingerprint())
+    {
         let start = Start::Resume(kept.resumable.clone());
         match establish(url, &start, Some(&kept), true, None).await {
             Err(CoreError::Refused { code, detail }) if gone(&code) => {
@@ -668,6 +688,14 @@ impl Credentials {
     /// Whether a lapsed session may be logged in again with these: an
     /// identity always, a password if there is a login, and none only for
     /// a session that was a guest's to begin with.
+    /// The identity these credentials log in as, if any.
+    fn fingerprint(&self) -> Option<&str> {
+        match self {
+            Credentials::Password(_) => None,
+            Credentials::Identity { fingerprint, .. } => Some(fingerprint),
+        }
+    }
+
     fn may_log_in_again(&self, guest: bool) -> bool {
         match self {
             Credentials::Password(p) => p.login.is_some() || guest,
@@ -688,16 +716,27 @@ async fn log_in(url: &str, creds: &Credentials) -> Result<Link, CoreError> {
             create,
             fingerprint,
         } => {
-            // A challenge lapsed or forgotten between its two requests
-            // (a server restarted, a slow link): proved once more.
-            let token = match auth::identity_token(url, device, *create, None).await {
-                Err(driver::Error::Refused(r)) if r.error.code == "unknown_challenge" => {
-                    auth::identity_token(url, device, *create, None).await?
-                }
-                other => other?,
-            };
             let start = Start::Login(LoginParams::default());
-            let mut link = establish(url, &start, None, false, Some(&token)).await?;
+            // A challenge lapsed between its two requests, or a token the
+            // upgrade refused (a server restarted, a slow link): proved
+            // once more, then taken as the answer.
+            let mut again = true;
+            let mut link = loop {
+                let tried = async {
+                    let token = auth::identity_token(url, device, *create, None).await?;
+                    establish(url, &start, None, false, Some(&token)).await
+                }
+                .await;
+                match tried {
+                    Err(CoreError::Refused { code, .. })
+                        if again
+                            && matches!(code.as_str(), "unknown_challenge" | "token_refused") =>
+                    {
+                        again = false
+                    }
+                    other => break other?,
+                }
+            };
             // The session the server made is the identity's, or the token
             // never reached it (a front that strips `Authorization` lets
             // the upgrade in unauthenticated) and this is someone else.
@@ -720,8 +759,10 @@ async fn log_in(url: &str, creds: &Credentials) -> Result<Link, CoreError> {
 
 /// A device's keys as the app holds them: the 32-byte seed its key is
 /// made from, the certificate its identity signed, and the identity's card.
-/// The seed is as secret as a password: the core wipes its copy, and the
-/// app wipes the array it handed over.
+/// The seed is as secret as a password. The core wipes the copy it keeps;
+/// the copies the FFI makes on the way are not wiped, nor is the array the
+/// app handed over unless the app wipes it. Seeds made in the core will
+/// end the crossing.
 #[derive(uniffi::Record)]
 pub struct DeviceIdentity {
     pub device_seed: Vec<u8>,
@@ -786,14 +827,16 @@ async fn establish(
             self_uid,
             caps: k.caps.clone(),
             guest: k.guest,
+            fingerprint: k.fingerprint.clone(),
+            outcome: k.outcome.clone(),
         })
     };
     let info = |name: String| LoginInfo {
         server_name: name,
         caps: known.map(|k| k.caps.clone()).unwrap_or_default(),
         can_resume: true,
-        fingerprint: None,
-        outcome: None,
+        fingerprint: known.and_then(|k| k.fingerprint.clone()),
+        outcome: known.and_then(|k| k.outcome.clone()),
     };
     let guest = known.is_some_and(|k| k.guest);
     match answer {
@@ -823,9 +866,12 @@ async fn establish(
                     self_uid,
                     caps: ok.caps.clone(),
                     guest,
+                    fingerprint: identity_field(&ok.self_user, "fingerprint"),
+                    outcome: identity_field(&ok.self_user, "outcome"),
                 }),
                 guest,
                 gap: true,
+                fresh: true,
                 client,
                 updates,
             })
@@ -846,6 +892,7 @@ async fn establish(
                 kept: resumed(last_seq, self_uid),
                 guest,
                 gap: must_sync,
+                fresh: false,
                 client,
                 updates,
             })
@@ -861,6 +908,7 @@ async fn establish(
                 kept: resumed(last_seq, self_uid),
                 guest,
                 gap: true,
+                fresh: false,
                 client,
                 updates,
             })
@@ -1193,7 +1241,13 @@ async fn pump(
     let mut first = std::mem::take(&mut link.first);
     let mut kicked = first.iter().any(|u| matches!(u, CoreUpdate::Kicked));
     if announce {
-        first.insert(0, CoreUpdate::Reconnected { gap: link.gap });
+        first.insert(
+            0,
+            CoreUpdate::Reconnected {
+                gap: link.gap,
+                info: link.fresh.then(|| link.info.clone()),
+            },
+        );
     }
     if !shared.deliver(first) {
         link.client.close();
@@ -1367,6 +1421,8 @@ mod tests {
             self_uid: 3,
             caps: vec!["history".into()],
             guest: false,
+            fingerprint: Some("hl1qexample".into()),
+            outcome: Some("linked".into()),
         };
         let back = Kept::decode(&kept.encode()).unwrap();
         assert_eq!(back.encode(), kept.encode());

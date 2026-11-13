@@ -70,7 +70,9 @@ pub async fn identity_token(
             "card": URL_SAFE_NO_PAD.encode(&device.card),
             "device_cert": URL_SAFE_NO_PAD.encode(&device.cert),
             "proof": URL_SAFE_NO_PAD.encode(&proof),
-            "downstream": "local",
+            // Over plain ws to another machine the hop is cleartext, and
+            // the session must not be shown as safer than it is (§8).
+            "downstream": if base.starts_with("http:") && !loopback(&host) { "cleartext" } else { "local" },
             "create": create,
         })),
     )
@@ -85,19 +87,27 @@ pub async fn identity_token(
 /// server's own signature over them holds for `host`. Nothing is signed for
 /// a server that has not shown it holds the key it names for this host:
 /// one publishing another's key could hand on that server's challenge and
-/// spend the answer there. Every refusal here is final.
+/// spend the answer there. A reply this refuses is refused for good.
 fn vouched(reply: &Value, host: &str, now: u64) -> Result<([u8; 32], PublicKey), Error> {
     let bytes = |key: &str| -> Result<Vec<u8>, Error> {
         reply
             .get(key)
             .and_then(Value::as_str)
             .and_then(|s| URL_SAFE_NO_PAD.decode(s).ok())
-            .ok_or_else(|| protocol(&format!("the challenge's {key} does not read")))
+            .ok_or_else(|| {
+                refused(
+                    "bad_challenge",
+                    &format!("the challenge's {key} does not read"),
+                )
+            })
     };
     let exact = |key: &str| -> Result<[u8; 32], Error> {
-        bytes(key)?
-            .try_into()
-            .map_err(|_| protocol(&format!("the challenge's {key} does not read")))
+        bytes(key)?.try_into().map_err(|_| {
+            refused(
+                "bad_challenge",
+                &format!("the challenge's {key} does not read"),
+            )
+        })
     };
     let (nonce, server_key) = (exact("challenge")?, exact("server_key")?);
     let signed = bytes("server_challenge").map_err(|_| {
@@ -124,6 +134,18 @@ fn vouched(reply: &Value, host: &str, now: u64) -> Result<([u8; 32], PublicKey),
             &format!("the server's challenge does not hold: {e}"),
         )),
     }
+}
+
+/// Whether `host` (in [`canonical_host`] form) is this machine.
+fn loopback(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => host.rsplit_once(':').map_or(host, |(h, _)| h),
+    };
+    name == "localhost"
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// The HTTP base an ng URL's server answers at, and the host it is
@@ -155,10 +177,7 @@ async fn post(http: &reqwest::Client, url: &str, body: Option<Value>) -> Result<
         .await
         .map_err(|e| Error::Connect(e.to_string()))?;
     let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| Error::Connect(e.to_string()))?;
+    let text = bounded(resp).await?;
     if status.is_success() {
         return serde_json::from_str(&text).map_err(|_| protocol("a reply that is not JSON"));
     }
@@ -192,6 +211,26 @@ async fn post(http: &reqwest::Client, url: &str, body: Option<Value>) -> Result<
         error: refusal,
         resumable: None,
     })))
+}
+
+/// What a reply says, read no further than any of these replies reaches:
+/// a captive portal or a hostile server streaming more is cut off.
+async fn bounded(mut resp: reqwest::Response) -> Result<String, Error> {
+    const MOST: usize = 64 * 1024;
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| Error::Connect(e.to_string()))?
+    {
+        if body.len() + chunk.len() > MOST {
+            return Err(Error::Connect(
+                "a reply longer than any identity reply".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 fn refused(code: &str, text: &str) -> Error {
@@ -254,6 +293,20 @@ mod tests {
         }
         for bad in ["https://hx.example/ng", "wss://user@hx.example/ng"] {
             assert!(base_of(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_this_machine_is_a_local_hop() {
+        for (host, local) in [
+            ("127.0.0.1:5700", true),
+            ("localhost", true),
+            ("[::1]:5700", true),
+            ("10.0.2.2:5700", false),
+            ("hx.example", false),
+            ("[2001:db8::1]:5700", false),
+        ] {
+            assert_eq!(loopback(host), local, "{host}");
         }
     }
 

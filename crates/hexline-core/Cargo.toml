@@ -21,8 +21,7 @@ hxng-client = { path = "../hxng-client", features = ["tokio"] }
 tokio = { version = "1.54", features = ["rt-multi-thread", "sync"] }
 serde_json = { workspace = true }
 zeroize = { workspace = true }
-# hxd-ng's pin, advanced with it.
-hl-identity = { git = "https://github.com/mishan/hx-libs.git", rev = "8cb5063c644972051492b1e1eab55e636f18a77d" }
+hl-identity = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # The platform verifier calls Android's trust manager through the JVM, and

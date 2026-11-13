@@ -272,7 +272,7 @@ async fn a_lost_link_is_resumed_and_what_was_missed_replayed() {
     alice.network_changed();
     sink.heard("the replay", said("while you were out")).await;
     let back = sink
-        .at(|u| matches!(u, CoreUpdate::Reconnected { gap: false }))
+        .at(|u| matches!(u, CoreUpdate::Reconnected { gap: false, .. }))
         .unwrap();
     assert!(
         back < sink.at(said("while you were out")).unwrap(),
@@ -306,7 +306,7 @@ async fn a_session_that_expired_while_the_link_was_down_is_logged_in_again() {
     proxy.refuse(false);
     alice.network_changed();
     sink.heard("back", |u| {
-        matches!(u, CoreUpdate::Reconnected { gap: true })
+        matches!(u, CoreUpdate::Reconnected { gap: true, .. })
     })
     .await;
     let back = sink
@@ -397,7 +397,7 @@ async fn in_the_background_the_link_goes_and_comes_back_at_the_front() {
     );
     alice.set_foreground(true);
     sink.heard("back", |u| {
-        matches!(u, CoreUpdate::Reconnected { gap: false })
+        matches!(u, CoreUpdate::Reconnected { gap: false, .. })
     })
     .await;
     bob_sink
@@ -614,8 +614,10 @@ async fn an_identity_logs_in_and_after_its_session_lapses_proves_its_device_agai
         .await;
     proxy.refuse(false);
     alice.network_changed();
+    // The fresh login's account of the identity, told with it.
     sink.heard("back", |u| {
-        matches!(u, CoreUpdate::Reconnected { gap: true })
+        matches!(u, CoreUpdate::Reconnected { gap: true, info: Some(i) }
+            if i.fingerprint.as_deref() == Some(fingerprint.as_str()))
     })
     .await;
     assert_ne!(saved_field(&alice.saved().unwrap(), "session"), first);
@@ -663,4 +665,52 @@ async fn a_session_the_server_did_not_make_the_identitys_is_refused() {
         Err(CoreError::Refused { code, .. }) => assert_eq!(code, "identity_not_honored"),
         other => panic!("{other:?}"),
     }
+}
+
+#[tokio::test]
+async fn an_identity_the_server_makes_a_guest_of_is_still_its_own_session() {
+    let server = Server::with_guest_identity(&["guest"]).await;
+    let alice = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
+    let (device, fingerprint) = identity("Alice");
+    let info = alice.login_identity(device, true, None).await.unwrap();
+    assert_eq!(info.fingerprint.as_deref(), Some(fingerprint.as_str()));
+    assert!(info.outcome.is_some(), "{info:?}");
+}
+
+#[tokio::test]
+async fn an_identitys_session_resumes_as_itself_and_another_identitys_is_not_resumed() {
+    let server = Server::with_identity(&[], 300).await;
+    let proxy = Proxy::to(&server).await;
+    let sink = Arc::new(Sink::default());
+    let alice = ServerConnection::new(proxy.url.clone(), sink.clone());
+    let (device, fingerprint) = identity("Alice");
+    alice.login_identity(device, true, None).await.unwrap();
+    sink.heard("her roster", roster).await;
+    proxy.sever();
+    sink.heard("back", |u| {
+        matches!(
+            u,
+            CoreUpdate::Reconnected {
+                gap: false,
+                info: None
+            }
+        )
+    })
+    .await;
+    let saved = alice.saved().unwrap();
+    assert_eq!(saved_field(&saved, "fingerprint"), Value::from(fingerprint));
+    alice.hang_up(false);
+
+    // Bob's device with Alice's saved session: a login of his own.
+    let bob = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
+    let (device, bobs) = identity("Bob");
+    let info = bob
+        .login_identity(device, true, Some(saved.clone()))
+        .await
+        .unwrap();
+    assert_eq!(info.fingerprint.as_deref(), Some(bobs.as_str()));
+    assert_ne!(
+        saved_field(&bob.saved().unwrap(), "session"),
+        saved_field(&saved, "session")
+    );
 }

@@ -28,8 +28,7 @@ rustls-platform-verifier = { version = "0.7", optional = true }
 futures-util = { version = "0.3", optional = true, default-features = false, features = ["sink", "std"] }
 # Identity's HTTP steps (challenge, auth), over the same rustls config.
 reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls-no-provider", "json"] }
-# hxd-ng's pin, advanced with it.
-hl-identity = { git = "https://github.com/mishan/hx-libs.git", rev = "8cb5063c644972051492b1e1eab55e636f18a77d", optional = true }
+hl-identity = { workspace = true, optional = true }
 base64 = { version = "0.23", optional = true }
 
 [dev-dependencies]

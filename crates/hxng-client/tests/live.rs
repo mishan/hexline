@@ -135,10 +135,10 @@ async fn an_identity_proves_its_device_and_logs_in_on_the_socket_that_proved_it(
     );
 
     // One upgrade a token: the second is refused, not let in as a guest.
-    assert!(matches!(
-        connect_with(&server.url, &anyone, None, Some(&token)).await,
-        Err(Error::Connect(_))
-    ));
+    match connect_with(&server.url, &anyone, None, Some(&token)).await {
+        Err(Error::Refused(r)) => assert_eq!(r.error.code, "token_refused"),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
 }
 
 #[tokio::test]

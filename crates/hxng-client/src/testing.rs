@@ -66,17 +66,24 @@ impl Server {
 
     /// As [`Server::start`], with detached sessions kept `grace` seconds.
     pub async fn with_grace(accounts: &[&str], grace: u64) -> Server {
-        Server::launch(accounts, grace, false).await
+        Server::launch(accounts, grace, None).await
     }
 
     /// As [`Server::with_grace`], taking identity logins at the host it
     /// listens on and its proxy's: from any identity, registrar or none,
     /// made an account of its own when the client asks for one.
     pub async fn with_identity(accounts: &[&str], grace: u64) -> Server {
-        Server::launch(accounts, grace, true).await
+        Server::launch(accounts, grace, Some(("allow", "create"))).await
     }
 
-    async fn launch(accounts: &[&str], grace: u64, identity: bool) -> Server {
+    /// As [`Server::with_identity`], under the default policy: an identity
+    /// no registrar vouches for, or one with no account, logs in as a guest.
+    pub async fn with_guest_identity(accounts: &[&str]) -> Server {
+        Server::launch(accounts, 300, Some(("guest", "guest"))).await
+    }
+
+    /// `identity` is the `unattested` and `new_accounts` policies.
+    async fn launch(accounts: &[&str], grace: u64, identity: Option<(&str, &str)>) -> Server {
         let bin = std::env::var("HXD_BIN").expect(
             "HXD_BIN must name an hxd binary for the live tests (`make test-live` sets it)",
         );
@@ -103,13 +110,12 @@ impl Server {
                  [ng]\nbind = \"127.0.0.1:{ng}\"\ngrace = {grace}\n\
                  [limits]\nng_requests = 0\nreconnect_seconds = 0\n\
                  [history]\ndb = \"history.db\"\n{}",
-                if identity {
-                    format!(
+                match identity {
+                    Some((unattested, new_accounts)) => format!(
                         "[identity]\nhosts = [\"127.0.0.1:{ng}\", \"127.0.0.1:{proxy_port}\"]\n\
-                         unattested = \"allow\"\nnew_accounts = \"create\"\n"
-                    )
-                } else {
-                    String::new()
+                         unattested = \"{unattested}\"\nnew_accounts = \"{new_accounts}\"\n"
+                    ),
+                    None => String::new(),
                 }
             ),
         )

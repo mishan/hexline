@@ -6,8 +6,9 @@
 //! resume, log in again or stop, with everything the protocol says about
 //! which.
 //!
-//! tungstenite logs every frame it writes at `trace`, payloads included:
-//! keep its logging below that, or the login's password and a resume's
+//! tungstenite logs every frame it writes at `trace`, payloads included,
+//! and the upgrade request with its headers: keep its logging below that,
+//! or the login's password, a resume's token and an identity's bearer
 //! token are logged with them.
 
 use std::collections::{HashMap, VecDeque};
@@ -184,7 +185,21 @@ pub async fn connect_with(
             tls.map(Connector::Rustls),
         )
         .await
-        .map_err(|e| Error::Connect(e.to_string()))?;
+        .map_err(|e| match e {
+            // The token unknown, spent, or not wanted here (auth §7.1).
+            tokio_tungstenite::tungstenite::Error::Http(r) if r.status() == 401 => {
+                Error::Refused(Box::new(Refusal {
+                    error: ErrorReply {
+                        code: "token_refused".into(),
+                        text: "the server refused the token on the upgrade".into(),
+                        retry_after: None,
+                        rest: Default::default(),
+                    },
+                    resumable: None,
+                }))
+            }
+            e => Error::Connect(e.to_string()),
+        })?;
         ws.send(Message::text(first.as_str()))
             .await
             .map_err(|_| Error::Closed)?;
