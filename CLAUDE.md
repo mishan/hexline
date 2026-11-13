@@ -29,7 +29,9 @@ make connected   # instrumented tests
 
 ## Rules
 
-- Kotlin renders; Rust decides. No protocol, CBOR or crypto in Kotlin.
+- Kotlin renders; Rust decides. No protocol, CBOR or crypto in Kotlin,
+  save sealing secrets at rest with the Android Keystore
+  (`secrets/SecretStore.kt`), which only the platform's Java API reaches.
 - The `fdroid` flavor carries nothing proprietary.
 - Pin versions: the toolchain in `rust-toolchain.toml`, Android libraries in
   `android/gradle/libs.versions.toml`, actions by commit SHA, the Gradle
