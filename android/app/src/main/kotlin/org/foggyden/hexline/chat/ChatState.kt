@@ -13,6 +13,9 @@ sealed interface Why {
 
     data object Lost : Why
 
+    /** A saved session the server no longer has, with no password to log in again. */
+    data object Expired : Why
+
     data object Unreachable : Why
 
     data object WrongPassword : Why
@@ -33,6 +36,7 @@ fun refusal(code: String): Why =
     when (code) {
         "login_failed" -> Why.WrongPassword
         "kicked" -> Why.Kicked
+        "session_expired" -> Why.Expired
         "replaced" -> Why.Replaced
         "banned" -> Why.Banned
         "server_full" -> Why.Full
@@ -78,6 +82,11 @@ sealed interface Entry {
         val text: String,
     ) : Entry
 
+    /** Lines said while the link was down, more than were filled in. */
+    data class Missed(
+        override val key: Long,
+    ) : Entry
+
     data class NotSent(
         override val key: Long,
         val why: Why,
@@ -103,6 +112,8 @@ data class ChatState(
     val leaving: Boolean = false,
     /** What the server said when it would not take the session back. */
     val refused: String? = null,
+    /** Lines were missed after this one: history is to fill them in. */
+    val fillAfter: ULong? = null,
     private val nextKey: Long = 0,
 ) {
     private val shownIds: Set<ULong> by lazy { entries.mapNotNullTo(HashSet()) { (it as? Entry.Line)?.line?.id } }
@@ -129,7 +140,9 @@ data class ChatState(
             is CoreUpdate.Broadcast -> appended { Entry.Broadcast(it, update.nick, update.text) }
             is CoreUpdate.Kicked -> copy(kicked = true)
             is CoreUpdate.Reconnecting -> copy(link = Link.Reconnecting(update.attempt))
-            is CoreUpdate.Reconnected -> copy(link = Link.Live)
+            is CoreUpdate.Reconnected ->
+                // From the earliest gap still open, so a second does not cut short the first.
+                copy(link = Link.Live, fillAfter = if (update.gap) listOfNotNull(fillAfter, newestId).minOrNull() else fillAfter)
             is CoreUpdate.Refused -> copy(refused = update.code)
             is CoreUpdate.Closed ->
                 copy(
@@ -164,6 +177,38 @@ data class ChatState(
         val joined = copy(entries = earlier.map { Entry.Line(keys.next(), it) } + entries, nextKey = nextKey + earlier.size)
         return joined.copy(earlierToLoad = hasMore && joined.oldestId != null && joined.oldestId != before)
     }
+
+    /**
+     * A page of history from after [fillAfter], each line put among those
+     * shown by its id, so lines said while the link was down fall before the
+     * ones heard since. A page that adds nothing ends the filling.
+     */
+    fun withLater(
+        page: List<ChatLine>,
+        hasMore: Boolean,
+    ): ChatState {
+        val missed = page.filter { it.id != null && it.id !in shownIds }
+        var next = nextKey
+        val merged = entries.toMutableList()
+        for (line in missed) {
+            val at = merged.indexOfFirst { e -> (e as? Entry.Line)?.line?.id?.let { it > line.id!! } == true }
+            merged.add(if (at < 0) merged.size else at, Entry.Line(next++, line))
+        }
+        val newest = missed.lastOrNull()?.id
+        return copy(entries = merged, nextKey = next, fillAfter = if (hasMore && newest != null) newest else null)
+    }
+
+    /** Gives up filling, marking where the lines that were not filled belong. */
+    fun withMissed(): ChatState {
+        val after = fillAfter ?: return this
+        val at = entries.indexOfFirst { e -> (e as? Entry.Line)?.line?.id?.let { it > after } == true }
+        val marked = entries.toMutableList().apply { add(size, Entry.Missed(nextKey)) }
+        return copy(entries = marked, nextKey = nextKey + 1, fillAfter = null)
+    }
+
+    /** The newest line shown that has an id. */
+    val newestId: ULong?
+        get() = entries.mapNotNull { (it as? Entry.Line)?.line?.id }.maxOrNull()
 
     /** The id to page back from: the oldest line shown that has one. */
     val oldestId: ULong?

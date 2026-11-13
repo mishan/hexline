@@ -15,6 +15,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -36,6 +37,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
@@ -54,17 +56,27 @@ import org.foggyden.hexline.core.ChatLine
 import org.foggyden.hexline.core.Status
 import org.foggyden.hexline.core.User
 import org.foggyden.hexline.core.coreVersion
+import org.foggyden.hexline.servers.Server
 
 @Composable
 fun ConnectScreen(
+    last: Server?,
     error: Why?,
     connecting: Boolean,
-    onConnect: (url: String, login: String?, password: String?) -> Unit,
+    onConnect: (url: String, login: String?, password: String?, remember: Boolean) -> Unit,
 ) {
     var url by rememberSaveable { mutableStateOf("") }
     var login by rememberSaveable { mutableStateOf("") }
     // Not saveable: saved state is written to disk with the task.
     var password by remember { mutableStateOf("") }
+    var rememberPassword by rememberSaveable { mutableStateOf(false) }
+    // The last server arrives once read; it fills only a form not yet begun.
+    LaunchedEffect(last) {
+        if (last != null && url.isEmpty() && login.isEmpty()) {
+            url = last.url
+            login = last.login.orEmpty()
+        }
+    }
     Column(
         Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -94,6 +106,10 @@ fun ConnectScreen(
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
             modifier = Modifier.fillMaxWidth(),
         )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(rememberPassword, { rememberPassword = it })
+            Text(stringResource(R.string.remember_password))
+        }
         if (error != null) {
             Text(
                 describe(error),
@@ -102,7 +118,7 @@ fun ConnectScreen(
             )
         }
         Button(
-            onClick = { onConnect(url.trim(), login.ifBlank { null }, password.ifEmpty { null }) },
+            onClick = { onConnect(url.trim(), login.ifBlank { null }, password.ifEmpty { null }, rememberPassword) },
             enabled = url.isNotBlank() && !connecting,
         ) { Text(stringResource(if (connecting) R.string.connecting else R.string.connect)) }
         Text(
@@ -119,6 +135,7 @@ private fun describe(why: Why): String =
         Why.Kicked -> stringResource(R.string.why_kicked)
         Why.Replaced -> stringResource(R.string.why_replaced)
         Why.Lost -> stringResource(R.string.why_lost)
+        Why.Expired -> stringResource(R.string.why_expired)
         Why.Unreachable -> stringResource(R.string.why_unreachable)
         Why.WrongPassword -> stringResource(R.string.why_wrong_password)
         Why.Banned -> stringResource(R.string.why_banned)
@@ -211,6 +228,7 @@ private fun Transcript(
                 is Entry.Notice -> Aside(entry.text)
                 is Entry.Broadcast -> Aside(stringResource(R.string.broadcast, entry.nick, entry.text))
                 is Entry.NotSent -> Aside(stringResource(R.string.not_sent, describe(entry.why)))
+                is Entry.Missed -> Aside(stringResource(R.string.missed))
             }
         }
     }

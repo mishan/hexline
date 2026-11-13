@@ -22,6 +22,7 @@ jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
 coroutines = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
 lifecycle-viewmodel-compose = { module = "androidx.lifecycle:lifecycle-viewmodel-compose", version.ref = "lifecycle" }
 lifecycle-runtime-compose = { module = "androidx.lifecycle:lifecycle-runtime-compose", version.ref = "lifecycle" }
+lifecycle-process = { module = "androidx.lifecycle:lifecycle-process", version.ref = "lifecycle" }
 # Versioned from Cargo.lock, in app/build.gradle.kts.
 rustls-platform-verifier = { module = "org.rustls:rustls-platform-verifier" }
 junit = { module = "junit:junit", version.ref = "junit" }

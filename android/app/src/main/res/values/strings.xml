@@ -5,6 +5,7 @@
     <string name="server_address">Server (ws:// or wss://)</string>
     <string name="login">Login</string>
     <string name="password">Password</string>
+    <string name="remember_password">Remember password</string>
     <string name="connect">Connect</string>
     <string name="connecting">Connecting…</string>
     <string name="disconnect">Leave</string>
@@ -13,6 +14,7 @@
     <string name="say_something">Say something</string>
     <string name="send">Send</string>
     <string name="line_removed">(removed)</string>
+    <string name="missed">More was said while you were away than is shown here.</string>
     <string name="action">* %1$s %2$s</string>
     <string name="broadcast">%1$s: %2$s</string>
     <string name="not_sent">Not sent: %1$s</string>
@@ -22,6 +24,7 @@
     <string name="why_kicked">You were disconnected by the server.</string>
     <string name="why_replaced">This session was opened somewhere else.</string>
     <string name="why_lost">The connection was lost.</string>
+    <string name="why_expired">The session ended. Sign in again.</string>
     <string name="why_unreachable">The server could not be reached.</string>
     <string name="why_wrong_password">Wrong login or password.</string>
     <string name="why_banned">You are banned from this server.</string>
