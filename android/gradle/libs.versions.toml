@@ -5,6 +5,7 @@ compose-bom = "2026.09.00"
 activity-compose = "1.13.0"
 jna = "5.19.1"
 coroutines = "1.11.0"
+lifecycle = "2.11.0"
 junit = "4.13.2"
 androidx-test-ext = "1.3.0"
 androidx-test-runner = "1.7.0"
@@ -19,6 +20,8 @@ compose-ui-test-manifest = { module = "androidx.compose.ui:ui-test-manifest" }
 activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activity-compose" }
 jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
 coroutines = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
+lifecycle-viewmodel-compose = { module = "androidx.lifecycle:lifecycle-viewmodel-compose", version.ref = "lifecycle" }
+lifecycle-runtime-compose = { module = "androidx.lifecycle:lifecycle-runtime-compose", version.ref = "lifecycle" }
 # Versioned from Cargo.lock, in app/build.gradle.kts.
 rustls-platform-verifier = { module = "org.rustls:rustls-platform-verifier" }
 junit = { module = "junit:junit", version.ref = "junit" }

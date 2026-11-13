@@ -111,6 +111,8 @@ dependencies {
     implementation(libs.activity.compose)
     implementation("${libs.jna.get()}@aar")
     implementation(libs.coroutines)
+    implementation(libs.lifecycle.viewmodel.compose)
+    implementation(libs.lifecycle.runtime.compose)
     implementation(libs.rustls.platform.verifier) { version { strictly(rustlsVerifierVersion) } }
 
     testImplementation(libs.junit)
