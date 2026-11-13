@@ -30,6 +30,7 @@ class ChatStateTest {
                 is Entry.Notice -> "notice: ${it.text}"
                 is Entry.Broadcast -> "broadcast: ${it.nick}: ${it.text}"
                 is Entry.NotSent -> "not sent: ${it.why}"
+                is Entry.Missed -> "missed more"
             }
         }
 
@@ -85,6 +86,52 @@ class ChatStateTest {
                 live.after(CoreUpdate.Refused("login_failed"), CoreUpdate.Closed(false, false)) to Why.WrongPassword,
             )
         for ((s, why) in cases) assertEquals(Link.Ended(why), s.link)
+    }
+
+    @Test
+    fun aGapIsFilledFromTheNewestLineBeforeItInOrderAndOnce() {
+        val before = live.after(CoreUpdate.Chat(line(10, "before")))
+        assertNull(before.after(CoreUpdate.Reconnected(false)).fillAfter)
+        // Line 13 arrives live once the link is back; 11 to 13 were said meanwhile.
+        val back = before.after(CoreUpdate.Reconnected(true), CoreUpdate.Chat(line(13, "live")))
+        assertEquals(10uL, back.fillAfter)
+        val page = back.withLater(listOf(line(11, "missed"), line(12, "missed too")), hasMore = true)
+        assertEquals(listOf("before", "missed", "missed too", "live"), shown(page))
+        assertEquals("the next page goes on from the newest filled", 12uL, page.fillAfter)
+        val done = page.withLater(listOf(line(13, "live")), hasMore = false)
+        assertEquals(listOf("before", "missed", "missed too", "live"), shown(done))
+        assertNull(done.fillAfter)
+        assertNull("a page with nothing new ends it", page.withLater(emptyList(), hasMore = true).fillAfter)
+        assertEquals(
+            done.entries.size,
+            done.entries
+                .map { it.key }
+                .toSet()
+                .size,
+        )
+    }
+
+    @Test
+    fun aSecondGapWhileTheFirstIsFillingFillsFromTheEarlier() {
+        val first = live.after(CoreUpdate.Chat(line(10, "before")), CoreUpdate.Reconnected(true))
+        val second = first.after(CoreUpdate.Chat(line(20, "live")), CoreUpdate.Reconnected(true))
+        assertEquals(10uL, second.fillAfter)
+        assertNull("no line, no gap to fill", live.after(CoreUpdate.Reconnected(true)).fillAfter)
+    }
+
+    @Test
+    fun aGapTooLongToFillIsMarkedWhereItIs() {
+        val back =
+            live.after(CoreUpdate.Chat(line(10, "before")), CoreUpdate.Reconnected(true), CoreUpdate.Chat(line(900, "live")))
+        val page = back.withLater(listOf(line(11, "missed")), hasMore = true)
+        val marked = page.withMissed()
+        assertEquals(listOf("before", "missed", "missed more", "live"), shown(marked))
+        assertNull(marked.fillAfter)
+    }
+
+    @Test
+    fun aLapsedSessionIsToldAsOneToSignInToAgain() {
+        assertEquals(Why.Expired, refusal("session_expired"))
     }
 
     @Test
