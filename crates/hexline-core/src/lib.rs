@@ -3,6 +3,7 @@
 //! renders what this crate hands it.
 
 mod connection;
+mod identity;
 mod model;
 #[cfg(target_os = "android")]
 mod tls;
@@ -10,6 +11,7 @@ mod tls;
 pub use connection::{
     CoreError, CoreUpdate, DeviceIdentity, LoginInfo, ServerConnection, UpdateSink,
 };
+pub use identity::{cert_for_device, cert_info, new_device, CertInfo, NewDevice};
 pub use model::{ChatLine, HistoryPage, Status, User};
 
 uniffi::setup_scaffolding!();
