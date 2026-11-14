@@ -6,19 +6,39 @@ import androidx.core.content.edit
 import org.foggyden.hexline.secrets.SecretStore
 import org.foggyden.hexline.secrets.SecretUnavailable
 import org.foggyden.hexline.secrets.SecretUnreadable
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
 import java.io.IOException
 import java.security.MessageDigest
 
-/** A server as the app connects to it: where, and as whom (null for a guest). */
+/** How a server is signed in to. */
+sealed interface SignIn {
+    data object Password : SignIn
+
+    /** As the identity [fingerprint] names, by the device this phone keeps of it. */
+    data class Identity(
+        val fingerprint: String,
+    ) : SignIn
+}
+
+/**
+ * A server as the app connects to it: where, and as whom. A password's
+ * login is null for a guest; an identity's is always null, as the server
+ * finds the account by the identity.
+ */
 data class Server(
     val url: String,
     val login: String?,
+    val signIn: SignIn = SignIn.Password,
 )
 
 /**
- * The server the app last connected to. Its address and login are kept in
- * preferences; the password, when the person asked for it to be kept, and the
- * session to resume are secrets, in the [SecretStore].
+ * The servers the app has connected to, the last first, each with how it
+ * signs in, so a server is never asked about twice. Addresses and logins
+ * are kept in preferences; a password, when the person asked for it to be
+ * kept, and the session to resume are secrets, in the [SecretStore].
  *
  * Calls block on the Keystore: not on the main thread. A secret that will
  * never open is forgotten and read as none; one that cannot be opened now is
@@ -29,26 +49,67 @@ class SavedServers(
     private val secrets: SecretStore = SecretStore(context),
     private val prefs: SharedPreferences = context.getSharedPreferences("servers", Context.MODE_PRIVATE),
 ) {
-    fun last(): Server? = prefs.getString(URL, null)?.let { Server(it, prefs.getString(LOGIN, null)) }
+    fun all(): List<Server> {
+        forgetTheOneKeptBefore()
+        val list = JSONArray(prefs.getString(SERVERS, null) ?: return emptyList())
+        return (0 until list.length()).map { i ->
+            val o = list.getJSONObject(i)
+            val login = if (o.has(LOGIN)) o.getString(LOGIN) else null
+            val signIn = if (o.has(IDENTITY)) SignIn.Identity(o.getString(IDENTITY)) else SignIn.Password
+            Server(o.getString(URL), login, signIn)
+        }
+    }
+
+    fun last(): Server? = all().firstOrNull()
 
     /**
-     * [server] is the last; its password is kept, or with null forgotten. The
-     * one before it, if another, is forgotten whole: only the last is kept.
+     * [server] is the last; its password is kept, or with null forgotten.
      * False if a secret could not be written now.
      */
     fun remember(
         server: Server,
         password: String?,
-    ): Boolean {
-        last()?.takeIf { it != server }?.let { old ->
-            secrets.delete(name("password", old))
-            secrets.delete(name("session", old))
+    ): Boolean =
+        synchronized(LOCK) {
+            write(listOf(server) + all().filter { it != server })
+            write(name("password", server), password?.toByteArray())
         }
-        prefs.edit {
-            putString(URL, server.url)
-            if (server.login == null) remove(LOGIN) else putString(LOGIN, server.login)
+
+    /** [server] is forgotten whole, its secrets with it. */
+    fun forget(server: Server): Unit =
+        synchronized(LOCK) {
+            write(all().filter { it != server })
+            secrets.delete(name("password", server))
+            secrets.delete(name("session", server))
+            askedToLink(server, false)
         }
-        return write(name("password", server), password?.toByteArray())
+
+    /**
+     * Whether an account was named to link [server]'s identity to and the
+     * server has not linked it yet: until it has, no login asks the server
+     * to make an account in the named one's place.
+     */
+    fun linkAsked(server: Server): Boolean = name("link", server) in prefs.getStringSet(LINK_ASKED, null).orEmpty()
+
+    fun askedToLink(
+        server: Server,
+        asked: Boolean,
+    ): Unit =
+        synchronized(LOCK) {
+            val names = prefs.getStringSet(LINK_ASKED, null).orEmpty().toMutableSet()
+            if (asked) names += name("link", server) else names -= name("link", server)
+            prefs.edit { putStringSet(LINK_ASKED, names) }
+        }
+
+    private fun write(servers: List<Server>) {
+        val list = JSONArray()
+        for (s in servers) {
+            val o = JSONObject().put(URL, s.url)
+            s.login?.let { o.put(LOGIN, it) }
+            (s.signIn as? SignIn.Identity)?.let { o.put(IDENTITY, it.fingerprint) }
+            list.put(o)
+        }
+        prefs.edit { putString(SERVERS, list.toString()) }
     }
 
     fun forgetPassword(server: Server) = secrets.delete(name("password", server))
@@ -57,11 +118,27 @@ class SavedServers(
 
     fun session(server: Server): ByteArray? = read(name("session", server))
 
-    /** The session to resume [server] with, or with null none. False if it could not be written now. */
+    /**
+     * The session to resume [server] with, or with null none. A server
+     * forgotten, or never saved, keeps none: a connection let go of may
+     * still be saving its own on the way out. False if it could not be
+     * written now.
+     */
     fun keepSession(
         server: Server,
         session: ByteArray?,
-    ): Boolean = write(name("session", server), session)
+    ): Boolean = synchronized(LOCK) { write(name("session", server), session?.takeIf { server in all() }) }
+
+    /** The one server this kept before it kept them all, and its secrets. */
+    private fun forgetTheOneKeptBefore() {
+        val url = prefs.getString(OLD_URL, null) ?: return
+        val login = prefs.getString(OLD_LOGIN, null).orEmpty()
+        for (kind in listOf("password", "session")) secrets.delete(kind + "-" + hash("$url\n$login".toByteArray()))
+        prefs.edit {
+            remove(OLD_URL)
+            remove(OLD_LOGIN)
+        }
+    }
 
     /** A secret not written is one not kept: the caller carries on without it. */
     private fun write(
@@ -87,17 +164,49 @@ class SavedServers(
             null
         }
 
-    /** A secret's name, from the server and login it is for: never a file name a person typed. */
+    /**
+     * A secret's name, from the server and how it is signed in to: never a
+     * file name a person typed. Each part goes in with its length, so no
+     * two servers' parts run together into the same name.
+     */
     private fun name(
         kind: String,
         server: Server,
     ): String {
-        val digest = MessageDigest.getInstance("SHA-256").digest("${server.url}\n${server.login.orEmpty()}".toByteArray())
-        return kind + "-" + digest.take(12).joinToString("") { "%02x".format(it) }
+        val whom =
+            when (val s = server.signIn) {
+                SignIn.Password -> server.login?.let { listOf("login", it) } ?: listOf("guest")
+                is SignIn.Identity -> listOf("identity", s.fingerprint)
+            }
+        val out = ByteArrayOutputStream()
+        val data = DataOutputStream(out)
+        for (part in listOf(server.url) + whom) {
+            val bytes = part.toByteArray()
+            data.writeInt(bytes.size)
+            data.write(bytes)
+        }
+        return kind + "-" + hash(out.toByteArray())
     }
 
+    private fun hash(bytes: ByteArray) =
+        MessageDigest
+            .getInstance("SHA-256")
+            .digest(bytes)
+            .take(12)
+            .joinToString("") { "%02x".format(it) }
+
     private companion object {
+        const val SERVERS = "servers"
         const val URL = "url"
         const val LOGIN = "login"
+        const val IDENTITY = "identity"
+        const val LINK_ASKED = "link_asked"
+
+        /** One for the process: each change reads the list, then writes it whole. */
+        val LOCK = Any()
+
+        /** Where the one server kept before was. */
+        const val OLD_URL = "url"
+        const val OLD_LOGIN = "login"
     }
 }

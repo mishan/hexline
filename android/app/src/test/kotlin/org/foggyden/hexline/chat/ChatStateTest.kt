@@ -2,6 +2,7 @@ package org.foggyden.hexline.chat
 
 import org.foggyden.hexline.core.ChatLine
 import org.foggyden.hexline.core.CoreUpdate
+import org.foggyden.hexline.core.LoginInfo
 import org.foggyden.hexline.core.Status
 import org.foggyden.hexline.core.User
 import org.junit.Assert.assertEquals
@@ -31,12 +32,28 @@ class ChatStateTest {
                 is Entry.Broadcast -> "broadcast: ${it.nick}: ${it.text}"
                 is Entry.NotSent -> "not sent: ${it.why}"
                 is Entry.Missed -> "missed more"
+                is Entry.SignedIn -> "signed in: ${it.outcome}"
             }
         }
 
     private fun ChatState.after(vararg updates: CoreUpdate) = updates.fold(this) { acc, u -> acc.apply(u) }
 
     private val live = ChatState().apply(CoreUpdate.Roster(1u, listOf(user(1, "alice"), user(2, "bob")), "welcome"))
+
+    @Test
+    fun aLoginAfterALapseThatLandsOtherwiseIsTold() {
+        val linked = live.signedIn("linked")
+        val back = { outcome: String -> CoreUpdate.Reconnected(true, LoginInfo("s", emptyList(), true, "fp", outcome, false)) }
+        assertEquals(listOf("signed in: Account"), shown(linked))
+        assertEquals(shown(linked), shown(linked.apply(back("linked"))))
+        assertEquals(shown(linked) + "signed in: Guest", shown(linked.apply(back("guest"))))
+    }
+
+    @Test
+    fun aPasswordLoginOrAnOutcomeThisAppDoesNotKnowAddsNoAside() {
+        assertEquals(shown(live), shown(live.signedIn(null)))
+        assertEquals(shown(live), shown(live.signedIn("someday")))
+    }
 
     @Test
     fun theRosterMakesTheLinkLiveAndUsersComeChangeAndGo() {

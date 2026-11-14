@@ -10,7 +10,7 @@ mod restore;
 mod tls;
 
 pub use connection::{
-    CoreError, CoreUpdate, DeviceIdentity, LoginInfo, ServerConnection, UpdateSink,
+    ClassicLogin, CoreError, CoreUpdate, DeviceIdentity, LoginInfo, ServerConnection, UpdateSink,
 };
 pub use identity::{cert_for_device, cert_info, new_device, CertInfo, NewDevice};
 pub use model::{ChatLine, HistoryPage, Status, User};

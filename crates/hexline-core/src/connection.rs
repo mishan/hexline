@@ -186,6 +186,9 @@ pub struct LoginInfo {
     /// (hotline-ng-identity.md §5.3), when it logged in as one.
     pub fingerprint: Option<String>,
     pub outcome: Option<String>,
+    /// A saved session taken up again, not a new login: what the server
+    /// made of the identity was said at the login that made it.
+    pub resumed: bool,
 }
 
 /// What the app is told, in order.
@@ -389,27 +392,35 @@ impl ServerConnection {
             password,
             ..LoginParams::default()
         };
-        self.start(Credentials::Password(params), saved).await
+        self.start(Credentials::Password(params), None, saved).await
     }
 
     /// Log in as an identity, proving `device` to the server first
     /// (hotline-ng-auth.md §6.2), or with `saved` resume that session. The
     /// device is proved again for each new login, and never for a resume.
     /// With `create`, a server whose policy allows it makes an account for
-    /// an identity it has none for.
+    /// an identity it has none for. With `link`, an existing account's
+    /// login and password, the server links the identity to that account
+    /// instead (hotline-ng-identity.md, section 5.4); they are sent with this
+    /// login alone, as a later one lands on the account by the link.
     pub async fn login_identity(
         &self,
         device: DeviceIdentity,
         create: bool,
+        link: Option<ClassicLogin>,
         saved: Option<Vec<u8>>,
     ) -> Result<LoginInfo, CoreError> {
+        let link = link.map(|l| (l.login, zeroize::Zeroizing::new(l.password)));
         let (device, fingerprint) = device.open()?;
         let creds = Credentials::Identity {
             device: Box::new(device),
-            create,
+            // An account named to link is never made in its place, by this
+            // login or one after a lapse: a link the server could not make
+            // is the operator's to resolve.
+            create: create && link.is_none(),
             fingerprint,
         };
-        self.start(creds, saved).await
+        self.start(creds, link, saved).await
     }
 }
 
@@ -417,6 +428,7 @@ impl ServerConnection {
     async fn start(
         &self,
         creds: Credentials,
+        link: Option<Classic>,
         saved: Option<Vec<u8>>,
     ) -> Result<LoginInfo, CoreError> {
         {
@@ -432,7 +444,8 @@ impl ServerConnection {
         // stops waiting for the answer.
         RUNTIME
             .spawn(async move {
-                let made = begin(&url, &creds, saved.as_deref()).await;
+                let made = begin(&url, &creds, link.as_ref(), saved.as_deref()).await;
+                drop(link);
                 let settle = |phase: Phase| {
                     *life.phase.lock().unwrap() = phase;
                     life.changed.notify_waiters();
@@ -645,7 +658,12 @@ fn gone(code: &str) -> bool {
 }
 
 /// The first link: the saved session resumed, or a login.
-async fn begin(url: &str, creds: &Credentials, saved: Option<&[u8]>) -> Result<Link, CoreError> {
+async fn begin(
+    url: &str,
+    creds: &Credentials,
+    classic: Option<&Classic>,
+    saved: Option<&[u8]>,
+) -> Result<Link, CoreError> {
     let kept = saved.map(Kept::decode);
     if matches!(kept, Some(None)) && !creds.may_log_in_again(false) {
         return Err(CoreError::Refused {
@@ -669,7 +687,7 @@ async fn begin(url: &str, creds: &Credentials, saved: Option<&[u8]>) -> Result<L
             other => return other,
         }
     }
-    log_in(url, creds).await
+    log_in(url, creds, classic).await
 }
 
 fn identity_field(self_user: &Value, key: &str) -> Option<String> {
@@ -679,6 +697,16 @@ fn identity_field(self_user: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .map(str::to_owned)
 }
+
+/// An existing account's login and password, to link an identity to.
+#[derive(uniffi::Record)]
+pub struct ClassicLogin {
+    pub login: String,
+    pub password: String,
+}
+
+/// A [`ClassicLogin`] as the core holds it, its password wiped when dropped.
+type Classic = (String, zeroize::Zeroizing<String>);
 
 /// How a connection logs in, kept for its life to log in again.
 enum Credentials {
@@ -713,7 +741,11 @@ impl Credentials {
 
 /// A new login: a password's, or an identity's on a socket its device
 /// was just proved for.
-async fn log_in(url: &str, creds: &Credentials) -> Result<Link, CoreError> {
+async fn log_in(
+    url: &str,
+    creds: &Credentials,
+    classic: Option<&Classic>,
+) -> Result<Link, CoreError> {
     match creds {
         Credentials::Password(p) => {
             establish(url, &Start::Login(p.clone()), None, false, None).await
@@ -728,22 +760,42 @@ async fn log_in(url: &str, creds: &Credentials) -> Result<Link, CoreError> {
             // upgrade refused (a server restarted, a slow link): proved
             // once more, then taken as the answer.
             let mut again = true;
+            let mut classic = classic.map(|(l, p)| (l.as_str(), p.as_str()));
+            // What the auth answered, kept past an upgrade it refused.
+            let (mut said, mut first) = (None, None);
             let mut link = loop {
                 let tried = async {
-                    let token = auth::identity_token(url, device, *create, None).await?;
-                    establish(url, &start, None, false, Some(&token)).await
+                    let admitted =
+                        auth::identity_token(url, device, *create, classic, None).await?;
+                    said = admitted.outcome;
+                    establish(url, &start, None, false, Some(&admitted.token)).await
                 }
                 .await;
                 match tried {
+                    // The auth never got as far as the password: sent again.
                     Err(CoreError::Refused { code, .. })
-                        if again
-                            && matches!(code.as_str(), "unknown_challenge" | "token_refused") =>
+                        if again && code == "unknown_challenge" =>
                     {
                         again = false
+                    }
+                    // The auth was answered, and any link it made is made:
+                    // the password is not sent again, and what the server
+                    // made of it is the first answer's, not a guest's.
+                    Err(CoreError::Refused { code, .. }) if again && code == "token_refused" => {
+                        again = false;
+                        if classic.take().is_some() {
+                            first = said.take();
+                        }
                     }
                     other => break other?,
                 }
             };
+            if let Some(outcome) = first {
+                link.info.outcome = Some(outcome.clone());
+                if let Some(k) = link.kept.as_mut() {
+                    k.outcome = Some(outcome);
+                }
+            }
             // The session the server made is the identity's, or the token
             // never reached it (a front that strips `Authorization` lets
             // the upgrade in unauthenticated) and this is someone else.
@@ -844,6 +896,7 @@ async fn establish(
         can_resume: true,
         fingerprint: known.and_then(|k| k.fingerprint.clone()),
         outcome: known.and_then(|k| k.outcome.clone()),
+        resumed: true,
     };
     let guest = known.is_some_and(|k| k.guest);
     match answer {
@@ -862,6 +915,7 @@ async fn establish(
                     can_resume: ok.detach.is_some(),
                     fingerprint: identity_field(&ok.self_user, "fingerprint"),
                     outcome: identity_field(&ok.self_user, "outcome"),
+                    resumed: false,
                 },
                 kept: ok.detach.is_some().then(|| Kept {
                     resumable: Resumable {
@@ -1076,7 +1130,7 @@ async fn supervise(
                         let start = Start::Resume(k.resumable.clone());
                         establish(&url, &start, Some(k), false, None).await
                     }
-                    None => log_in(&url, &creds).await,
+                    None => log_in(&url, &creds, None).await,
                 }
             };
             tokio::pin!(tried);

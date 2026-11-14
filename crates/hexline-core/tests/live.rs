@@ -6,7 +6,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hexline_core::{CoreError, CoreUpdate, DeviceIdentity, ServerConnection, Status, UpdateSink};
+use hexline_core::{
+    ClassicLogin, CoreError, CoreUpdate, DeviceIdentity, ServerConnection, Status, UpdateSink,
+};
 use hxng_client::testing::{back_up, device, Proxy, Server};
 use serde_json::Value;
 
@@ -432,6 +434,7 @@ async fn a_saved_session_resumes_after_a_restart_with_a_roster() {
         .await
         .unwrap();
     assert!(info.server_name.starts_with("hexline-live-"), "{info:?}");
+    assert!(info.resumed, "{info:?}");
     sink.heard("the replay", said("while gone")).await;
     let roster_at = sink.at(roster).unwrap();
     assert!(roster_at > sink.at(said("while gone")).unwrap());
@@ -604,7 +607,10 @@ async fn an_identity_logs_in_and_after_its_session_lapses_proves_its_device_agai
     let sink = Arc::new(Sink::default());
     let alice = ServerConnection::new(proxy.url.clone(), sink.clone());
     let (device, fingerprint) = identity("Alice");
-    let info = alice.login_identity(device, true, None).await.unwrap();
+    let info = alice
+        .login_identity(device, true, None, None)
+        .await
+        .unwrap();
     assert!(info.can_resume, "{info:?}");
     assert_eq!(info.fingerprint.as_deref(), Some(fingerprint.as_str()));
     sink.heard("her roster", roster).await;
@@ -653,7 +659,7 @@ async fn a_device_seed_that_is_not_one_is_refused_before_anything_is_sent() {
     let (mut device, _) = identity("Alice");
     device.device_seed.pop();
     assert!(matches!(
-        alice.login_identity(device, true, None).await,
+        alice.login_identity(device, true, None, None).await,
         Err(CoreError::Protocol { .. })
     ));
 }
@@ -667,7 +673,7 @@ async fn a_session_the_server_did_not_make_the_identitys_is_refused() {
     proxy.strip_authorization();
     let alice = ServerConnection::new(proxy.url.clone(), Arc::new(Sink::default()));
     let (device, _) = identity("Alice");
-    match alice.login_identity(device, true, None).await {
+    match alice.login_identity(device, true, None, None).await {
         Err(CoreError::Refused { code, .. }) => assert_eq!(code, "identity_not_honored"),
         other => panic!("{other:?}"),
     }
@@ -678,9 +684,166 @@ async fn an_identity_the_server_makes_a_guest_of_is_still_its_own_session() {
     let server = Server::with_guest_identity(&["guest"]).await;
     let alice = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
     let (device, fingerprint) = identity("Alice");
-    let info = alice.login_identity(device, true, None).await.unwrap();
+    let info = alice
+        .login_identity(device, true, None, None)
+        .await
+        .unwrap();
     assert_eq!(info.fingerprint.as_deref(), Some(fingerprint.as_str()));
     assert!(info.outcome.is_some(), "{info:?}");
+}
+
+#[tokio::test]
+async fn an_identity_given_an_accounts_password_is_linked_to_it_and_lands_on_it_after() {
+    let server = Server::with_identity(&["bob"], 300).await;
+    let (_, d) = device("Bob");
+    let bobs = || DeviceIdentity {
+        device_seed: d.key.seed().to_vec(),
+        cert: d.cert.clone(),
+        card: d.card.clone(),
+    };
+    let link = |password: &str| ClassicLogin {
+        login: "bob".into(),
+        password: password.into(),
+    };
+    let bob = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
+    match bob
+        .login_identity(bobs(), true, Some(link("pw-wrong")), None)
+        .await
+    {
+        Err(CoreError::Refused { code, .. }) => assert_eq!(code, "login_failed"),
+        other => panic!("{other:?}"),
+    }
+    let info = bob
+        .login_identity(bobs(), true, Some(link("pw-bob")), None)
+        .await
+        .unwrap();
+    assert_eq!(info.outcome.as_deref(), Some("linked"), "{info:?}");
+    bob.disconnect().await;
+
+    // Asked to make an account, and landing on bob's by the link instead.
+    let again = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
+    let info = again
+        .login_identity(bobs(), true, None, None)
+        .await
+        .unwrap();
+    assert_eq!(info.outcome.as_deref(), Some("linked"), "{info:?}");
+}
+
+#[tokio::test]
+async fn a_linked_identity_logs_in_again_after_a_lapse_without_the_password() {
+    let server = Server::with_identity(&["bob", "alice"], 1).await;
+    let proxy = Proxy::to(&server).await;
+    let sink = Arc::new(Sink::default());
+    let bob = ServerConnection::new(proxy.url.clone(), sink.clone());
+    let (device, _) = identity("Bob");
+    let link = ClassicLogin {
+        login: "bob".into(),
+        password: "pw-bob".into(),
+    };
+    bob.login_identity(device, true, Some(link), None)
+        .await
+        .unwrap();
+    sink.heard("his roster", roster).await;
+    // The password sent again would be refused now.
+    let file = server.account_file("bob");
+    let account = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(&file, account.replace("pw-bob", "pw-changed")).unwrap();
+
+    let (_alice, alice_sink) = logged_in(&server.url, "alice").await;
+    proxy.refuse(true);
+    proxy.sever();
+    // The session gone, so only a login brings him back.
+    alice_sink
+        .heard_within(30, "bob's session ending", |u| {
+            matches!(u, CoreUpdate::UserParted { .. })
+        })
+        .await;
+    proxy.refuse(false);
+    bob.network_changed();
+    sink.heard_within(30, "back on his account", |u| {
+        matches!(u, CoreUpdate::Reconnected { gap: true, info: Some(i) }
+            if i.outcome.as_deref() == Some("linked"))
+    })
+    .await;
+}
+
+/// `account`'s file, made to take no link but one an operator makes: an
+/// identity that names it lands as a guest, so the server needs a guest.
+fn not_self_linkable(server: &Server, account: &str) {
+    let file = server.account_file(account);
+    let mut text = std::fs::read_to_string(&file).unwrap();
+    text.push_str("[identity]\nallow_self_link = false\n");
+    std::fs::write(&file, text).unwrap();
+}
+
+#[tokio::test]
+async fn a_link_the_server_could_not_make_leaves_no_account_made_after_a_lapse() {
+    let server = Server::with_identity(&["bob", "alice", "guest"], 1).await;
+    not_self_linkable(&server, "bob");
+    let proxy = Proxy::to(&server).await;
+    let sink = Arc::new(Sink::default());
+    let bob = ServerConnection::new(proxy.url.clone(), sink.clone());
+    let (device, _) = identity("Bob");
+    let link = ClassicLogin {
+        login: "bob".into(),
+        password: "pw-bob".into(),
+    };
+    let info = bob
+        .login_identity(device, true, Some(link), None)
+        .await
+        .unwrap();
+    assert_eq!(info.outcome.as_deref(), Some("classic_pending_link"));
+    sink.heard("his roster", roster).await;
+
+    let (_alice, alice_sink) = logged_in(&server.url, "alice").await;
+    proxy.refuse(true);
+    proxy.sever();
+    alice_sink
+        .heard_within(30, "bob's session ending", |u| {
+            matches!(u, CoreUpdate::UserParted { .. })
+        })
+        .await;
+    proxy.refuse(false);
+    bob.network_changed();
+    sink.heard_within(30, "back, still a guest", |u| {
+        matches!(u, CoreUpdate::Reconnected { info: Some(i), .. }
+            if i.outcome.as_deref() == Some("guest"))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_upgrade_refused_after_a_link_is_proved_again_without_the_password() {
+    let server = Server::with_identity(&["bob", "guest"], 300).await;
+    not_self_linkable(&server, "bob");
+    let proxy = Proxy::to(&server).await;
+    proxy.refuse_upgrades(1);
+    let bob = ServerConnection::new(proxy.url.clone(), Arc::new(Sink::default()));
+    let (device, _) = identity("Bob");
+    let link = ClassicLogin {
+        login: "bob".into(),
+        password: "pw-bob".into(),
+    };
+    let info = bob
+        .login_identity(device, true, Some(link), None)
+        .await
+        .unwrap();
+    // The first auth's answer, not the guest the second one was made.
+    assert_eq!(info.outcome.as_deref(), Some("classic_pending_link"));
+    let heard = proxy.heard();
+    let sent = heard.windows(6).filter(|w| w == b"pw-bob").count();
+    assert_eq!(sent, 1, "{}", String::from_utf8_lossy(&heard));
+}
+
+#[tokio::test]
+async fn a_server_that_takes_no_identity_sign_in_says_so() {
+    let server = Server::start(&["bob"]).await;
+    let bob = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
+    let (device, _) = identity("Bob");
+    match bob.login_identity(device, true, None, None).await {
+        Err(CoreError::Refused { code, .. }) => assert_eq!(code, "no_identity_sign_in"),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -690,7 +853,10 @@ async fn an_identitys_session_resumes_as_itself_and_another_identitys_is_not_res
     let sink = Arc::new(Sink::default());
     let alice = ServerConnection::new(proxy.url.clone(), sink.clone());
     let (device, fingerprint) = identity("Alice");
-    alice.login_identity(device, true, None).await.unwrap();
+    alice
+        .login_identity(device, true, None, None)
+        .await
+        .unwrap();
     sink.heard("her roster", roster).await;
     proxy.sever();
     sink.heard("back", |u| {
@@ -711,10 +877,11 @@ async fn an_identitys_session_resumes_as_itself_and_another_identitys_is_not_res
     let bob = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
     let (device, bobs) = identity("Bob");
     let info = bob
-        .login_identity(device, true, Some(saved.clone()))
+        .login_identity(device, true, None, Some(saved.clone()))
         .await
         .unwrap();
     assert_eq!(info.fingerprint.as_deref(), Some(bobs.as_str()));
+    assert!(!info.resumed, "{info:?}");
     assert_ne!(
         saved_field(&bob.saved().unwrap(), "session"),
         saved_field(&saved, "session")
@@ -774,7 +941,7 @@ async fn an_identity_kept_at_a_registrar_is_restored_to_a_device_that_logs_in() 
             cert: restored.cert,
             card: restored.card,
         };
-        let login = conn.login_identity(device, true, None).await.unwrap();
+        let login = conn.login_identity(device, true, None, None).await.unwrap();
         assert_eq!(login.fingerprint, Some(fingerprint));
     }
 }
@@ -869,6 +1036,6 @@ async fn a_restored_device_is_vouched_for_where_unattested_identities_are_guests
         cert: restored.cert,
         card: restored.card,
     };
-    let info = conn.login_identity(device, true, None).await.unwrap();
+    let info = conn.login_identity(device, true, None, None).await.unwrap();
     assert_eq!(info.outcome.as_deref(), Some("created"), "{info:?}");
 }

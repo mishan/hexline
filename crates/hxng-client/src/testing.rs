@@ -61,6 +61,11 @@ fn account(name: &str) -> String {
 }
 
 impl Server {
+    /// The file `account` is kept in, which the server reads at each login.
+    pub fn account_file(&self, account: &str) -> PathBuf {
+        self._dir.0.join("accounts").join(format!("{account}.toml"))
+    }
+
     /// Each of `accounts` has the password `pw-<name>`, but `guest`.
     pub async fn start(accounts: &[&str]) -> Server {
         Server::with_grace(accounts, 300).await
@@ -220,6 +225,8 @@ pub struct Proxy {
     refusing: Arc<AtomicBool>,
     cut_after: Arc<Mutex<Option<Duration>>>,
     mangling: Arc<AtomicBool>,
+    unauthorized: Arc<Mutex<usize>>,
+    heard: Arc<Mutex<Vec<u8>>>,
     accept: JoinHandle<()>,
 }
 
@@ -238,30 +245,32 @@ impl Proxy {
         let refusing = Arc::new(AtomicBool::new(false));
         let cut_after = Arc::new(Mutex::new(None));
         let mangling = Arc::new(AtomicBool::new(false));
+        let unauthorized = Arc::new(Mutex::new(0));
+        let heard = Arc::new(Mutex::new(Vec::new()));
         let target = server.addr;
         let accept = tokio::spawn({
-            let (links, refusing, cut_after, mangling) = (
+            let (links, refusing, cut_after, mangling, unauthorized, heard) = (
                 links.clone(),
                 refusing.clone(),
                 cut_after.clone(),
                 mangling.clone(),
+                unauthorized.clone(),
+                heard.clone(),
             );
             async move {
-                while let Ok((mut client, _)) = listener.accept().await {
+                while let Ok((client, _)) = listener.accept().await {
                     if refusing.load(Ordering::SeqCst) {
                         continue;
                     }
                     let cut: Option<Duration> = *cut_after.lock().unwrap();
                     let mangle = mangling.load(Ordering::SeqCst);
+                    let (unauthorized, heard) = (unauthorized.clone(), heard.clone());
                     let link = tokio::spawn(async move {
-                        if let Ok(mut server) = tokio::net::TcpStream::connect(target).await {
-                            if mangle && mangle_first(&mut client, &mut server).await.is_err() {
-                                return;
-                            }
-                            let copy = tokio::io::copy_bidirectional(&mut client, &mut server);
+                        if let Ok(server) = tokio::net::TcpStream::connect(target).await {
+                            let pass = pass_on(client, server, mangle, unauthorized, heard);
                             match cut {
-                                Some(after) => drop(tokio::time::timeout(after, copy).await),
-                                None => drop(copy.await),
+                                Some(after) => drop(tokio::time::timeout(after, pass).await),
+                                None => drop(pass.await),
                             }
                         }
                     });
@@ -275,8 +284,21 @@ impl Proxy {
             refusing,
             cut_after,
             mangling,
+            unauthorized,
+            heard,
             accept,
         }
+    }
+
+    /// The next `upgrades` WebSocket upgrades are answered 401, as a server
+    /// that no longer knows the token would.
+    pub fn refuse_upgrades(&self, upgrades: usize) {
+        *self.unauthorized.lock().unwrap() = upgrades;
+    }
+
+    /// Everything clients have sent through the proxy, in the order it came.
+    pub fn heard(&self) -> Vec<u8> {
+        self.heard.lock().unwrap().clone()
     }
 
     /// Cut every link now open, both ways.
@@ -327,24 +349,65 @@ pub fn device(name: &str) -> (hl_identity::IdentityKey, crate::auth::Device) {
     (id, crate::auth::Device { key, cert, card })
 }
 
-/// Pass on the client's first read with its `authorization:` header
-/// renamed; a request is written whole by the clients these tests run.
-async fn mangle_first(
-    client: &mut tokio::net::TcpStream,
-    server: &mut tokio::net::TcpStream,
+/// Pass a link on both ways, keeping what the client sends. Its first
+/// read, a request written whole by the clients these tests run, may be
+/// refused (an upgrade while `unauthorized` counts) or have its
+/// `authorization:` header renamed (`mangle`).
+async fn pass_on(
+    mut client: tokio::net::TcpStream,
+    mut server: tokio::net::TcpStream,
+    mangle: bool,
+    unauthorized: Arc<Mutex<usize>>,
+    heard: Arc<Mutex<Vec<u8>>>,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = vec![0; 16 * 1024];
     let n = client.read(&mut buf).await?;
     let mut first = buf[..n].to_vec();
-    let needle = b"authorization:";
-    if let Some(at) = first
-        .windows(needle.len())
-        .position(|w| w.eq_ignore_ascii_case(needle))
-    {
-        first[at..at + needle.len()].copy_from_slice(b"x-stripped-by:");
+    let upgrade = first
+        .windows(9)
+        .any(|w| w.eq_ignore_ascii_case(b"websocket"));
+    let refused = upgrade && {
+        let mut left = unauthorized.lock().unwrap();
+        let refused = *left > 0;
+        *left = left.saturating_sub(1);
+        refused
+    };
+    if refused {
+        return client
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            )
+            .await;
     }
-    server.write_all(&first).await
+    let needle = b"authorization:";
+    if mangle {
+        if let Some(at) = first
+            .windows(needle.len())
+            .position(|w| w.eq_ignore_ascii_case(needle))
+        {
+            first[at..at + needle.len()].copy_from_slice(b"x-stripped-by:");
+        }
+    }
+    heard.lock().unwrap().extend_from_slice(&first);
+    server.write_all(&first).await?;
+    let (mut from_client, mut to_client) = client.split();
+    let (mut from_server, mut to_server) = server.split();
+    let up = async {
+        loop {
+            let n = from_client.read(&mut buf).await?;
+            if n == 0 {
+                return to_server.shutdown().await;
+            }
+            heard.lock().unwrap().extend_from_slice(&buf[..n]);
+            to_server.write_all(&buf[..n]).await?;
+        }
+    };
+    let down = async {
+        tokio::io::copy(&mut from_server, &mut to_client).await?;
+        to_client.shutdown().await
+    };
+    tokio::try_join!(up, down).map(|_| ())
 }
 
 /// Register `handle` for a new identity at `server`'s registrar and put

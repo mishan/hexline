@@ -33,4 +33,12 @@ class SessionPolicyTest {
         assertEquals("alice", loginFor(alice, null, null))
         assertEquals(null, loginFor(guest, null, saved))
     }
+
+    @Test
+    fun aKeptPasswordIsKeptUnlessAnotherIsTyped() {
+        assertEquals("kept", passwordToKeep(null, "kept", remember = false))
+        assertEquals("typed", passwordToKeep("typed", "kept", remember = true))
+        assertEquals(null, passwordToKeep("typed", "kept", remember = false))
+        assertEquals(null, passwordToKeep(null, null, remember = true))
+    }
 }

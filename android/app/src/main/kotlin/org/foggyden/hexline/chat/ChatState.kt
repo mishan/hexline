@@ -26,6 +26,39 @@ sealed interface Why {
 
     data object NotUnderstood : Why
 
+    /** The identity chosen is no longer kept on this phone. */
+    data object NoIdentity : Why
+
+    /** The identity is already linked to another account on this server. */
+    data object AlreadyLinked : Why
+
+    /** The server's policy does not admit this identity. */
+    data object Denied : Why
+
+    /** This device's certificate may not link accounts (design 2.3). */
+    data object NoManage : Why
+
+    /** This device, or its identity, was revoked. */
+    data object Revoked : Why
+
+    /** The identity was replaced by a successor. */
+    data object Rotated : Why
+
+    /** The identity's registrar has frozen it. */
+    data object Frozen : Why
+
+    /** The server does not take identity sign-in. */
+    data object NoIdentitySignIn : Why
+
+    /** The server took the proof but did not log the session in as the identity. */
+    data object NotHonored : Why
+
+    /** The server would not read this device's certificate or card. */
+    data object BadCredentials : Why
+
+    /** The phone's keystore cannot open the device's key now, as while it is locked. */
+    data object KeyLocked : Why
+
     data class Refused(
         val code: String,
     ) : Why
@@ -40,7 +73,34 @@ fun refusal(code: String): Why =
         "replaced" -> Why.Replaced
         "banned" -> Why.Banned
         "server_full" -> Why.Full
+        "already_linked" -> Why.AlreadyLinked
+        "denied" -> Why.Denied
+        "no_manage" -> Why.NoManage
+        "revoked" -> Why.Revoked
+        "rotated" -> Why.Rotated
+        "frozen" -> Why.Frozen
+        "no_identity_sign_in" -> Why.NoIdentitySignIn
+        "identity_not_honored" -> Why.NotHonored
+        "bad_card", "bad_cert", "card_too_large" -> Why.BadCredentials
         else -> Why.Refused(code)
+    }
+
+/** What a server made of an identity that logged in (hotline-ng-identity.md, section 5.3). */
+enum class Outcome {
+    /** On an account: one it was linked to, or one made for it. */
+    Account,
+    Guest,
+
+    /** A guest, as the account named could not be linked: an operator's to resolve. */
+    PendingLink,
+}
+
+fun outcome(code: String?): Outcome? =
+    when (code) {
+        "linked", "created" -> Outcome.Account
+        "guest", "unattested_guest" -> Outcome.Guest
+        "classic_pending_link" -> Outcome.PendingLink
+        else -> null
     }
 
 /** Where the connection stands, as the screen shows it. */
@@ -91,6 +151,11 @@ sealed interface Entry {
         override val key: Long,
         val why: Why,
     ) : Entry
+
+    data class SignedIn(
+        override val key: Long,
+        val outcome: Outcome,
+    ) : Entry
 }
 
 /**
@@ -114,6 +179,8 @@ data class ChatState(
     val refused: String? = null,
     /** Lines were missed after this one: history is to fill them in. */
     val fillAfter: ULong? = null,
+    /** What the server last made of the identity this is logged in as. */
+    val outcome: String? = null,
     private val nextKey: Long = 0,
 ) {
     private val shownIds: Set<ULong> by lazy { entries.mapNotNullTo(HashSet()) { (it as? Entry.Line)?.line?.id } }
@@ -142,7 +209,13 @@ data class ChatState(
             is CoreUpdate.Reconnecting -> copy(link = Link.Reconnecting(update.attempt))
             is CoreUpdate.Reconnected ->
                 // From the earliest gap still open, so a second does not cut short the first.
-                copy(link = Link.Live, fillAfter = if (update.gap) listOfNotNull(fillAfter, newestId).minOrNull() else fillAfter)
+                copy(link = Link.Live, fillAfter = if (update.gap) listOfNotNull(fillAfter, newestId).minOrNull() else fillAfter).let { s ->
+                    // A login after a lapse that landed otherwise than the last.
+                    update.info
+                        ?.outcome
+                        ?.takeIf { it != outcome }
+                        ?.let(s::signedIn) ?: s
+                }
             is CoreUpdate.Refused -> copy(refused = update.code)
             is CoreUpdate.Closed ->
                 copy(
@@ -161,6 +234,9 @@ data class ChatState(
         }
 
     fun notSent(why: Why) = appended { Entry.NotSent(it, why) }
+
+    /** What the server made of the identity this logged in as, if it said. */
+    fun signedIn(code: String?) = copy(outcome = code).let { s -> outcome(code)?.let { o -> s.appended { Entry.SignedIn(it, o) } } ?: s }
 
     /**
      * A page of history from before the first line shown, joined on: a line

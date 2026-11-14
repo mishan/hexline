@@ -44,13 +44,13 @@ class IdentitiesTest {
         assertArrayEquals(CERT, listed.cert)
         assertArrayEquals(CARD, listed.card)
         assertTrue(listed.info.canLogin && listed.info.canManage)
-        assertArrayEquals(SEED, identities().seed(FINGERPRINT))
+        assertArrayEquals(SEED, identities().device(FINGERPRINT)?.second)
         val sealed = (files() + secrets.listFiles().orEmpty()).joinToString { String(it.readBytes(), Charsets.ISO_8859_1) }
         assertTrue("no seed in the clear", !sealed.contains(String(SEED, Charsets.ISO_8859_1)))
 
         identities().delete(FINGERPRINT)
         assertTrue(identities().list().isEmpty())
-        assertNull(identities().seed(FINGERPRINT))
+        assertNull(identities().device(FINGERPRINT)?.second)
         assertTrue("its seed goes too", secrets.listFiles().isNullOrEmpty())
     }
 
@@ -59,7 +59,7 @@ class IdentitiesTest {
         identities().save(SEED.copyOf(), CERT, CARD, null)
         identities().save(SEED2.copyOf(), CERT2, CARD, null)
         assertArrayEquals(CERT2, identities().list().single().cert)
-        assertArrayEquals(SEED2, identities().seed(FINGERPRINT))
+        assertArrayEquals(SEED2, identities().device(FINGERPRINT)?.second)
         assertEquals("one seed left", 1, secrets.listFiles().orEmpty().size)
     }
 
@@ -98,7 +98,7 @@ class IdentitiesTest {
     fun anIdentityWhoseSeedWillNeverOpenIsForgotten() {
         identities().save(SEED.copyOf(), CERT, CARD, null)
         KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(alias)
-        assertNull(identities().seed(FINGERPRINT))
+        assertNull(identities().device(FINGERPRINT)?.second)
         assertTrue(identities().list().isEmpty())
         assertTrue("its file goes too", files().isEmpty())
     }

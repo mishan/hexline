@@ -93,17 +93,18 @@ class Identities(
         }
 
     /**
-     * The seed of [fingerprint]'s device, or null if none is kept. One that
-     * will never open is forgotten with its identity; one the Keystore cannot
-     * open now is [SecretUnavailable], and still there. The caller wipes what
-     * it is given.
+     * [fingerprint]'s identity and its device's seed, read together so the
+     * seed is the device the certificate is for, or null if none is kept.
+     * One that will never open is forgotten with its identity; one the
+     * Keystore cannot open now is [SecretUnavailable], and still there. The
+     * caller wipes the seed.
      */
-    fun seed(fingerprint: String): ByteArray? =
+    fun device(fingerprint: String): Pair<StoredIdentity, ByteArray>? =
         synchronized(LOCK) {
             val stored = load(file(fingerprint)) ?: return null
             val secret = secretName(stored.fingerprint, stored.info.device)
             try {
-                secrets.get(secret)
+                secrets.get(secret)?.let { stored to it }
             } catch (_: SecretUnreadable) {
                 delete(fingerprint)
                 null

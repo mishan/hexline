@@ -8,14 +8,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
-import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -37,7 +35,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
@@ -47,90 +44,15 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import org.foggyden.hexline.R
 import org.foggyden.hexline.core.ChatLine
 import org.foggyden.hexline.core.Status
 import org.foggyden.hexline.core.User
-import org.foggyden.hexline.core.coreVersion
-import org.foggyden.hexline.servers.Server
 
 @Composable
-fun ConnectScreen(
-    last: Server?,
-    error: Why?,
-    connecting: Boolean,
-    onConnect: (url: String, login: String?, password: String?, remember: Boolean) -> Unit,
-) {
-    var url by rememberSaveable { mutableStateOf("") }
-    var login by rememberSaveable { mutableStateOf("") }
-    // Not saveable: saved state is written to disk with the task.
-    var password by remember { mutableStateOf("") }
-    var rememberPassword by rememberSaveable { mutableStateOf(false) }
-    // The last server arrives once read; it fills only a form not yet begun.
-    LaunchedEffect(last) {
-        if (last != null && url.isEmpty() && login.isEmpty()) {
-            url = last.url
-            login = last.login.orEmpty()
-        }
-    }
-    Column(
-        Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineMedium)
-        OutlinedTextField(
-            url,
-            { url = it },
-            label = { Text(stringResource(R.string.server_address)) },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            login,
-            { login = it },
-            label = { Text(stringResource(R.string.login)) },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            password,
-            { password = it },
-            label = { Text(stringResource(R.string.password)) },
-            singleLine = true,
-            visualTransformation = PasswordVisualTransformation(),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(rememberPassword, { rememberPassword = it })
-            Text(stringResource(R.string.remember_password))
-        }
-        if (error != null) {
-            Text(
-                describe(error),
-                color = MaterialTheme.colorScheme.error,
-                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
-            )
-        }
-        Button(
-            onClick = { onConnect(url.trim(), login.ifBlank { null }, password.ifEmpty { null }, rememberPassword) },
-            enabled = url.isNotBlank() && !connecting,
-        ) { Text(stringResource(if (connecting) R.string.connecting else R.string.connect)) }
-        Text(
-            stringResource(R.string.core_version, coreVersion()),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.outline,
-        )
-    }
-}
-
-@Composable
-private fun describe(why: Why): String =
+internal fun describe(why: Why): String =
     when (why) {
         Why.Kicked -> stringResource(R.string.why_kicked)
         Why.Replaced -> stringResource(R.string.why_replaced)
@@ -141,6 +63,17 @@ private fun describe(why: Why): String =
         Why.Banned -> stringResource(R.string.why_banned)
         Why.Full -> stringResource(R.string.why_full)
         Why.NotUnderstood -> stringResource(R.string.why_not_understood)
+        Why.NoIdentity -> stringResource(R.string.why_no_identity)
+        Why.AlreadyLinked -> stringResource(R.string.why_already_linked)
+        Why.Denied -> stringResource(R.string.why_denied)
+        Why.NoManage -> stringResource(R.string.why_no_manage)
+        Why.Revoked -> stringResource(R.string.why_revoked)
+        Why.Rotated -> stringResource(R.string.why_rotated)
+        Why.Frozen -> stringResource(R.string.why_frozen)
+        Why.NoIdentitySignIn -> stringResource(R.string.why_no_identity_sign_in)
+        Why.NotHonored -> stringResource(R.string.why_not_honored)
+        Why.BadCredentials -> stringResource(R.string.why_bad_credentials)
+        Why.KeyLocked -> stringResource(R.string.why_key_locked)
         is Why.Refused -> stringResource(R.string.why_refused, why.code)
     }
 
@@ -229,10 +162,19 @@ private fun Transcript(
                 is Entry.Broadcast -> Aside(stringResource(R.string.broadcast, entry.nick, entry.text))
                 is Entry.NotSent -> Aside(stringResource(R.string.not_sent, describe(entry.why)))
                 is Entry.Missed -> Aside(stringResource(R.string.missed))
+                is Entry.SignedIn -> Aside(signedIn(entry.outcome))
             }
         }
     }
 }
+
+@Composable
+private fun signedIn(outcome: Outcome): String =
+    when (outcome) {
+        Outcome.Account -> stringResource(R.string.signed_in_account)
+        Outcome.Guest -> stringResource(R.string.signed_in_guest)
+        Outcome.PendingLink -> stringResource(R.string.signed_in_pending_link)
+    }
 
 @Composable
 private fun Aside(text: String) {
