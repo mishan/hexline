@@ -17,7 +17,7 @@ use crate::{ErrorReply, Token};
 
 /// What a server's clock may differ from this one's by: hxd-ng's default
 /// `[identity] clock_skew`.
-const CLOCK_SKEW: u64 = 300;
+pub const CLOCK_SKEW: u64 = 300;
 
 /// A device as it proves itself: its key, the certificate the identity
 /// signed for it, and the identity's card.

@@ -25,7 +25,20 @@ class ConnectFlowTest {
     fun whatWasTypedIsStillThereAfterARestoreIsCanceled() {
         rule.setContent {
             MaterialTheme {
-                ConnectFlow(emptyList(), emptyList(), Restoring.Idle, null, false, { _, _, _, _ -> }, {}, { _, _, _, _, _ -> }, {})
+                ConnectFlow(
+                    emptyList(),
+                    emptyList(),
+                    emptyMap(),
+                    Restoring.Idle,
+                    null,
+                    false,
+                    { _, _, _, _ -> },
+                    {},
+                    { _, _, _, _, _ -> },
+                    {},
+                    {},
+                    { _, _ -> },
+                )
             }
         }
         rule.onNode(hasSetTextAction() and hasText(text(R.string.server_address))).performTextInput("wss://a.example/ng")

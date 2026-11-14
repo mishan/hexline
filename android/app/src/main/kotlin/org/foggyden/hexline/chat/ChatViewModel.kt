@@ -31,8 +31,10 @@ import org.foggyden.hexline.core.restoreIdentity
 import org.foggyden.hexline.identity.Identities
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
+import org.foggyden.hexline.identity.Standing
 import org.foggyden.hexline.identity.StoredIdentity
 import org.foggyden.hexline.identity.restoreProblem
+import org.foggyden.hexline.identity.standing
 import org.foggyden.hexline.secrets.SecretUnavailable
 import org.foggyden.hexline.servers.SavedServers
 import org.foggyden.hexline.servers.Server
@@ -67,6 +69,11 @@ class ChatViewModel(
     /** The identities this phone is a device of. */
     val identityList: StateFlow<List<StoredIdentity>> = kept
 
+    private val refused = MutableStateFlow<Map<String, String>>(emptyMap())
+
+    /** What servers refused this phone's devices as, by [org.foggyden.hexline.servers.refusalKey]. */
+    val refusals: StateFlow<Map<String, String>> = refused
+
     private val restoring = MutableStateFlow<Restoring>(Restoring.Idle)
     val restore: StateFlow<Restoring> = restoring
 
@@ -95,7 +102,14 @@ class ChatViewModel(
      * batch is applied whole and in order, and the call returns at once, as
      * the core asks.
      */
-    private inner class Sink : UpdateSink {
+    private inner class Sink(
+        val server: Server,
+        /** When its connect was asked for, a [SavedServers.generation]. */
+        val since: Long,
+    ) : UpdateSink {
+        /** The device an identity login proved: the one to mark if a later login is refused. */
+        @Volatile var device: ByteArray? = null
+
         override fun deliver(updates: List<CoreUpdate>) {
             var before: ChatState? = null
             state.update { s ->
@@ -105,7 +119,10 @@ class ChatViewModel(
             }
             val wasConnecting = before?.link == Link.Connecting
             val reconnected = updates.any { it is CoreUpdate.Reconnected }
+            // A login after a lapse, refused by the server.
+            val refused = updates.firstNotNullOfOrNull { (it as? CoreUpdate.Refused)?.code }
             viewModelScope.launch {
+                if (refused != null) markRefused(server, device, refused, since)
                 if (sink !== this@Sink) return@launch
                 // The first page waits for the roster that makes the link live.
                 if (wasConnecting && state.value.link == Link.Live) loadEarlier()
@@ -149,7 +166,8 @@ class ChatViewModel(
         viewModelScope.launch {
             val found =
                 withContext(Dispatchers.IO) {
-                    kept.value = identities.list()
+                    publishIdentities()
+                    publishRefusals()
                     savedServers.value = servers.all()
                     servers.last()?.let { Triple(it, servers.session(it), servers.password(it)) }
                 } ?: return@launch
@@ -194,18 +212,9 @@ class ChatViewModel(
      */
     fun forget(server: Server) {
         if (pending?.server == server) pending = null
-        if (server == this.server) {
-            sink = null
-            // Forgetting a server is leaving it: no session is left behind
-            // that nothing will resume or end.
-            connection?.let {
-                it.hangUp(true)
-                it.close()
-            }
-            connection = null
-            this.server = null
-            state.value = ChatState()
-        }
+        // Forgetting a server is leaving it: no session is left behind that
+        // nothing will resume or end.
+        if (server == this.server) leave()
         viewModelScope.launch {
             savedServers.value = withContext(Dispatchers.IO) { servers.forget(server).let { servers.all() } }
         }
@@ -227,8 +236,19 @@ class ChatViewModel(
                 try {
                     val device = restoreIdentity(registrar, handle, kind, secret, deviceName).also { made = it }
                     withContext(Dispatchers.IO) {
-                        identities.save(device.seed, device.cert, device.card, handle)
-                        kept.value = identities.list()
+                        val replaced =
+                            identities
+                                .list()
+                                .find { it.fingerprint == device.fingerprint }
+                                ?.info
+                                ?.device
+                        identities.save(device.seed, device.cert, device.card, handle, registrar)
+                        // The new device starts with no server's refusal; the old one's go with it.
+                        replaced?.let {
+                            servers.forgetRefusalsOf(it)
+                            publishRefusals()
+                        }
+                        publishIdentities()
                     }
                     Restoring.Done(device.fingerprint)
                 } catch (e: CoreException) {
@@ -247,15 +267,104 @@ class ChatViewModel(
         if (restoring.value != Restoring.Working) restoring.value = Restoring.Idle
     }
 
+    /** Logs out of the current connection and lets go of it. */
+    private fun leave() {
+        sink = null
+        connection?.let {
+            it.hangUp(true)
+            it.close()
+        }
+        connection = null
+        this.server = null
+        state.value = ChatState()
+    }
+
+    /**
+     * Forgets [fingerprint]'s identity, its device's seed, and what every
+     * saved server kept for it (a session, a refusal), and logs out of the
+     * current connection if it is signed in as it.
+     */
+    fun deleteIdentity(fingerprint: String) {
+        val signedIn = SignIn.Identity(fingerprint)
+        if (pending?.server?.signIn == signedIn) pending = null
+        if (server?.signIn == signedIn) leave()
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                val device =
+                    identities
+                        .list()
+                        .find { it.fingerprint == fingerprint }
+                        ?.info
+                        ?.device
+                identities.delete(fingerprint)
+                publishIdentities()
+                for (s in servers.all().filter { it.signIn == signedIn }) servers.keepSession(s, null)
+                device?.let(servers::forgetRefusalsOf)
+                publishRefusals()
+            }
+        }
+    }
+
+    /**
+     * Forgets [server]'s refusal of [fingerprint]'s device, so a login
+     * tries it there again: the server may have lifted it.
+     */
+    fun tryAgain(
+        server: Server,
+        fingerprint: String,
+    ) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                identities.list().find { it.fingerprint == fingerprint }?.let { servers.forgetRefusal(server, it.info.device) }
+                publishRefusals()
+            }
+        }
+    }
+
+    /** Read and shown under one lock, so a slower read is never shown over a newer one. */
+    private fun publishIdentities() = synchronized(kept) { kept.value = identities.list() }
+
+    /** As [publishIdentities], for the refusals servers made. */
+    private fun publishRefusals() = synchronized(refused) { refused.value = servers.refusals() }
+
+    /**
+     * Keeps [server]'s refusal of [device] when only a new device answers
+     * it: that device is not offered to sign in there again, and is
+     * everywhere else.
+     */
+    private suspend fun markRefused(
+        server: Server,
+        device: ByteArray?,
+        code: String,
+        since: Long,
+    ) {
+        if (server.signIn !is SignIn.Identity || device == null || code !in REVOKED) return
+        withContext(Dispatchers.IO) {
+            servers.markRefused(server, device, code, since)
+            publishRefusals()
+        }
+    }
+
     private class NoIdentity : Exception()
 
-    /** Logs in as the identity [fingerprint] names, its seed wiped once handed over. */
+    /** An identity this phone will not sign in to [to] with, and why. */
+    private class Unusable(
+        val why: Why,
+    ) : Exception()
+
+    /**
+     * Logs in to [to] as the identity [fingerprint] names, its seed wiped
+     * once handed over; not with a certificate outside its time, nor a
+     * device [to] refused, and not resumed with either.
+     */
     private suspend fun loginIdentity(
         conn: ServerConnection,
+        to: Server,
         fingerprint: String,
         create: Boolean,
         link: ClassicLogin?,
         saved: ByteArray?,
+        proving: (ByteArray) -> Unit,
     ): LoginInfo {
         // Held outside the read, so a cancellation after it still wipes it.
         var seed: ByteArray? = null
@@ -263,6 +372,13 @@ class ChatViewModel(
             val (stored, mine) =
                 withContext(Dispatchers.IO) { identities.device(fingerprint)?.also { seed = it.second } }
                     ?: throw NoIdentity()
+            when (standing(stored, System.currentTimeMillis() / 1000)) {
+                Standing.Expired -> throw Unusable(Why.CertExpired)
+                Standing.NotYetValid -> throw Unusable(Why.CertNotYetValid)
+                else -> {}
+            }
+            withContext(Dispatchers.IO) { servers.refused(to, stored.info.device) }?.let { throw Unusable(refusal(it)) }
+            proving(stored.info.device)
             return conn.loginIdentity(DeviceIdentity(mine, stored.cert, stored.card), create, link, saved)
         } finally {
             seed?.fill(0)
@@ -283,7 +399,7 @@ class ChatViewModel(
             connection = null
             it.close()
         }
-        val mine = Sink()
+        val mine = Sink(to, since)
         sink = mine
         val conn = ServerConnection(to.url, mine)
         conn.setForeground(foreground)
@@ -299,7 +415,7 @@ class ChatViewModel(
                             // An account named to link and not linked yet is
                             // never made in its place.
                             val asked = link != null || withContext(Dispatchers.IO) { servers.linkAsked(to) }
-                            loginIdentity(conn, how.fingerprint, !asked, link, saved)
+                            loginIdentity(conn, to, how.fingerprint, !asked, link, saved) { mine.device = it }
                         }
                     }
                 // Forgotten while logging in: nothing of it is kept.
@@ -318,12 +434,19 @@ class ChatViewModel(
             } catch (_: NoIdentity) {
                 if (connection !== conn) return@launch
                 state.update { it.copy(link = Link.Ended(Why.NoIdentity)) }
+            } catch (e: Unusable) {
+                if (connection !== conn) return@launch
+                state.update { it.copy(link = Link.Ended(e.why)) }
             } catch (_: SecretUnavailable) {
                 if (connection !== conn) return@launch
                 state.update { it.copy(link = Link.Ended(Why.KeyLocked)) }
             } catch (e: CoreException) {
-                if (connection !== conn) return@launch
                 val code = (e as? CoreException.Refused)?.code
+                // Kept whether or not this is still the connection: the
+                // server said it of this device, and a forget since is
+                // honored by the generation.
+                if (code != null) markRefused(to, mine.device, code, since)
+                if (connection !== conn) return@launch
                 withContext(Dispatchers.IO) {
                     // Refused for good: the saved session is not coming back.
                     // Busy or unreachable, it may yet.
@@ -466,5 +589,8 @@ class ChatViewModel(
         const val FILL_PAGE = 200u
         const val FILL_PAGES = 5
         const val FILL_WAIT = 2_000L
+
+        /** What a server refuses a device as that only a new device answers. */
+        val REVOKED = setOf("revoked", "rotated")
     }
 }

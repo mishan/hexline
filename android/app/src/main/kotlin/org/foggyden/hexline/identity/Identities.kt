@@ -20,6 +20,8 @@ class StoredIdentity(
     val cert: ByteArray,
     val card: ByteArray,
     val info: CertInfo,
+    /** Where it was restored from, to renew it at. */
+    val registrar: String? = null,
 ) {
     /** The identity, in the form the core gives it: the only one to pass back. */
     val fingerprint: String get() = info.fingerprint
@@ -60,6 +62,7 @@ class Identities(
         cert: ByteArray,
         card: ByteArray,
         handle: String?,
+        registrar: String?,
     ): StoredIdentity =
         synchronized(LOCK) {
             val info = certForDevice(cert, card, seed)
@@ -70,7 +73,7 @@ class Identities(
             // leaves one whole device or the other.
             val secret = secretName(info.fingerprint, info.device)
             secrets.put(secret, seed)
-            val stored = StoredIdentity(handle?.ifEmpty { null }, cert, card, info)
+            val stored = StoredIdentity(handle?.ifEmpty { null }, cert, card, info, registrar?.ifEmpty { null })
             write(file, stored)
             before?.let { old ->
                 secretName(old.fingerprint, old.info.device).takeIf { it != secret }?.let(secrets::delete)
@@ -138,7 +141,13 @@ class Identities(
                 )
             // The file a fingerprint names holds that identity's device only.
             if (file(info.fingerprint).name != file.name) return null
-            StoredIdentity(json.optString("handle").ifEmpty { null }, unb64(json.getString("cert")), unb64(json.getString("card")), info)
+            StoredIdentity(
+                json.optString("handle").ifEmpty { null },
+                unb64(json.getString("cert")),
+                unb64(json.getString("card")),
+                info,
+                json.optString("registrar").ifEmpty { null },
+            )
         } catch (_: Exception) {
             null
         }
@@ -154,7 +163,10 @@ class Identities(
                 .put("card", b64(stored.card))
                 .put("device", b64(stored.info.device))
                 .put("device_enc", b64(stored.info.deviceEnc))
-                .apply { stored.handle?.let { put("handle", it) } }
+                .apply {
+                    stored.handle?.let { put("handle", it) }
+                    stored.registrar?.let { put("registrar", it) }
+                }
         val atomic = AtomicFile(file)
         val out = atomic.startWrite()
         try {

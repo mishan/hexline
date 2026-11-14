@@ -665,6 +665,143 @@ async fn a_device_seed_that_is_not_one_is_refused_before_anything_is_sent() {
 }
 
 #[tokio::test]
+async fn a_certificate_outside_its_time_is_refused_before_anything_is_sent() {
+    use hl_identity::{Card, DeviceCert, DeviceKey, IdentityKey};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Past its end, and not begun: a phone whose clock is behind.
+    for (issued, lifetime, want) in [
+        (now - 2000, 1000, "cert_expired"),
+        (now + 3600, 86_400, "cert_not_yet_valid"),
+    ] {
+        let id = IdentityKey::generate();
+        let key = DeviceKey::generate();
+        let cert = DeviceCert::for_keys(&id, key.public(), key.public_enc(), issued, lifetime)
+            .unwrap()
+            .sign(&id);
+        let card = Card::new(&id, "Alice", now).sign(&id, Vec::new()).unwrap();
+        // Nothing listens here: a login that reached for the network would
+        // be refused as unreachable instead.
+        let alice = ServerConnection::new("ws://127.0.0.1:9/ng".into(), Arc::new(Sink::default()));
+        let device = DeviceIdentity {
+            device_seed: key.seed().to_vec(),
+            cert,
+            card,
+        };
+        let refused = alice.login_identity(device, true, None, None).await;
+        assert!(
+            matches!(&refused, Err(CoreError::Refused { code, .. }) if code == want),
+            "{want}: {refused:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_saved_session_is_not_resumed_with_a_certificate_past_its_time() {
+    use hl_identity::{DeviceCert, DeviceKey};
+    let server = Server::with_identity(&[], 300).await;
+    let (id, d) = device("Alice");
+    let alice = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
+    let device = DeviceIdentity {
+        device_seed: d.key.seed().to_vec(),
+        cert: d.cert.clone(),
+        card: d.card.clone(),
+    };
+    alice
+        .login_identity(device, true, None, None)
+        .await
+        .unwrap();
+    let saved = alice.saved().unwrap();
+    alice.hang_up(false);
+
+    // The same identity's device, its certificate since past its time.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let key = DeviceKey::generate();
+    let lapsed = DeviceCert::for_keys(&id, key.public(), key.public_enc(), now - 2000, 1000)
+        .unwrap()
+        .sign(&id);
+    // Nothing listens here: a resume that reached for the network would be
+    // refused as unreachable instead.
+    let again = ServerConnection::new("ws://127.0.0.1:9/ng".into(), Arc::new(Sink::default()));
+    let device = DeviceIdentity {
+        device_seed: key.seed().to_vec(),
+        cert: lapsed,
+        card: d.card.clone(),
+    };
+    let refused = again.login_identity(device, true, None, Some(saved)).await;
+    assert!(
+        matches!(&refused, Err(CoreError::Refused { code, .. }) if code == "cert_expired"),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_device_revoked_while_its_link_was_down_is_refused_and_not_tried_again() {
+    let server = Server::with_identity(&["bob"], 300).await;
+    let proxy = Proxy::to(&server).await;
+    let sink = Arc::new(Sink::default());
+    let alice = ServerConnection::new(proxy.url.clone(), sink.clone());
+    let (_id, d) = device("Alice");
+    let device_fp = hl_identity::Fingerprint::of(&d.key.public()).to_string();
+    let again = || DeviceIdentity {
+        device_seed: d.key.seed().to_vec(),
+        cert: d.cert.clone(),
+        card: d.card.clone(),
+    };
+    alice
+        .login_identity(again(), true, None, None)
+        .await
+        .unwrap();
+    sink.heard("her roster", roster).await;
+    let (_bob, bob_sink) = logged_in(&server.url, "bob").await;
+    bob_sink
+        .heard(
+            "alice",
+            |u| matches!(u, CoreUpdate::Roster { users, .. } if users.iter().any(|u| u.nick == "Alice")),
+        )
+        .await;
+
+    proxy.refuse(true);
+    proxy.sever();
+    server.revoke_device(&device_fp);
+    // Her session, waiting to be resumed, ends with the revocation.
+    bob_sink
+        .heard_within(10, "alice's session ending", |u| {
+            matches!(u, CoreUpdate::UserParted { .. })
+        })
+        .await;
+    proxy.refuse(false);
+    alice.network_changed();
+    sink.heard_within(
+        10,
+        "the refusal",
+        |u| matches!(u, CoreUpdate::Refused { code } if code == "revoked"),
+    )
+    .await;
+    sink.heard("the end", |u| matches!(u, CoreUpdate::Closed { .. }))
+        .await;
+    let closed = sink.at(|u| matches!(u, CoreUpdate::Closed { .. })).unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        sink.positions(reconnecting).iter().all(|&i| i < closed),
+        "tried again after the refusal: {:?}",
+        sink.all()
+    );
+
+    let fresh = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
+    let refused = fresh.login_identity(again(), true, None, None).await;
+    assert!(
+        matches!(&refused, Err(CoreError::Refused { code, .. }) if code == "revoked"),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_session_the_server_did_not_make_the_identitys_is_refused() {
     // A server with a guest account, which an upgrade that lost its token
     // is let in to.
