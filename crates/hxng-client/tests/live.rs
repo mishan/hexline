@@ -164,3 +164,9 @@ async fn an_identity_is_refused_by_its_code() {
         }
     }
 }
+
+#[tokio::test]
+async fn a_server_launched_on_a_port_another_holds_is_not_taken_for_that_one() {
+    let first = Server::start(&[]).await;
+    assert!(Server::try_on(first.addr.port()).await.is_none());
+}

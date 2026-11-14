@@ -4,7 +4,7 @@
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -112,11 +112,20 @@ impl Server {
         // server may take it first. Each try is on fresh ports, and taken
         // only once the server there is this one.
         for _ in 0..5 {
-            if let Some(server) = Server::try_launch(accounts, grace, identity, registrar).await {
+            let ng = free_port();
+            if let Some(server) = Server::try_launch(accounts, grace, identity, registrar, ng).await
+            {
                 return server;
             }
         }
         panic!("hxd never came up on ports of its own");
+    }
+
+    /// One try at [`Server::start`]'s server with its ng port `ng`, as
+    /// another test may have taken the same port: none if this one's hxd
+    /// is not the one that answers there.
+    pub async fn try_on(ng: u16) -> Option<Server> {
+        Server::try_launch(&[], 300, None, false, ng).await
     }
 
     async fn try_launch(
@@ -124,25 +133,29 @@ impl Server {
         grace: u64,
         identity: Option<(&str, &str)>,
         registrar: bool,
+        ng: u16,
     ) -> Option<Server> {
         let bin = std::env::var("HXD_BIN").expect(
             "HXD_BIN must name an hxd binary for the live tests (`make test-live` sets it)",
         );
         let root =
             std::env::var("TMPDIR").unwrap_or_else(|_| std::env::temp_dir().display().to_string());
-        let dir = PathBuf::from(root).join(format!(
+        // Its own whatever ports it is given: two launches at once may be
+        // given the same one, and only one of them binds it.
+        static LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+        let name = format!(
             "hexline-live-{}-{}",
             std::process::id(),
-            free_port()
-        ));
+            LAUNCHES.fetch_add(1, Ordering::SeqCst)
+        );
+        let dir = PathBuf::from(root).join(&name);
         std::fs::create_dir_all(dir.join("accounts")).unwrap();
         for a in accounts {
             std::fs::write(dir.join("accounts").join(format!("{a}.toml")), account(a)).unwrap();
         }
         let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
         let proxy_port = proxy.local_addr().unwrap().port();
-        let (legacy, ng) = (free_port(), free_port());
-        let name = format!("hexline-live-{ng}");
+        let legacy = free_port();
         std::fs::write(
             dir.join("hxd-ng.toml"),
             format!(

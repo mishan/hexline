@@ -74,8 +74,16 @@ class ChatViewModel(
     @Volatile private var connection: ServerConnection? = null
     private var server: Server? = null
 
-    /** A server a connect is reading the secrets of, before it starts. */
-    private var pending: Server? = null
+    /**
+     * A connect reading its server's secrets, before it starts: one of its
+     * own, so a connect to the same server asked for after a forget is not
+     * taken for the one the forget canceled.
+     */
+    private class Pending(
+        val server: Server,
+    )
+
+    private var pending: Pending? = null
 
     /** The connection has been live: what it saves from now on is its own. */
     private var established = false
@@ -162,7 +170,8 @@ class ChatViewModel(
         remember: Boolean,
         link: ClassicLogin? = null,
     ) {
-        pending = wanted
+        val mine = Pending(wanted)
+        pending = mine
         val since = servers.generation()
         viewModelScope.launch {
             val (kept, saved) =
@@ -172,7 +181,7 @@ class ChatViewModel(
                     null to null
                 }
             // Forgotten, or another connect asked for, while its secrets were read.
-            if (pending != wanted) return@launch
+            if (pending !== mine) return@launch
             pending = null
             start(wanted, password ?: kept, link, saved, passwordToKeep(password, kept, remember), since)
         }
@@ -184,7 +193,7 @@ class ChatViewModel(
      * out) remembers it again.
      */
     fun forget(server: Server) {
-        if (server == pending) pending = null
+        if (pending?.server == server) pending = null
         if (server == this.server) {
             sink = null
             // Forgetting a server is leaving it: no session is left behind
