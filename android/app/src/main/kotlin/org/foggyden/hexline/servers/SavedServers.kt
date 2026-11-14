@@ -190,15 +190,31 @@ class SavedServers(
     fun session(server: Server): ByteArray? = read(name("session", server))
 
     /**
+     * Forgets [server]'s session, and any write of one asked for before
+     * this: a save on its way out does not bring it back.
+     */
+    fun forgetSession(server: Server): Unit =
+        synchronized(LOCK) {
+            forgottenAt[name("session", server)] = ++forgets
+            write(name("session", server), null)
+        }
+
+    /**
      * The session to resume [server] with, or with null none. A server
      * forgotten, or never saved, keeps none: a connection let go of may
-     * still be saving its own on the way out. False if it could not be
-     * written now.
+     * still be saving its own on the way out. With [since], a
+     * [generation], none if the session was forgotten since. False if it
+     * could not be written now.
      */
     fun keepSession(
         server: Server,
         session: ByteArray?,
-    ): Boolean = synchronized(LOCK) { write(name("session", server), session?.takeIf { server in all() }) }
+        since: Long? = null,
+    ): Boolean =
+        synchronized(LOCK) {
+            if (since != null && (forgottenAt[name("session", server)] ?: 0) > since) return false
+            write(name("session", server), session?.takeIf { server in all() })
+        }
 
     /** The one server this kept before it kept them all, and its secrets. */
     private fun forgetTheOneKeptBefore() {

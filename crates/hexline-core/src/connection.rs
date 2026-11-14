@@ -1053,6 +1053,14 @@ fn ended(code: &str) -> CoreError {
 }
 
 /// Whether a refusal may pass if the core tries again later.
+/// Whether a server's refusal `code` holds against this device until it
+/// is replaced: the server refused the key itself, not this one login, so
+/// asking it again as it is will be refused again.
+#[uniffi::export]
+pub fn refusal_lasts(code: String) -> bool {
+    matches!(code.as_str(), "revoked" | "rotated")
+}
+
 fn for_now(code: &str) -> bool {
     matches!(
         code,

@@ -178,6 +178,18 @@ class SavedServersTest {
     }
 
     @Test
+    fun aSessionSavedAfterItWasClearedIsNotWrittenBack() {
+        val a = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
+        servers().remember(a, null)
+        val since = servers().generation()
+        servers().forgetSession(a)
+        servers().keepSession(a, byteArrayOf(1, 2, 3), since)
+        assertNull("a save from before the clear", servers().session(a))
+        servers().keepSession(a, byteArrayOf(4), servers().generation())
+        assertArrayEquals("one from after it", byteArrayOf(4), servers().session(a))
+    }
+
+    @Test
     fun aRefusalForAServerForgottenSinceItsLoginBeganIsNotKept() {
         val a = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
         val device = ByteArray(32) { 1 }

@@ -27,6 +27,7 @@ import org.foggyden.hexline.core.Restored
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.ServerConnection
 import org.foggyden.hexline.core.UpdateSink
+import org.foggyden.hexline.core.refusalLasts
 import org.foggyden.hexline.core.restoreIdentity
 import org.foggyden.hexline.identity.Identities
 import org.foggyden.hexline.identity.RestoreProblem
@@ -216,7 +217,12 @@ class ChatViewModel(
         // nothing will resume or end.
         if (server == this.server) leave()
         viewModelScope.launch {
-            savedServers.value = withContext(Dispatchers.IO) { servers.forget(server).let { servers.all() } }
+            savedServers.value =
+                withContext(Dispatchers.IO) {
+                    servers.forget(server)
+                    publishRefusals()
+                    servers.all()
+                }
         }
     }
 
@@ -298,7 +304,7 @@ class ChatViewModel(
                         ?.device
                 identities.delete(fingerprint)
                 publishIdentities()
-                for (s in servers.all().filter { it.signIn == signedIn }) servers.keepSession(s, null)
+                for (s in servers.all().filter { it.signIn == signedIn }) servers.forgetSession(s)
                 device?.let(servers::forgetRefusalsOf)
                 publishRefusals()
             }
@@ -338,7 +344,7 @@ class ChatViewModel(
         code: String,
         since: Long,
     ) {
-        if (server.signIn !is SignIn.Identity || device == null || code !in REVOKED) return
+        if (server.signIn !is SignIn.Identity || device == null || !refusalLasts(code)) return
         withContext(Dispatchers.IO) {
             servers.markRefused(server, device, code, since)
             publishRefusals()
@@ -450,7 +456,7 @@ class ChatViewModel(
                 withContext(Dispatchers.IO) {
                     // Refused for good: the saved session is not coming back.
                     // Busy or unreachable, it may yet.
-                    if (saved != null && code != null && !keepsSession(code)) servers.keepSession(to, null)
+                    if (saved != null && code != null && !keepsSession(code)) servers.forgetSession(to)
                     if (code == "login_failed") servers.forgetPassword(to)
                 }
                 if (connection !== conn) return@launch
@@ -545,7 +551,9 @@ class ChatViewModel(
         val (conn, to) = (connection ?: return) to (server ?: return)
         if (!established || state.value.leaving) return
         val saved = conn.saved()
-        viewModelScope.launch(Dispatchers.IO) { servers.keepSession(to, saved) }
+        // Asked for now: a clear that comes first wins, even if this write lands after it.
+        val since = servers.generation()
+        viewModelScope.launch(Dispatchers.IO) { servers.keepSession(to, saved, since) }
     }
 
     fun disconnect() {
@@ -554,7 +562,7 @@ class ChatViewModel(
         viewModelScope.launch {
             // Forgotten first, so a process gone before the logout lands does
             // not wake up in the chat the person left.
-            withContext(Dispatchers.IO) { servers.keepSession(to, null) }
+            withContext(Dispatchers.IO) { servers.forgetSession(to) }
             conn.disconnect()
         }
     }
@@ -572,7 +580,8 @@ class ChatViewModel(
         val saved = conn.saved().takeIf { established && !leaving }
         conn.hangUp(leaving)
         conn.close()
-        if (established || leaving) thread(name = "hexline-save") { servers.keepSession(to, saved) }
+        val since = servers.generation()
+        if (established || leaving) thread(name = "hexline-save") { servers.keepSession(to, saved, since) }
     }
 
     private fun why(e: CoreException): Why =
@@ -589,8 +598,5 @@ class ChatViewModel(
         const val FILL_PAGE = 200u
         const val FILL_PAGES = 5
         const val FILL_WAIT = 2_000L
-
-        /** What a server refuses a device as that only a new device answers. */
-        val REVOKED = setOf("revoked", "rotated")
     }
 }

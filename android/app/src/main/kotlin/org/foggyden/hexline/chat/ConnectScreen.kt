@@ -25,6 +25,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.listSaver
@@ -41,6 +42,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.LifecycleResumeEffect
+import kotlinx.coroutines.delay
 import org.foggyden.hexline.R
 import org.foggyden.hexline.core.ClassicLogin
 import org.foggyden.hexline.core.SecretKind
@@ -49,6 +52,7 @@ import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
 import org.foggyden.hexline.identity.Standing
 import org.foggyden.hexline.identity.StoredIdentity
+import org.foggyden.hexline.identity.nextChange
 import org.foggyden.hexline.identity.standing
 import org.foggyden.hexline.identity.usable
 import org.foggyden.hexline.servers.Server
@@ -125,7 +129,7 @@ private fun ConnectScreen(
     onTryAgain: (server: Server, fingerprint: String) -> Unit,
 ) {
     var form by form
-    val now = System.currentTimeMillis() / 1000
+    val now = certificateClock(identities)
     var deleting by remember { mutableStateOf<StoredIdentity?>(null) }
     val refused = { server: Server, kept: StoredIdentity -> refusals[refusalKey(server, kept.info.device)] }
     // The servers arrive once read; the last fills only a form not yet begun.
@@ -279,6 +283,28 @@ private fun ConnectScreen(
             dismissButton = { TextButton({ deleting = null }) { Text(stringResource(R.string.cancel)) } },
         )
     }
+}
+
+/**
+ * The time, in seconds, as what the screen shows of [identities] needs
+ * it: read again when the app comes back, and at the next moment any of
+ * them stands otherwise, so a certificate that begins or ends while the
+ * screen is open is shown, and offered, as it now is.
+ */
+@Composable
+private fun certificateClock(identities: List<StoredIdentity>): Long {
+    var now by remember { mutableLongStateOf(System.currentTimeMillis() / 1000) }
+    LifecycleResumeEffect(Unit) {
+        now = System.currentTimeMillis() / 1000
+        onPauseOrDispose {}
+    }
+    LaunchedEffect(identities, now) {
+        val next = identities.mapNotNull { nextChange(it, now) }.minOrNull() ?: return@LaunchedEffect
+        delay((next - now) * 1000)
+        // Never short of it: a clock read a moment early would wait again for nothing.
+        now = maxOf(System.currentTimeMillis() / 1000, next)
+    }
+    return now
 }
 
 /** What the person is told of an identity that is not simply good, or null. */

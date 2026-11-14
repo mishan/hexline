@@ -127,6 +127,21 @@ pub fn cert_time(issued: u64, expires: u64, now: u64) -> CertTime {
     }
 }
 
+/// The first moment after `now` at which [`cert_time`] answers otherwise
+/// for this certificate, if there is one: for the app to look again then.
+#[uniffi::export]
+pub fn cert_time_changes(issued: u64, expires: u64, now: u64) -> Option<u64> {
+    let skew = hxng_client::auth::CLOCK_SKEW;
+    let at_now = cert_time(issued, expires, now);
+    [
+        issued.saturating_sub(skew),
+        expires.saturating_add(skew).saturating_add(1),
+    ]
+    .into_iter()
+    .filter(|&t| t > now && cert_time(issued, expires, t) != at_now)
+    .min()
+}
+
 /// `cert` refused if it is outside its time, before a server is asked: a
 /// server would answer it as a certificate it cannot read, where this one
 /// wants renewing, or the phone's clock setting right. A resume proves

@@ -67,6 +67,17 @@ impl Sink {
     }
 }
 
+/// What resumes `conn`'s session, once the core has it to give.
+async fn saved_soon(conn: &ServerConnection) -> Vec<u8> {
+    for _ in 0..100 {
+        if let Some(saved) = conn.saved() {
+            return saved;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no session to save");
+}
+
 /// One field of what `saved()` gave, which the app keeps as bytes.
 fn saved_field(saved: &[u8], key: &str) -> Value {
     serde_json::from_slice::<Value>(saved).unwrap()[key].clone()
@@ -713,7 +724,7 @@ async fn a_saved_session_is_not_resumed_with_a_certificate_past_its_time() {
         .login_identity(device, true, None, None)
         .await
         .unwrap();
-    let saved = alice.saved().unwrap();
+    let saved = saved_soon(&alice).await;
     alice.hang_up(false);
 
     // The same identity's device, its certificate since past its time.
