@@ -38,8 +38,6 @@ pub struct CertInfo {
     pub device_enc: Vec<u8>,
     pub issued: u64,
     pub expires: u64,
-    /// When to renew it: with a third of its life left (design §2.1).
-    pub renew_after: u64,
     pub can_login: bool,
     pub can_message: bool,
     pub can_vouch: bool,
@@ -90,13 +88,65 @@ pub fn cert_info(
         device_enc,
         issued: c.issued,
         expires: c.expires,
-        renew_after: c.expires - (c.expires - c.issued) / 3,
         can_login: c.allows(caps::LOGIN),
         can_message: c.allows(caps::MESSAGE),
         can_vouch: c.allows(caps::VOUCH),
         can_manage: c.allows(caps::MANAGE),
         name: c.name,
     })
+}
+
+/// Where a certificate's time stands.
+#[derive(Debug, PartialEq, uniffi::Enum)]
+pub enum CertTime {
+    Valid,
+    /// Begins after the clock, past what a server allows: the clock is
+    /// likely wrong.
+    NotYetValid,
+    Expired,
+}
+
+/// A certificate from `issued` to `expires` at `now`, by hl-identity's own
+/// window within the skew a server allows: the one line the app and the
+/// core both draw, so neither offers what the other refuses.
+#[uniffi::export]
+pub fn cert_time(issued: u64, expires: u64, now: u64) -> CertTime {
+    let window = DeviceCert {
+        identity: [0; 32],
+        device: [0; 32],
+        device_enc: [0; 32],
+        issued,
+        expires,
+        caps: None,
+        name: None,
+    };
+    match window.check_valid(now, hxng_client::auth::CLOCK_SKEW) {
+        Ok(()) => CertTime::Valid,
+        Err(hl_identity::Error::Expired) => CertTime::Expired,
+        Err(_) => CertTime::NotYetValid,
+    }
+}
+
+/// `cert` refused if it is outside its time, before a server is asked: a
+/// server would answer it as a certificate it cannot read, where this one
+/// wants renewing, or the phone's clock setting right. A resume proves
+/// nothing, so it is asked before a resume too: an expired device is
+/// never kept on by the core.
+pub(crate) fn in_time(cert: &[u8]) -> Result<(), CoreError> {
+    let Ok(c) = DeviceCert::parse(cert) else {
+        return Ok(());
+    };
+    match cert_time(c.issued, c.expires, crate::restore::now()) {
+        CertTime::Valid => Ok(()),
+        CertTime::Expired => Err(CoreError::Refused {
+            code: "cert_expired".into(),
+            detail: "this device's certificate has expired".into(),
+        }),
+        CertTime::NotYetValid => Err(CoreError::Refused {
+            code: "cert_not_yet_valid".into(),
+            detail: "this device's certificate is not valid yet: check the phone's clock".into(),
+        }),
+    }
 }
 
 fn refused(detail: &str) -> CoreError {
@@ -136,7 +186,6 @@ mod tests {
                 device_enc: device.public_enc.clone(),
                 issued: 900,
                 expires: 1200,
-                renew_after: 1100,
                 can_login: true,
                 can_message: true,
                 can_vouch: false,

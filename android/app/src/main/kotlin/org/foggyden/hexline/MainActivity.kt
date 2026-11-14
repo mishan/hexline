@@ -28,6 +28,7 @@ fun Hexline(chat: ChatViewModel) {
     val state by chat.chat.collectAsStateWithLifecycle()
     val saved by chat.saved.collectAsStateWithLifecycle()
     val identities by chat.identityList.collectAsStateWithLifecycle()
+    val refusals by chat.refusals.collectAsStateWithLifecycle()
     val restore by chat.restore.collectAsStateWithLifecycle()
     when (val link = state.link) {
         Link.Live, is Link.Reconnecting -> ChatScreen(state, chat::send, chat::loadEarlier, chat::disconnect)
@@ -35,6 +36,7 @@ fun Hexline(chat: ChatViewModel) {
             ConnectFlow(
                 saved = saved,
                 identities = identities,
+                refusals = refusals,
                 restore = restore,
                 error = (link as? Link.Ended)?.why,
                 connecting = link == Link.Connecting,
@@ -42,6 +44,8 @@ fun Hexline(chat: ChatViewModel) {
                 onForget = chat::forget,
                 onRestore = chat::restore,
                 onRestoreSeen = chat::restoreSeen,
+                onDelete = chat::deleteIdentity,
+                onTryAgain = chat::tryAgain,
             )
     }
 }

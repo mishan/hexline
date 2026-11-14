@@ -12,6 +12,7 @@ import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.FilterChip
@@ -31,6 +32,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
@@ -45,9 +47,13 @@ import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.coreVersion
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
+import org.foggyden.hexline.identity.Standing
 import org.foggyden.hexline.identity.StoredIdentity
+import org.foggyden.hexline.identity.standing
+import org.foggyden.hexline.identity.usable
 import org.foggyden.hexline.servers.Server
 import org.foggyden.hexline.servers.SignIn
+import org.foggyden.hexline.servers.refusalKey
 
 /**
  * Signing in: the connect screen, and the restore screen it opens. The
@@ -58,6 +64,7 @@ import org.foggyden.hexline.servers.SignIn
 fun ConnectFlow(
     saved: List<Server>,
     identities: List<StoredIdentity>,
+    refusals: Map<String, String>,
     restore: Restoring,
     error: Why?,
     connecting: Boolean,
@@ -65,13 +72,18 @@ fun ConnectFlow(
     onForget: (Server) -> Unit,
     onRestore: (registrar: String, handle: String, kind: SecretKind, secret: String, deviceName: String) -> Unit,
     onRestoreSeen: () -> Unit,
+    onDelete: (fingerprint: String) -> Unit,
+    onTryAgain: (server: Server, fingerprint: String) -> Unit,
 ) {
     val form = rememberSaveable(stateSaver = FormSaver) { mutableStateOf(ConnectForm()) }
-    var restoring by rememberSaveable { mutableStateOf(false) }
-    LaunchedEffect(restore) { if (restore is Restoring.Done) restoring = false }
-    if (restoring) {
-        RestoreScreen(restore, onRestore) {
-            restoring = false
+    // The registrar and handle the restore screen opens with: blank for a
+    // new identity, an identity's own to renew it. Null while it is closed.
+    var restoreFor by rememberSaveable { mutableStateOf<Pair<String, String>?>(null) }
+    LaunchedEffect(restore) { if (restore is Restoring.Done) restoreFor = null }
+    val opened = restoreFor
+    if (opened != null) {
+        RestoreScreen(restore, opened.first, opened.second, onRestore) {
+            restoreFor = null
             onRestoreSeen()
         }
     } else {
@@ -79,16 +91,19 @@ fun ConnectFlow(
             form = form,
             saved = saved,
             identities = identities,
+            refusals = refusals,
             restored = (restore as? Restoring.Done)?.fingerprint,
             error = error,
             connecting = connecting,
             onConnect = onConnect,
             onForget = onForget,
-            onRestore = {
+            onRestore = { renewing ->
                 onRestoreSeen()
-                restoring = true
+                restoreFor = (renewing?.registrar.orEmpty()) to (renewing?.handle.orEmpty())
             },
             onRestored = onRestoreSeen,
+            onDelete = onDelete,
+            onTryAgain = onTryAgain,
         )
     }
 }
@@ -98,15 +113,21 @@ private fun ConnectScreen(
     form: MutableState<ConnectForm>,
     saved: List<Server>,
     identities: List<StoredIdentity>,
+    refusals: Map<String, String>,
     restored: String?,
     error: Why?,
     connecting: Boolean,
     onConnect: (server: Server, password: String?, remember: Boolean, link: ClassicLogin?) -> Unit,
     onForget: (Server) -> Unit,
-    onRestore: () -> Unit,
+    onRestore: (renewing: StoredIdentity?) -> Unit,
     onRestored: () -> Unit,
+    onDelete: (fingerprint: String) -> Unit,
+    onTryAgain: (server: Server, fingerprint: String) -> Unit,
 ) {
     var form by form
+    val now = System.currentTimeMillis() / 1000
+    var deleting by remember { mutableStateOf<StoredIdentity?>(null) }
+    val refused = { server: Server, kept: StoredIdentity -> refusals[refusalKey(server, kept.info.device)] }
     // The servers arrive once read; the last fills only a form not yet begun.
     LaunchedEffect(saved.firstOrNull()) {
         val last = saved.firstOrNull()
@@ -128,12 +149,24 @@ private fun ConnectScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineMedium)
+        for (kept in identities) {
+            val banner =
+                when (val s = standing(kept, now)) {
+                    is Standing.Renew -> pluralStringResource(R.plurals.renew_banner, s.days.toInt(), named(kept), s.days.toInt())
+                    Standing.Expired -> stringResource(R.string.expired_banner, named(kept))
+                    else -> null
+                } ?: continue
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(banner, Modifier.weight(1f), color = MaterialTheme.colorScheme.error)
+                TextButton({ onRestore(kept) }) { Text(stringResource(R.string.renew)) }
+            }
+        }
         if (saved.isNotEmpty()) {
             Text(stringResource(R.string.saved_servers), style = MaterialTheme.typography.titleSmall)
             for (server in saved) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     TextButton({ form = form.filled(server) }, Modifier.weight(1f)) {
-                        Text(stringResource(R.string.saved_server, server.url, whom(server, identities)))
+                        Text(stringResource(R.string.saved_server, server.url, whom(server, identities, now, refused)))
                     }
                     TextButton({ onForget(server) }) { Text(stringResource(R.string.forget)) }
                 }
@@ -166,6 +199,8 @@ private fun ConnectScreen(
             if (form.missing(identities)) Text(stringResource(R.string.identity_missing), color = MaterialTheme.colorScheme.error)
             Column(Modifier.selectableGroup()) {
                 for (kept in identities) {
+                    val standing = standing(kept, now)
+                    val refusedHere = refused(form.identityServer(kept), kept)
                     Row(
                         Modifier
                             .fillMaxWidth()
@@ -174,12 +209,31 @@ private fun ConnectScreen(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         RadioButton(kept == identity, null)
-                        Text(named(kept), Modifier.padding(start = 8.dp))
+                        Column(Modifier.padding(start = 8.dp)) {
+                            Text(named(kept))
+                            listOfNotNull(describe(standing), refusedHere?.let { describeRefusal(it, form.url) }).forEach {
+                                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                            }
+                            Text(capabilities(kept), style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                    Row {
+                        // Offered whatever a server said: a new device is the way back.
+                        if (standing != Standing.Good || refusedHere != null) {
+                            TextButton({ onRestore(kept) }) { Text(stringResource(R.string.renew)) }
+                        }
+                        // The server may have lifted it: asked again there.
+                        if (refusedHere != null) {
+                            TextButton({ onTryAgain(form.identityServer(kept), kept.fingerprint) }) {
+                                Text(stringResource(R.string.try_again))
+                            }
+                        }
+                        TextButton({ deleting = kept }) { Text(stringResource(R.string.delete)) }
                     }
                 }
             }
-            TextButton(onRestore) { Text(stringResource(R.string.restore_identity)) }
-            if (identity != null) {
+            TextButton({ onRestore(null) }) { Text(stringResource(R.string.restore_identity)) }
+            if (identity != null && standing(identity, now).usable && refused(form.identityServer(identity), identity) == null) {
                 Checked(form.linking, { form = form.copy(linking = it) }, stringResource(R.string.have_account))
                 if (form.linking) {
                     OutlinedTextField(
@@ -200,7 +254,7 @@ private fun ConnectScreen(
                 modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
             )
         }
-        val request = form.request(identities)
+        val request = form.request(identities, now, refused)
         Button(
             onClick = { request?.let { onConnect(it.server, it.password, it.remember, it.link) } },
             enabled = request != null && !connecting,
@@ -211,6 +265,61 @@ private fun ConnectScreen(
             color = MaterialTheme.colorScheme.outline,
         )
     }
+    deleting?.let { doomed ->
+        AlertDialog(
+            onDismissRequest = { deleting = null },
+            title = { Text(stringResource(R.string.delete_identity_title, named(doomed))) },
+            text = { Text(stringResource(R.string.delete_identity_body)) },
+            confirmButton = {
+                TextButton({
+                    deleting = null
+                    onDelete(doomed.fingerprint)
+                }) { Text(stringResource(R.string.delete)) }
+            },
+            dismissButton = { TextButton({ deleting = null }) { Text(stringResource(R.string.cancel)) } },
+        )
+    }
+}
+
+/** What the person is told of an identity that is not simply good, or null. */
+@Composable
+private fun describe(standing: Standing): String? =
+    when (standing) {
+        Standing.Good -> null
+        is Standing.Renew -> pluralStringResource(R.plurals.expires_in, standing.days.toInt(), standing.days.toInt())
+        Standing.Expired -> stringResource(R.string.identity_expired)
+        Standing.NotYetValid -> stringResource(R.string.identity_not_yet_valid)
+    }
+
+/** A server's host as a person knows it: with its port unless that is the scheme's own. */
+private fun shownHost(uri: java.net.URI): String? {
+    val host = uri.host ?: return null
+    val own = if (uri.scheme == "wss") 443 else 80
+    return if (uri.port == -1 || uri.port == own) host else "$host:${uri.port}"
+}
+
+/** What a server refused an identity's device as, and which server. */
+@Composable
+private fun describeRefusal(
+    code: String,
+    url: String,
+): String {
+    val host = runCatching { shownHost(java.net.URI(url.trim())) }.getOrNull() ?: url.trim()
+    return if (code == "rotated") stringResource(R.string.refused_rotated, host) else stringResource(R.string.refused_revoked, host)
+}
+
+/** What this device's certificate lets it do, in words. */
+@Composable
+private fun capabilities(identity: StoredIdentity): String {
+    val info = identity.info
+    val can =
+        listOfNotNull(
+            stringResource(R.string.cap_login).takeIf { info.canLogin },
+            stringResource(R.string.cap_message).takeIf { info.canMessage },
+            stringResource(R.string.cap_manage).takeIf { info.canManage },
+            stringResource(R.string.cap_vouch).takeIf { info.canVouch },
+        )
+    return if (can.isEmpty()) stringResource(R.string.device_can_nothing) else stringResource(R.string.device_can, can.joinToString(", "))
 }
 
 /** The form as the task saves it: never what was typed as a password. */
@@ -237,11 +346,24 @@ private fun named(identity: StoredIdentity) = identity.handle ?: identity.finger
 private fun whom(
     server: Server,
     identities: List<StoredIdentity>,
+    now: Long,
+    refused: (Server, StoredIdentity) -> String?,
 ): String =
     when (val how = server.signIn) {
         SignIn.Password -> server.login ?: stringResource(R.string.as_guest)
-        is SignIn.Identity ->
-            identities.find { it.fingerprint == how.fingerprint }?.let(::named) ?: how.fingerprint.take(16)
+        is SignIn.Identity -> {
+            val kept = identities.find { it.fingerprint == how.fingerprint }
+            val name = kept?.let(::named) ?: how.fingerprint.take(16)
+            val why =
+                when {
+                    kept == null -> null
+                    refused(server, kept) != null -> stringResource(R.string.standing_refused)
+                    standing(kept, now) == Standing.Expired -> stringResource(R.string.standing_expired)
+                    standing(kept, now) == Standing.NotYetValid -> stringResource(R.string.standing_not_yet_valid)
+                    else -> null
+                }
+            if (why == null) name else stringResource(R.string.whom_unusable, name, why)
+        }
     }
 
 @Composable
@@ -283,11 +405,13 @@ private fun Checked(
 @Composable
 fun RestoreScreen(
     restoring: Restoring,
+    initialRegistrar: String,
+    initialHandle: String,
     onRestore: (registrar: String, handle: String, kind: SecretKind, secret: String, deviceName: String) -> Unit,
     onCancel: () -> Unit,
 ) {
-    var registrar by rememberSaveable { mutableStateOf("") }
-    var handle by rememberSaveable { mutableStateOf("") }
+    var registrar by rememberSaveable { mutableStateOf(initialRegistrar) }
+    var handle by rememberSaveable { mutableStateOf(initialHandle) }
     var byCode by rememberSaveable { mutableStateOf(false) }
     // Not saveable: saved state is written to disk with the task.
     var secret by remember { mutableStateOf("") }

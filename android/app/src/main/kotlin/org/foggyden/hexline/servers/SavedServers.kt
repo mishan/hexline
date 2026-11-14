@@ -90,7 +90,70 @@ class SavedServers(
             secrets.delete(name("password", server))
             secrets.delete(name("session", server))
             askedToLink(server, false)
+            forgetRefusals(server)
         }
+
+    /**
+     * What [server] refused [device] as, `revoked` or `rotated`, or null.
+     * Kept for that server and that device alone: a server's word, not
+     * signed by anyone, is no reason to stop signing in elsewhere, and a
+     * new device, as a renewal makes, starts with none.
+     */
+    fun refused(
+        server: Server,
+        device: ByteArray,
+    ): String? = refusals()[refusalKey(server, device)]
+
+    /** Every refusal kept, by [refusalKey]: for a screen to look up without the disk. */
+    fun refusals(): Map<String, String> =
+        prefs
+            .getStringSet(REFUSED, null)
+            .orEmpty()
+            .mapNotNull { it.split('=', limit = 2).takeIf { p -> p.size == 2 }?.let { p -> p[0] to p[1] } }
+            .toMap()
+
+    /**
+     * Keeps [server]'s refusal of [device]; with [since], a [generation],
+     * not if [server] has been forgotten since, as [remember] does not.
+     */
+    fun markRefused(
+        server: Server,
+        device: ByteArray,
+        code: String,
+        since: Long? = null,
+    ): Unit =
+        synchronized(LOCK) {
+            if (since != null && (forgottenAt[name("list", server)] ?: 0) > since) return
+            val key = refusalKey(server, device)
+            keepRefusals { it.filterNot { e -> e.startsWith("$key=") } + "$key=$code" }
+        }
+
+    /** Forgets [server]'s refusal of [device], for a login to try again. */
+    fun forgetRefusal(
+        server: Server,
+        device: ByteArray,
+    ): Unit =
+        synchronized(LOCK) {
+            val key = refusalKey(server, device)
+            keepRefusals { it.filterNot { e -> e.startsWith("$key=") } }
+        }
+
+    /** Forgets every server's refusal of [device], once it is deleted or replaced. */
+    fun forgetRefusalsOf(device: ByteArray): Unit =
+        synchronized(LOCK) {
+            val mine = "/" + shortHash(device) + "="
+            keepRefusals { it.filterNot { e -> mine in e } }
+        }
+
+    /** Forgets every device's refusal by [server]. */
+    fun forgetRefusals(server: Server): Unit =
+        synchronized(LOCK) {
+            val mine = name("refused", server) + "/"
+            keepRefusals { it.filterNot { e -> e.startsWith(mine) } }
+        }
+
+    private fun keepRefusals(change: (Set<String>) -> List<String>) =
+        prefs.edit { putStringSet(REFUSED, change(prefs.getStringSet(REFUSED, null).orEmpty()).toSet()) }
 
     /**
      * Whether an account was named to link [server]'s identity to and the
@@ -172,18 +235,10 @@ class SavedServers(
             null
         }
 
-    /** A secret's name, from the server and how it is signed in to: never a file name a person typed. */
     private fun name(
         kind: String,
         server: Server,
-    ): String {
-        val whom =
-            when (val s = server.signIn) {
-                SignIn.Password -> server.login?.let { listOf("login", it) } ?: listOf("guest")
-                is SignIn.Identity -> listOf("identity", s.fingerprint)
-            }
-        return kind + "-" + partsHash(listOf(server.url) + whom)
-    }
+    ) = nameOf(kind, server)
 
     private companion object {
         const val SERVERS = "servers"
@@ -191,6 +246,7 @@ class SavedServers(
         const val LOGIN = "login"
         const val IDENTITY = "identity"
         const val LINK_ASKED = "link_asked"
+        const val REFUSED = "refused"
 
         /** One for the process: each change reads the list, then writes it whole. */
         val LOCK = Any()
@@ -204,3 +260,22 @@ class SavedServers(
         const val OLD_LOGIN = "login"
     }
 }
+
+/** A secret's name, from the server and how it is signed in to: never a file name a person typed. */
+private fun nameOf(
+    kind: String,
+    server: Server,
+): String {
+    val whom =
+        when (val s = server.signIn) {
+            SignIn.Password -> server.login?.let { listOf("login", it) } ?: listOf("guest")
+            is SignIn.Identity -> listOf("identity", s.fingerprint)
+        }
+    return kind + "-" + partsHash(listOf(server.url) + whom)
+}
+
+/** Where a refusal of [device] by [server] is kept, in [SavedServers.refusals]. */
+fun refusalKey(
+    server: Server,
+    device: ByteArray,
+): String = nameOf("refused", server) + "/" + shortHash(device)

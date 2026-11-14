@@ -66,6 +66,27 @@ impl Server {
         self._dir.0.join("accounts").join(format!("{account}.toml"))
     }
 
+    /// Refuses the device whose key `device` is, as an operator does with
+    /// `hxd identity revoke --device`: written to the config, then the
+    /// server told to read it again, which ends every session the key holds.
+    pub fn revoke_device(&self, device: &str) {
+        let config = self._dir.0.join("hxd-ng.toml");
+        let text = std::fs::read_to_string(&config).unwrap();
+        let revoked = text.replacen(
+            "[identity]\n",
+            &format!("[identity]\nrevoked_devices = [\"{device}\"]\n"),
+            1,
+        );
+        assert_ne!(revoked, text, "a server taking identity logins");
+        std::fs::write(&config, revoked).unwrap();
+        let pid = self._proc.id().expect("a running server").to_string();
+        let hup = std::process::Command::new("kill")
+            .args(["-HUP", &pid])
+            .status()
+            .unwrap();
+        assert!(hup.success());
+    }
+
     /// Each of `accounts` has the password `pw-<name>`, but `guest`.
     pub async fn start(accounts: &[&str]) -> Server {
         Server::with_grace(accounts, 300).await

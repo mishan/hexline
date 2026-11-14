@@ -147,6 +147,48 @@ class SavedServersTest {
     }
 
     @Test
+    fun aRefusalIsKeptForItsServerAndDeviceAloneUntilTheServerIsForgotten() {
+        val a = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
+        val b = Server("wss://b.example/ng", null, SignIn.Identity("fp-x"))
+        val (device, renewed) = ByteArray(32) { 1 } to ByteArray(32) { 2 }
+        servers().remember(a, null)
+        servers().markRefused(a, device, "revoked")
+        assertEquals("revoked", servers().refused(a, device))
+        assertNull("another server", servers().refused(b, device))
+        assertNull("a new device", servers().refused(a, renewed))
+        servers().forget(a)
+        assertNull("forgotten with its server", servers().refused(a, device))
+    }
+
+    @Test
+    fun aDevicesRefusalsGoWithItAndAnotherDevicesStay() {
+        val a = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
+        val b = Server("wss://b.example/ng", null, SignIn.Identity("fp-x"))
+        val (device, other) = ByteArray(32) { 1 } to ByteArray(32) { 2 }
+        for (s in listOf(a, b)) {
+            servers().remember(s, null)
+            servers().markRefused(s, device, "revoked")
+            servers().markRefused(s, other, "rotated")
+        }
+        servers().forgetRefusalsOf(device)
+        assertEquals(listOf(null, null), listOf(servers().refused(a, device), servers().refused(b, device)))
+        assertEquals(listOf("rotated", "rotated"), listOf(servers().refused(a, other), servers().refused(b, other)))
+        servers().forgetRefusal(a, other)
+        assertEquals("tried again there alone", listOf(null, "rotated"), listOf(servers().refused(a, other), servers().refused(b, other)))
+    }
+
+    @Test
+    fun aRefusalForAServerForgottenSinceItsLoginBeganIsNotKept() {
+        val a = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
+        val device = ByteArray(32) { 1 }
+        servers().remember(a, null)
+        val since = servers().generation()
+        servers().forget(a)
+        servers().markRefused(a, device, "revoked", since)
+        assertNull(servers().refused(a, device))
+    }
+
+    @Test
     fun aServerForgottenSinceALoginBeganIsNotRememberedByIt() {
         val a = Server("wss://a.example/ng", "alice")
         servers().remember(a, null)
