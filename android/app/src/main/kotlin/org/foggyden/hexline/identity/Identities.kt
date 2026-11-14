@@ -6,13 +6,13 @@ import android.util.Base64
 import org.foggyden.hexline.core.CertInfo
 import org.foggyden.hexline.core.certForDevice
 import org.foggyden.hexline.core.certInfo
+import org.foggyden.hexline.core.shortHash
 import org.foggyden.hexline.secrets.SecretStore
 import org.foggyden.hexline.secrets.SecretUnavailable
 import org.foggyden.hexline.secrets.SecretUnreadable
 import org.json.JSONObject
 import java.io.File
 import java.io.FileNotFoundException
-import java.security.MessageDigest
 
 /** An identity this phone is a device of: what a server is shown, and what the core read of it. */
 class StoredIdentity(
@@ -167,19 +167,12 @@ class Identities(
     }
 
     /** Names from the identity, and the device: never anything typed. */
-    private fun file(fingerprint: String) = File(dir, "identity-" + hash(fingerprint.toByteArray()))
+    private fun file(fingerprint: String) = File(dir, "identity-" + shortHash(fingerprint.toByteArray()))
 
     private fun secretName(
         fingerprint: String,
         device: ByteArray,
-    ) = "device-" + hash(fingerprint.toByteArray()) + "-" + hash(device)
-
-    private fun hash(bytes: ByteArray) =
-        MessageDigest
-            .getInstance("SHA-256")
-            .digest(bytes)
-            .take(12)
-            .joinToString("") { "%02x".format(it) }
+    ) = "device-" + shortHash(fingerprint.toByteArray()) + "-" + shortHash(device)
 
     private fun b64(b: ByteArray) = Base64.encodeToString(b, Base64.NO_WRAP)
 

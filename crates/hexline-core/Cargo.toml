@@ -23,6 +23,7 @@ serde_json = { workspace = true }
 zeroize = { workspace = true }
 base64 = "0.23"
 hl-identity = { workspace = true }
+sha2 = "0.10"
 
 [target.'cfg(target_os = "android")'.dependencies]
 # The platform verifier calls Android's trust manager through the JVM, and

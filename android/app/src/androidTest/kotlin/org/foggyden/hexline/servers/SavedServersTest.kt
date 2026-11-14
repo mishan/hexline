@@ -145,4 +145,19 @@ class SavedServersTest {
         servers().forget(a)
         assertFalse(servers().linkAsked(a))
     }
+
+    @Test
+    fun aServerForgottenSinceALoginBeganIsNotRememberedByIt() {
+        val a = Server("wss://a.example/ng", "alice")
+        servers().remember(a, null)
+        servers().forget(a)
+        assertTrue("forgotten before it began", servers().remember(a, "hunter2", servers().generation()))
+        assertEquals(listOf(a), servers().all())
+
+        val began = servers().generation()
+        servers().forget(a)
+        assertFalse(servers().remember(a, "hunter2", began))
+        assertEquals(emptyList<Server>(), servers().all())
+        assertNull(servers().password(a))
+    }
 }

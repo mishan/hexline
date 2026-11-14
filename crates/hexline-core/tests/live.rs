@@ -828,6 +828,7 @@ async fn an_upgrade_refused_after_a_link_is_proved_again_without_the_password() 
         .login_identity(device, true, Some(link), None)
         .await
         .unwrap();
+    assert_eq!(proxy.upgrades_refused(), 1);
     // The first auth's answer, not the guest the second one was made.
     assert_eq!(info.outcome.as_deref(), Some("classic_pending_link"));
     let heard = proxy.heard();

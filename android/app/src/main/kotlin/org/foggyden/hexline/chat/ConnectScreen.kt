@@ -22,6 +22,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -48,8 +49,53 @@ import org.foggyden.hexline.identity.StoredIdentity
 import org.foggyden.hexline.servers.Server
 import org.foggyden.hexline.servers.SignIn
 
+/**
+ * Signing in: the connect screen, and the restore screen it opens. The
+ * form is held here, outside either, so what was typed is still there
+ * when the person comes back from a restore.
+ */
 @Composable
-fun ConnectScreen(
+fun ConnectFlow(
+    saved: List<Server>,
+    identities: List<StoredIdentity>,
+    restore: Restoring,
+    error: Why?,
+    connecting: Boolean,
+    onConnect: (server: Server, password: String?, remember: Boolean, link: ClassicLogin?) -> Unit,
+    onForget: (Server) -> Unit,
+    onRestore: (registrar: String, handle: String, kind: SecretKind, secret: String, deviceName: String) -> Unit,
+    onRestoreSeen: () -> Unit,
+) {
+    val form = rememberSaveable(stateSaver = FormSaver) { mutableStateOf(ConnectForm()) }
+    var restoring by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(restore) { if (restore is Restoring.Done) restoring = false }
+    if (restoring) {
+        RestoreScreen(restore, onRestore) {
+            restoring = false
+            onRestoreSeen()
+        }
+    } else {
+        ConnectScreen(
+            form = form,
+            saved = saved,
+            identities = identities,
+            restored = (restore as? Restoring.Done)?.fingerprint,
+            error = error,
+            connecting = connecting,
+            onConnect = onConnect,
+            onForget = onForget,
+            onRestore = {
+                onRestoreSeen()
+                restoring = true
+            },
+            onRestored = onRestoreSeen,
+        )
+    }
+}
+
+@Composable
+private fun ConnectScreen(
+    form: MutableState<ConnectForm>,
     saved: List<Server>,
     identities: List<StoredIdentity>,
     restored: String?,
@@ -60,7 +106,7 @@ fun ConnectScreen(
     onRestore: () -> Unit,
     onRestored: () -> Unit,
 ) {
-    var form by rememberSaveable(stateSaver = FormSaver) { mutableStateOf(ConnectForm()) }
+    var form by form
     // The servers arrive once read; the last fills only a form not yet begun.
     LaunchedEffect(saved.firstOrNull()) {
         val last = saved.firstOrNull()

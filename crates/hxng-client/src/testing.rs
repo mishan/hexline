@@ -225,7 +225,7 @@ pub struct Proxy {
     refusing: Arc<AtomicBool>,
     cut_after: Arc<Mutex<Option<Duration>>>,
     mangling: Arc<AtomicBool>,
-    unauthorized: Arc<Mutex<usize>>,
+    unauthorized: Arc<Mutex<Upgrades>>,
     heard: Arc<Mutex<Vec<u8>>>,
     accept: JoinHandle<()>,
 }
@@ -245,7 +245,7 @@ impl Proxy {
         let refusing = Arc::new(AtomicBool::new(false));
         let cut_after = Arc::new(Mutex::new(None));
         let mangling = Arc::new(AtomicBool::new(false));
-        let unauthorized = Arc::new(Mutex::new(0));
+        let unauthorized = Arc::new(Mutex::new(Upgrades::default()));
         let heard = Arc::new(Mutex::new(Vec::new()));
         let target = server.addr;
         let accept = tokio::spawn({
@@ -293,7 +293,12 @@ impl Proxy {
     /// The next `upgrades` WebSocket upgrades are answered 401, as a server
     /// that no longer knows the token would.
     pub fn refuse_upgrades(&self, upgrades: usize) {
-        *self.unauthorized.lock().unwrap() = upgrades;
+        self.unauthorized.lock().unwrap().left = upgrades;
+    }
+
+    /// How many upgrades have been answered 401.
+    pub fn upgrades_refused(&self) -> usize {
+        self.unauthorized.lock().unwrap().refused
     }
 
     /// Everything clients have sent through the proxy, in the order it came.
@@ -325,6 +330,13 @@ impl Proxy {
     }
 }
 
+/// The upgrades a [`Proxy`] is to refuse, and has.
+#[derive(Default)]
+struct Upgrades {
+    left: usize,
+    refused: usize,
+}
+
 impl Drop for Proxy {
     fn drop(&mut self) {
         self.accept.abort();
@@ -350,27 +362,40 @@ pub fn device(name: &str) -> (hl_identity::IdentityKey, crate::auth::Device) {
 }
 
 /// Pass a link on both ways, keeping what the client sends. Its first
-/// read, a request written whole by the clients these tests run, may be
-/// refused (an upgrade while `unauthorized` counts) or have its
-/// `authorization:` header renamed (`mangle`).
+/// request's head may be refused (an upgrade while `unauthorized` has
+/// some left) or have its `authorization:` header renamed (`mangle`).
 async fn pass_on(
     mut client: tokio::net::TcpStream,
     mut server: tokio::net::TcpStream,
     mangle: bool,
-    unauthorized: Arc<Mutex<usize>>,
+    unauthorized: Arc<Mutex<Upgrades>>,
     heard: Arc<Mutex<Vec<u8>>>,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut buf = vec![0; 16 * 1024];
-    let n = client.read(&mut buf).await?;
-    let mut first = buf[..n].to_vec();
-    let upgrade = first
+    const MOST: usize = 16 * 1024;
+    let mut buf = vec![0; MOST];
+    // The head whole, however it was split; what follows it is kept.
+    let mut first = Vec::new();
+    let head = loop {
+        let n = client.read(&mut buf).await?;
+        first.extend_from_slice(&buf[..n]);
+        if let Some(at) = first.windows(4).position(|w| w == b"\r\n\r\n") {
+            break at + 4;
+        }
+        if n == 0 || first.len() >= MOST {
+            break first.len();
+        }
+    };
+    let upgrade = first[..head]
         .windows(9)
         .any(|w| w.eq_ignore_ascii_case(b"websocket"));
     let refused = upgrade && {
-        let mut left = unauthorized.lock().unwrap();
-        let refused = *left > 0;
-        *left = left.saturating_sub(1);
+        let mut upgrades = unauthorized.lock().unwrap();
+        let refused = upgrades.left > 0;
+        if refused {
+            upgrades.left -= 1;
+            upgrades.refused += 1;
+        }
         refused
     };
     if refused {
@@ -382,7 +407,7 @@ async fn pass_on(
     }
     let needle = b"authorization:";
     if mangle {
-        if let Some(at) = first
+        if let Some(at) = first[..head]
             .windows(needle.len())
             .position(|w| w.eq_ignore_ascii_case(needle))
         {

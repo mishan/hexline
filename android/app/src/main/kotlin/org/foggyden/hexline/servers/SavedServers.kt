@@ -3,15 +3,14 @@ package org.foggyden.hexline.servers
 import android.content.Context
 import android.content.SharedPreferences
 import androidx.core.content.edit
+import org.foggyden.hexline.core.partsHash
+import org.foggyden.hexline.core.shortHash
 import org.foggyden.hexline.secrets.SecretStore
 import org.foggyden.hexline.secrets.SecretUnavailable
 import org.foggyden.hexline.secrets.SecretUnreadable
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
-import java.io.DataOutputStream
 import java.io.IOException
-import java.security.MessageDigest
 
 /** How a server is signed in to. */
 sealed interface SignIn {
@@ -62,22 +61,31 @@ class SavedServers(
 
     fun last(): Server? = all().firstOrNull()
 
+    /** Counts forgets: what [remember] is given to say when it was asked for. */
+    fun generation(): Long = synchronized(LOCK) { forgets }
+
     /**
      * [server] is the last; its password is kept, or with null forgotten.
-     * False if a secret could not be written now.
+     * With [since], a [generation], not if [server] has been forgotten
+     * since then: a login that lands after its server was forgotten does
+     * not bring it back. Whether it was remembered.
      */
     fun remember(
         server: Server,
         password: String?,
+        since: Long? = null,
     ): Boolean =
         synchronized(LOCK) {
+            if (since != null && (forgottenAt[name("list", server)] ?: 0) > since) return false
             write(listOf(server) + all().filter { it != server })
             write(name("password", server), password?.toByteArray())
+            true
         }
 
     /** [server] is forgotten whole, its secrets with it. */
     fun forget(server: Server): Unit =
         synchronized(LOCK) {
+            forgottenAt[name("list", server)] = ++forgets
             write(all().filter { it != server })
             secrets.delete(name("password", server))
             secrets.delete(name("session", server))
@@ -133,7 +141,7 @@ class SavedServers(
     private fun forgetTheOneKeptBefore() {
         val url = prefs.getString(OLD_URL, null) ?: return
         val login = prefs.getString(OLD_LOGIN, null).orEmpty()
-        for (kind in listOf("password", "session")) secrets.delete(kind + "-" + hash("$url\n$login".toByteArray()))
+        for (kind in listOf("password", "session")) secrets.delete(kind + "-" + shortHash("$url\n$login".toByteArray()))
         prefs.edit {
             remove(OLD_URL)
             remove(OLD_LOGIN)
@@ -164,11 +172,7 @@ class SavedServers(
             null
         }
 
-    /**
-     * A secret's name, from the server and how it is signed in to: never a
-     * file name a person typed. Each part goes in with its length, so no
-     * two servers' parts run together into the same name.
-     */
+    /** A secret's name, from the server and how it is signed in to: never a file name a person typed. */
     private fun name(
         kind: String,
         server: Server,
@@ -178,22 +182,8 @@ class SavedServers(
                 SignIn.Password -> server.login?.let { listOf("login", it) } ?: listOf("guest")
                 is SignIn.Identity -> listOf("identity", s.fingerprint)
             }
-        val out = ByteArrayOutputStream()
-        val data = DataOutputStream(out)
-        for (part in listOf(server.url) + whom) {
-            val bytes = part.toByteArray()
-            data.writeInt(bytes.size)
-            data.write(bytes)
-        }
-        return kind + "-" + hash(out.toByteArray())
+        return kind + "-" + partsHash(listOf(server.url) + whom)
     }
-
-    private fun hash(bytes: ByteArray) =
-        MessageDigest
-            .getInstance("SHA-256")
-            .digest(bytes)
-            .take(12)
-            .joinToString("") { "%02x".format(it) }
 
     private companion object {
         const val SERVERS = "servers"
@@ -204,6 +194,10 @@ class SavedServers(
 
         /** One for the process: each change reads the list, then writes it whole. */
         val LOCK = Any()
+
+        // The process's, under LOCK: a login outlives no process.
+        var forgets = 0L
+        val forgottenAt = HashMap<String, Long>()
 
         /** Where the one server kept before was. */
         const val OLD_URL = "url"

@@ -37,6 +37,7 @@ import org.foggyden.hexline.secrets.SecretUnavailable
 import org.foggyden.hexline.servers.SavedServers
 import org.foggyden.hexline.servers.Server
 import org.foggyden.hexline.servers.SignIn
+import java.io.IOException
 import kotlin.concurrent.thread
 
 /**
@@ -72,6 +73,9 @@ class ChatViewModel(
     // Read from the IO dispatcher too, to see a forget that came first.
     @Volatile private var connection: ServerConnection? = null
     private var server: Server? = null
+
+    /** A server a connect is reading the secrets of, before it starts. */
+    private var pending: Server? = null
 
     /** The connection has been live: what it saves from now on is its own. */
     private var established = false
@@ -143,7 +147,7 @@ class ChatViewModel(
                 } ?: return@launch
             val (last, session, password) = found
             // A session left without leaving: take it up again.
-            if (session != null) start(last, password, null, session, keep = password)
+            if (session != null) start(last, password, null, session, keep = password, since = servers.generation())
         }
     }
 
@@ -158,17 +162,19 @@ class ChatViewModel(
         remember: Boolean,
         link: ClassicLogin? = null,
     ) {
+        pending = wanted
+        val since = servers.generation()
         viewModelScope.launch {
-            val known = wanted in savedServers.value
             val (kept, saved) =
-                if (known) {
+                if (wanted in savedServers.value) {
                     withContext(Dispatchers.IO) { servers.password(wanted) to servers.session(wanted).takeIf { link == null } }
                 } else {
                     null to null
                 }
-            // Forgotten while its secrets were read: not connected to after all.
-            if (known && wanted !in savedServers.value) return@launch
-            start(wanted, password ?: kept, link, saved, passwordToKeep(password, kept, remember))
+            // Forgotten, or another connect asked for, while its secrets were read.
+            if (pending != wanted) return@launch
+            pending = null
+            start(wanted, password ?: kept, link, saved, passwordToKeep(password, kept, remember), since)
         }
     }
 
@@ -178,6 +184,7 @@ class ChatViewModel(
      * out) remembers it again.
      */
     fun forget(server: Server) {
+        if (server == pending) pending = null
         if (server == this.server) {
             sink = null
             // Forgetting a server is leaving it: no session is left behind
@@ -219,6 +226,8 @@ class ChatViewModel(
                     Restoring.Failed(restoreProblem(e))
                 } catch (_: SecretUnavailable) {
                     Restoring.Failed(RestoreProblem.NotKept)
+                } catch (_: IOException) {
+                    Restoring.Failed(RestoreProblem.NotKept)
                 } finally {
                     made?.seed?.fill(0)
                 }
@@ -257,6 +266,7 @@ class ChatViewModel(
         link: ClassicLogin?,
         saved: ByteArray?,
         keep: String?,
+        since: Long,
     ) {
         if (state.value.link.let { it == Link.Connecting || it == Link.Live || it is Link.Reconnecting }) return
         state.value = ChatState(link = Link.Connecting)
@@ -289,7 +299,7 @@ class ChatViewModel(
                 state.update { if (info.resumed) it.copy(outcome = info.outcome) else it.signedIn(info.outcome) }
                 withContext(Dispatchers.IO) {
                     if (connection !== conn) return@withContext
-                    servers.remember(to, keep.takeIf { to.signIn == SignIn.Password })
+                    if (!servers.remember(to, keep.takeIf { to.signIn == SignIn.Password }, since)) return@withContext
                     if (to.signIn is SignIn.Identity && !info.resumed) {
                         servers.askedToLink(to, info.outcome != "linked" && (link != null || servers.linkAsked(to)))
                     }
@@ -311,6 +321,7 @@ class ChatViewModel(
                     if (saved != null && code != null && !keepsSession(code)) servers.keepSession(to, null)
                     if (code == "login_failed") servers.forgetPassword(to)
                 }
+                if (connection !== conn) return@launch
                 state.update { it.copy(link = Link.Ended(why(e))) }
             }
         }
