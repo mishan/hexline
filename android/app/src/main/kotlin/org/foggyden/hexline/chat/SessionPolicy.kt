@@ -21,3 +21,14 @@ fun loginFor(
     password: String?,
     saved: ByteArray?,
 ): String? = if (saved != null && password == null) null else server.login
+
+/**
+ * The password to keep for a server once logged in: one typed, if the
+ * person asked for it to be kept, or with none typed the one already kept,
+ * so connecting to a saved server without retyping it does not forget it.
+ */
+fun passwordToKeep(
+    typed: String?,
+    kept: String?,
+    remember: Boolean,
+): String? = if (typed != null) typed.takeIf { remember } else kept

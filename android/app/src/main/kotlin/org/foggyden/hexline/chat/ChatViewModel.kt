@@ -18,12 +18,26 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.foggyden.hexline.core.ClassicLogin
 import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.CoreUpdate
+import org.foggyden.hexline.core.DeviceIdentity
+import org.foggyden.hexline.core.LoginInfo
+import org.foggyden.hexline.core.Restored
+import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.ServerConnection
 import org.foggyden.hexline.core.UpdateSink
+import org.foggyden.hexline.core.restoreIdentity
+import org.foggyden.hexline.identity.Identities
+import org.foggyden.hexline.identity.RestoreProblem
+import org.foggyden.hexline.identity.Restoring
+import org.foggyden.hexline.identity.StoredIdentity
+import org.foggyden.hexline.identity.restoreProblem
+import org.foggyden.hexline.secrets.SecretUnavailable
 import org.foggyden.hexline.servers.SavedServers
 import org.foggyden.hexline.servers.Server
+import org.foggyden.hexline.servers.SignIn
+import java.io.IOException
 import kotlin.concurrent.thread
 
 /**
@@ -39,16 +53,37 @@ class ChatViewModel(
     app: Application,
 ) : AndroidViewModel(app) {
     private val servers = SavedServers(app)
+    private val identities = Identities(app)
     private val state = MutableStateFlow(ChatState())
     val chat: StateFlow<ChatState> = state
 
-    private val lastServer = MutableStateFlow<Server?>(null)
+    private val savedServers = MutableStateFlow<List<Server>>(emptyList())
 
-    /** The server last connected to, to offer again. */
-    val last: StateFlow<Server?> = lastServer
+    /** The servers connected to, the last first, to offer again. */
+    val saved: StateFlow<List<Server>> = savedServers
 
-    private var connection: ServerConnection? = null
+    private val kept = MutableStateFlow<List<StoredIdentity>>(emptyList())
+
+    /** The identities this phone is a device of. */
+    val identityList: StateFlow<List<StoredIdentity>> = kept
+
+    private val restoring = MutableStateFlow<Restoring>(Restoring.Idle)
+    val restore: StateFlow<Restoring> = restoring
+
+    // Read from the IO dispatcher too, to see a forget that came first.
+    @Volatile private var connection: ServerConnection? = null
     private var server: Server? = null
+
+    /**
+     * A connect reading its server's secrets, before it starts: one of its
+     * own, so a connect to the same server asked for after a forget is not
+     * taken for the one the forget canceled.
+     */
+    private class Pending(
+        val server: Server,
+    )
+
+    private var pending: Pending? = null
 
     /** The connection has been live: what it saves from now on is its own. */
     private var established = false
@@ -114,40 +149,133 @@ class ChatViewModel(
         viewModelScope.launch {
             val found =
                 withContext(Dispatchers.IO) {
+                    kept.value = identities.list()
+                    savedServers.value = servers.all()
                     servers.last()?.let { Triple(it, servers.session(it), servers.password(it)) }
                 } ?: return@launch
             val (last, session, password) = found
-            lastServer.value = last
             // A session left without leaving: take it up again.
-            if (session != null) start(last, password, session, remember = password != null)
+            if (session != null) start(last, password, null, session, keep = password, since = servers.generation())
         }
     }
 
+    /**
+     * Connects to [wanted], with [link] an existing account's login to link
+     * an identity to. A saved server's kept password stands in for none
+     * typed, and its session is resumed rather than a second made beside it.
+     */
     fun connect(
-        url: String,
-        login: String?,
+        wanted: Server,
         password: String?,
         remember: Boolean,
+        link: ClassicLogin? = null,
     ) {
-        val wanted = Server(url, login)
+        val mine = Pending(wanted)
+        pending = mine
+        val since = servers.generation()
         viewModelScope.launch {
-            // The server last used: its kept password if none is typed, and
-            // its session if one was kept, rather than a second beside it.
-            val (pw, saved) =
-                if (wanted == lastServer.value) {
-                    withContext(Dispatchers.IO) { (password ?: servers.password(wanted)) to servers.session(wanted) }
+            val (kept, saved) =
+                if (wanted in savedServers.value) {
+                    withContext(Dispatchers.IO) { servers.password(wanted) to servers.session(wanted).takeIf { link == null } }
                 } else {
-                    password to null
+                    null to null
                 }
-            start(wanted, pw, saved, remember)
+            // Forgotten, or another connect asked for, while its secrets were read.
+            if (pending !== mine) return@launch
+            pending = null
+            start(wanted, password ?: kept, link, saved, passwordToKeep(password, kept, remember), since)
+        }
+    }
+
+    /**
+     * Forgets [server], and lets go of its connection if it has one, so
+     * nothing it does after (a login landing, a session saved on the way
+     * out) remembers it again.
+     */
+    fun forget(server: Server) {
+        if (pending?.server == server) pending = null
+        if (server == this.server) {
+            sink = null
+            // Forgetting a server is leaving it: no session is left behind
+            // that nothing will resume or end.
+            connection?.let {
+                it.hangUp(true)
+                it.close()
+            }
+            connection = null
+            this.server = null
+            state.value = ChatState()
+        }
+        viewModelScope.launch {
+            savedServers.value = withContext(Dispatchers.IO) { servers.forget(server).let { servers.all() } }
+        }
+    }
+
+    /** Makes this phone a device of the identity a registrar keeps for [handle]. */
+    fun restore(
+        registrar: String,
+        handle: String,
+        kind: SecretKind,
+        secret: String,
+        deviceName: String,
+    ) {
+        if (restoring.value == Restoring.Working) return
+        restoring.value = Restoring.Working
+        viewModelScope.launch {
+            var made: Restored? = null
+            restoring.value =
+                try {
+                    val device = restoreIdentity(registrar, handle, kind, secret, deviceName).also { made = it }
+                    withContext(Dispatchers.IO) {
+                        identities.save(device.seed, device.cert, device.card, handle)
+                        kept.value = identities.list()
+                    }
+                    Restoring.Done(device.fingerprint)
+                } catch (e: CoreException) {
+                    Restoring.Failed(restoreProblem(e))
+                } catch (_: SecretUnavailable) {
+                    Restoring.Failed(RestoreProblem.NotKept)
+                } catch (_: IOException) {
+                    Restoring.Failed(RestoreProblem.NotKept)
+                } finally {
+                    made?.seed?.fill(0)
+                }
+        }
+    }
+
+    fun restoreSeen() {
+        if (restoring.value != Restoring.Working) restoring.value = Restoring.Idle
+    }
+
+    private class NoIdentity : Exception()
+
+    /** Logs in as the identity [fingerprint] names, its seed wiped once handed over. */
+    private suspend fun loginIdentity(
+        conn: ServerConnection,
+        fingerprint: String,
+        create: Boolean,
+        link: ClassicLogin?,
+        saved: ByteArray?,
+    ): LoginInfo {
+        // Held outside the read, so a cancellation after it still wipes it.
+        var seed: ByteArray? = null
+        try {
+            val (stored, mine) =
+                withContext(Dispatchers.IO) { identities.device(fingerprint)?.also { seed = it.second } }
+                    ?: throw NoIdentity()
+            return conn.loginIdentity(DeviceIdentity(mine, stored.cert, stored.card), create, link, saved)
+        } finally {
+            seed?.fill(0)
         }
     }
 
     private fun start(
         to: Server,
         password: String?,
+        link: ClassicLogin?,
         saved: ByteArray?,
-        remember: Boolean,
+        keep: String?,
+        since: Long,
     ) {
         if (state.value.link.let { it == Link.Connecting || it == Link.Live || it is Link.Reconnecting }) return
         state.value = ChatState(link = Link.Connecting)
@@ -164,12 +292,37 @@ class ChatViewModel(
         established = false
         viewModelScope.launch {
             try {
-                conn.login(loginFor(to, password, saved), password, saved)
+                val info =
+                    when (val how = to.signIn) {
+                        SignIn.Password -> conn.login(loginFor(to, password, saved), password, saved)
+                        is SignIn.Identity -> {
+                            // An account named to link and not linked yet is
+                            // never made in its place.
+                            val asked = link != null || withContext(Dispatchers.IO) { servers.linkAsked(to) }
+                            loginIdentity(conn, how.fingerprint, !asked, link, saved)
+                        }
+                    }
+                // Forgotten while logging in: nothing of it is kept.
+                if (connection !== conn) return@launch
                 established = true
-                lastServer.value = to
-                withContext(Dispatchers.IO) { servers.remember(to, password.takeIf { remember }) }
+                state.update { if (info.resumed) it.copy(outcome = info.outcome) else it.signedIn(info.outcome) }
+                withContext(Dispatchers.IO) {
+                    if (connection !== conn) return@withContext
+                    if (!servers.remember(to, keep.takeIf { to.signIn == SignIn.Password }, since)) return@withContext
+                    if (to.signIn is SignIn.Identity && !info.resumed) {
+                        servers.askedToLink(to, info.outcome != "linked" && (link != null || servers.linkAsked(to)))
+                    }
+                    savedServers.value = servers.all()
+                }
                 save()
+            } catch (_: NoIdentity) {
+                if (connection !== conn) return@launch
+                state.update { it.copy(link = Link.Ended(Why.NoIdentity)) }
+            } catch (_: SecretUnavailable) {
+                if (connection !== conn) return@launch
+                state.update { it.copy(link = Link.Ended(Why.KeyLocked)) }
             } catch (e: CoreException) {
+                if (connection !== conn) return@launch
                 val code = (e as? CoreException.Refused)?.code
                 withContext(Dispatchers.IO) {
                     // Refused for good: the saved session is not coming back.
@@ -177,6 +330,7 @@ class ChatViewModel(
                     if (saved != null && code != null && !keepsSession(code)) servers.keepSession(to, null)
                     if (code == "login_failed") servers.forgetPassword(to)
                 }
+                if (connection !== conn) return@launch
                 state.update { it.copy(link = Link.Ended(why(e))) }
             }
         }

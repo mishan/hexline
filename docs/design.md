@@ -175,9 +175,13 @@ stores them, so the offline-file form needs no server.
 
 Kotlin ByteArrays carrying a plaintext seed are filled with zeros after
 the handoff; the residual (JVM copies) is noted in the threat model
-entry Hexline adds. Backups: `android:allowBackup="false"` and
-`dataExtractionRules` excluding everything; a Keystore key never
-leaves the device anyway, so a backed-up blob would be undecryptable.
+entry Hexline adds. The same goes for an account's password typed to
+link an identity: Kotlin holds it as a `String`; the core wipes its own
+copy when the login is done, but not the copy in the JSON body it builds
+for the auth request, and the HTTP client's buffers are out of its reach.
+Backups: `android:allowBackup="false"` and `dataExtractionRules`
+excluding everything; a Keystore key never leaves the device anyway, so
+a backed-up blob would be undecryptable.
 
 **Losing the phone.** Holder mode makes the phone the worst-case asset
 (threat model, "stolen identity key"). Mitigations Hexline enforces in

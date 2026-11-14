@@ -30,7 +30,9 @@ pub struct Device {
 /// Prove `device` to the server whose ng endpoint is `url`, and hand back
 /// the token its upgrade presents. With `create`, a server whose policy
 /// allows it makes an account for an identity it has none for
-/// (hotline-ng-identity.md §8.2). Each token is good for one upgrade, so
+/// (hotline-ng-identity.md §8.2). With `classic`, a login and password,
+/// the server links the identity to that existing account if it allows
+/// (section 5.4), and makes none. Each token is good for one upgrade, so
 /// each new connection proves the device again; a resume needs none.
 ///
 /// Refusals come back as [`Error::Refused`] with the server's code. A
@@ -40,33 +42,60 @@ pub async fn identity_token(
     url: &str,
     device: &Device,
     create: bool,
+    classic: Option<(&str, &str)>,
     tls: Option<Arc<rustls::ClientConfig>>,
-) -> Result<Token, Error> {
+) -> Result<Admitted, Error> {
     let (base, host) = base_of(url)?;
     let http = http_client(&base, tls)?;
 
-    let challenge = post(&http, &format!("{base}/identity/challenge"), None).await?;
+    let challenge = post(&http, &format!("{base}/identity/challenge"), None)
+        .await
+        .map_err(|e| match e {
+            // Said apart from the generic code, which a refused request of
+            // any other kind also answers with.
+            Error::Refused(r) if r.error.code == "not_available" => refused(
+                "no_identity_sign_in",
+                "the server does not take identity logins",
+            ),
+            e => e,
+        })?;
     let (nonce, server_key) = vouched(&challenge, &host, now())?;
     let proof = LoginProof::sign(&device.key, &nonce, &server_key, &host, now())
         .map_err(|e| protocol(&e.to_string()))?;
-    let ok = post(
-        &http,
-        &format!("{base}/identity/auth"),
-        Some(json!({
-            "card": URL_SAFE_NO_PAD.encode(&device.card),
-            "device_cert": URL_SAFE_NO_PAD.encode(&device.cert),
-            "proof": URL_SAFE_NO_PAD.encode(&proof),
-            // Over plain ws to another machine the hop is cleartext, and
-            // the session must not be shown as safer than it is (§8).
-            "downstream": if base.starts_with("http:") && !loopback(&host) { "cleartext" } else { "local" },
-            "create": create,
-        })),
-    )
-    .await?;
-    ok.get("token")
+    let mut body = json!({
+        "card": URL_SAFE_NO_PAD.encode(&device.card),
+        "device_cert": URL_SAFE_NO_PAD.encode(&device.cert),
+        "proof": URL_SAFE_NO_PAD.encode(&proof),
+        // Over plain ws to another machine the hop is cleartext, and
+        // the session must not be shown as safer than it is (§8).
+        "downstream": if base.starts_with("http:") && !loopback(&host) { "cleartext" } else { "local" },
+        "create": create,
+    });
+    if let Some((login, password)) = classic {
+        // Credentials already imply it (section 5.3); said anyway, so a
+        // server that read them otherwise makes no account in place of
+        // the one named.
+        body["create"] = Value::Bool(false);
+        body["login"] = Value::from(login);
+        body["password"] = Value::from(password);
+    }
+    let ok = post(&http, &format!("{base}/identity/auth"), Some(body)).await?;
+    let token = ok
+        .get("token")
         .and_then(Value::as_str)
         .map(|t| Token::new(t.to_owned()))
-        .ok_or_else(|| protocol("the auth reply carried no token"))
+        .ok_or_else(|| protocol("the auth reply carried no token"))?;
+    Ok(Admitted {
+        token,
+        outcome: ok.get("outcome").and_then(Value::as_str).map(str::to_owned),
+    })
+}
+
+/// A device proved: the token its upgrade presents, and what the server
+/// said it would make of the identity (hotline-ng-identity.md, section 5.3).
+pub struct Admitted {
+    pub token: Token,
+    pub outcome: Option<String>,
 }
 
 /// The challenge and server key a challenge reply carries, once the

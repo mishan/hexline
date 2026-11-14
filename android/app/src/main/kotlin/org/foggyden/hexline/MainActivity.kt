@@ -11,7 +11,7 @@ import androidx.compose.runtime.getValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import org.foggyden.hexline.chat.ChatScreen
 import org.foggyden.hexline.chat.ChatViewModel
-import org.foggyden.hexline.chat.ConnectScreen
+import org.foggyden.hexline.chat.ConnectFlow
 import org.foggyden.hexline.chat.Link
 
 class MainActivity : ComponentActivity() {
@@ -26,15 +26,22 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun Hexline(chat: ChatViewModel) {
     val state by chat.chat.collectAsStateWithLifecycle()
-    val last by chat.last.collectAsStateWithLifecycle()
+    val saved by chat.saved.collectAsStateWithLifecycle()
+    val identities by chat.identityList.collectAsStateWithLifecycle()
+    val restore by chat.restore.collectAsStateWithLifecycle()
     when (val link = state.link) {
         Link.Live, is Link.Reconnecting -> ChatScreen(state, chat::send, chat::loadEarlier, chat::disconnect)
         else ->
-            ConnectScreen(
-                last = last,
+            ConnectFlow(
+                saved = saved,
+                identities = identities,
+                restore = restore,
                 error = (link as? Link.Ended)?.why,
                 connecting = link == Link.Connecting,
                 onConnect = chat::connect,
+                onForget = chat::forget,
+                onRestore = chat::restore,
+                onRestoreSeen = chat::restoreSeen,
             )
     }
 }

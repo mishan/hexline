@@ -117,9 +117,10 @@ async fn a_wrong_password_is_refused() {
 async fn an_identity_proves_its_device_and_logs_in_on_the_socket_that_proved_it() {
     let server = Server::with_identity(&[], 300).await;
     let (id, alice) = device("Alice");
-    let token = identity_token(&server.url, &alice, true, None)
+    let token = identity_token(&server.url, &alice, true, None, None)
         .await
-        .unwrap();
+        .unwrap()
+        .token;
     let anyone = Start::Login(LoginParams::default());
     let (_client, answer, _heard) = connect_with(&server.url, &anyone, None, Some(&token))
         .await
@@ -154,12 +155,18 @@ async fn an_identity_is_refused_by_its_code() {
         card: alice.card.clone(),
     };
     for (url, who, want) in [
-        (&plain.url, &alice, "not_available"),
+        (&plain.url, &alice, "no_identity_sign_in"),
         (&with.url, &forged, "bad_proof"),
     ] {
-        match identity_token(url, who, true, None).await {
+        match identity_token(url, who, true, None, None).await {
             Err(Error::Refused(r)) => assert_eq!(r.error.code, want, "{}", r.error.text),
             other => panic!("{want}: {:?}", other.map(|_| ())),
         }
     }
+}
+
+#[tokio::test]
+async fn a_server_launched_on_a_port_another_holds_is_not_taken_for_that_one() {
+    let first = Server::start(&[]).await;
+    assert!(Server::try_on(first.addr.port()).await.is_none());
 }
