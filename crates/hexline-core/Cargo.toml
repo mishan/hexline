@@ -18,7 +18,7 @@ live-tests = ["hxng-client/live-tests"]
 [dependencies]
 uniffi = { workspace = true, features = ["tokio"] }
 hxng-client = { path = "../hxng-client", features = ["tokio"] }
-tokio = { version = "1.54", features = ["rt-multi-thread", "sync"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "sync", "macros", "time"] }
 serde_json = { workspace = true }
 zeroize = { workspace = true }
 base64 = "0.23"

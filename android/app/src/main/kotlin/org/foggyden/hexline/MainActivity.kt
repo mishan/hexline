@@ -30,6 +30,7 @@ fun Hexline(chat: ChatViewModel) {
     val identities by chat.identityList.collectAsStateWithLifecycle()
     val refusals by chat.refusals.collectAsStateWithLifecycle()
     val restore by chat.restore.collectAsStateWithLifecycle()
+    val enrolling by chat.enrollment.collectAsStateWithLifecycle()
     when (val link = state.link) {
         Link.Live, is Link.Reconnecting -> ChatScreen(state, chat::send, chat::loadEarlier, chat::disconnect)
         else ->
@@ -46,6 +47,12 @@ fun Hexline(chat: ChatViewModel) {
                 onRestoreSeen = chat::restoreSeen,
                 onDelete = chat::deleteIdentity,
                 onTryAgain = chat::tryAgain,
+                enrolling = enrolling,
+                onStartEnroll = chat::startEnroll,
+                onRequestEnroll = chat::requestEnroll,
+                onConfirmEnroll = chat::confirmEnroll,
+                onDiscardEnroll = chat::discardEnroll,
+                onEnrollSeen = chat::enrollSeen,
             )
     }
 }

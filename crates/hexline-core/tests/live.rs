@@ -1242,3 +1242,324 @@ async fn a_restored_device_is_vouched_for_where_unattested_identities_are_guests
     let info = conn.login_identity(device, true, None, None).await.unwrap();
     assert_eq!(info.outcome.as_deref(), Some("created"), "{info:?}");
 }
+
+/// What enrolling a device asks: refused with this code.
+fn refused_as(e: &CoreError) -> &str {
+    match e {
+        CoreError::Refused { code, .. } => code,
+        other => panic!("not a refusal: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_device_a_holder_certifies_by_its_code_logs_in_as_the_identity() {
+    use hexline_core::{cert_for_device, Enrollee};
+    use hxng_client::testing::Holder;
+    let server = Server::with_identity(&[], 1).await;
+    let holder = Holder::new(&server, "Alice");
+    let session = holder.open().await;
+    let phone = Enrollee::new();
+    let typed = session.code.to_lowercase().replace('-', " ");
+    let asking = tokio::spawn(phone.clone().enroll(
+        server.url.clone(),
+        Some(typed),
+        "Hexline".into(),
+    ));
+    let asked = holder.asked(&session).await;
+    // What the holder's prompt shows is what the phone shows.
+    assert_eq!(
+        hl_identity::Fingerprint::of(&asked.request.device).short(),
+        phone.device_fingerprint()
+    );
+    assert_eq!(asked.request.name.as_deref(), Some("Hexline"));
+    holder.approve(&session, &asked, 90).await;
+    let enrolled = asking.await.unwrap().unwrap();
+    let fingerprint = hl_identity::Fingerprint::of(&holder.id.public());
+    assert_eq!(enrolled.fingerprint, fingerprint.to_string());
+    assert_eq!(enrolled.short, fingerprint.short());
+    assert_eq!(enrolled.name, "Alice");
+    let info = cert_for_device(enrolled.cert.clone(), enrolled.card.clone(), phone.seed()).unwrap();
+    assert!(info.can_login && info.can_message && !info.can_manage);
+
+    let conn = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
+    let device = DeviceIdentity {
+        device_seed: phone.seed(),
+        cert: enrolled.cert,
+        card: enrolled.card,
+    };
+    let login = conn.login_identity(device, true, None, None).await.unwrap();
+    assert_eq!(login.fingerprint, Some(fingerprint.to_string()));
+}
+
+#[tokio::test]
+async fn a_holders_no_and_a_wrong_code_are_told_apart() {
+    use hexline_core::Enrollee;
+    use hxng_client::testing::Holder;
+    let server = Server::with_identity(&[], 1).await;
+    let holder = Holder::new(&server, "Alice");
+    let session = holder.open().await;
+    let phone = Enrollee::new();
+    let asking = tokio::spawn(phone.clone().enroll(
+        server.url.clone(),
+        Some(session.code.clone()),
+        "Hexline".into(),
+    ));
+    let asked = holder.asked(&session).await;
+    holder.deny(&session, &asked, "not_mine").await;
+    match asking.await.unwrap().unwrap_err() {
+        CoreError::Refused { code, detail } => {
+            assert_eq!((code.as_str(), detail.as_str()), ("denied", "not_mine"))
+        }
+        other => panic!("{other:?}"),
+    }
+    // Its one request spent, the code admits no other.
+    let again = Enrollee::new()
+        .enroll(
+            server.url.clone(),
+            Some(session.code.clone()),
+            "Hexline".into(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused_as(&again), "unknown_code");
+    let typo = Enrollee::new()
+        .enroll(server.url.clone(), Some("K7PM".into()), "Hexline".into())
+        .await
+        .unwrap_err();
+    assert_eq!(refused_as(&typo), "bad_code");
+}
+
+#[tokio::test]
+async fn an_answer_for_another_device_is_refused() {
+    use hexline_core::Enrollee;
+    use hxng_client::testing::Holder;
+    let server = Server::with_identity(&[], 1).await;
+    let holder = Holder::new(&server, "Alice");
+    let session = holder.open().await;
+    let phone = Enrollee::new();
+    let asking = tokio::spawn(phone.clone().enroll(
+        server.url.clone(),
+        Some(session.code.clone()),
+        "Hexline".into(),
+    ));
+    let asked = holder.asked(&session).await;
+    let other = hl_identity::DeviceKey::generate();
+    // Its own encryption key beside another's signing key, and the reverse.
+    holder
+        .answer_with(
+            &session,
+            &asked,
+            other.public(),
+            asked.request.device_enc,
+            90,
+        )
+        .await;
+    assert_eq!(
+        refused_as(&asking.await.unwrap().unwrap_err()),
+        "wrong_device"
+    );
+
+    let session = holder.open().await;
+    let asking = tokio::spawn(phone.clone().enroll(
+        server.url.clone(),
+        Some(session.code.clone()),
+        "Hexline".into(),
+    ));
+    let asked = holder.asked(&session).await;
+    holder
+        .answer_with(
+            &session,
+            &asked,
+            asked.request.device,
+            other.public_enc(),
+            90,
+        )
+        .await;
+    assert_eq!(
+        refused_as(&asking.await.unwrap().unwrap_err()),
+        "wrong_device"
+    );
+}
+
+#[tokio::test]
+async fn a_wait_for_a_holder_stops_when_canceled() {
+    use hexline_core::Enrollee;
+    use hxng_client::testing::Holder;
+    let server = Server::with_identity(&[], 1).await;
+    let holder = Holder::new(&server, "Alice");
+    let session = holder.open().await;
+    let phone = Enrollee::new();
+    let asking = tokio::spawn(phone.clone().enroll(
+        server.url.clone(),
+        Some(session.code.clone()),
+        "Hexline".into(),
+    ));
+    holder.asked(&session).await;
+    phone.cancel();
+    let ended = tokio::time::timeout(Duration::from_secs(5), asking)
+        .await
+        .expect("a canceled wait ends at once")
+        .unwrap();
+    assert_eq!(refused_as(&ended.unwrap_err()), "canceled");
+}
+
+#[tokio::test]
+async fn a_device_is_renewed_by_its_holder_standing_by_and_without_one_needs_a_code() {
+    use hexline_core::{cert_for_device, Enrollee};
+    use hxng_client::testing::Holder;
+    let server = Server::with_identity(&[], 1).await;
+    let holder = Holder::new(&server, "Alice");
+    let session = holder.open().await;
+    let phone = Enrollee::new();
+    let asking = tokio::spawn(phone.clone().enroll(
+        server.url.clone(),
+        Some(session.code.clone()),
+        "Hexline".into(),
+    ));
+    let asked = holder.asked(&session).await;
+    holder.approve(&session, &asked, 1).await;
+    let first = asking.await.unwrap().unwrap();
+
+    // Nobody standing by: the renewal is to be asked for with a code.
+    let renewing = Enrollee::renewing(phone.seed(), first.cert.clone()).unwrap();
+    let none = renewing
+        .clone()
+        .enroll(server.url.clone(), None, "Hexline".into())
+        .await
+        .unwrap_err();
+    assert_eq!(refused_as(&none), "no_holder");
+
+    let standing = holder.stand_by().await;
+    let asking = tokio::spawn(
+        renewing
+            .clone()
+            .enroll(server.url.clone(), None, "Hexline".into()),
+    );
+    let asked = holder.asked(&standing).await;
+    let prev =
+        hl_identity::DeviceCert::parse(asked.request.prev.as_deref().expect("its certificate"))
+            .unwrap();
+    assert_eq!(asked.request.device, prev.device);
+    assert_eq!(asked.request.caps, prev.caps, "no more than it has");
+    holder.approve(&standing, &asked, 90).await;
+    let renewed = asking.await.unwrap().unwrap();
+    assert_eq!(renewed.fingerprint, first.fingerprint);
+    let was = cert_for_device(first.cert, first.card, phone.seed()).unwrap();
+    let now = cert_for_device(renewed.cert, renewed.card, renewing.seed()).unwrap();
+    assert_eq!(now.device, was.device, "the same device");
+    assert!(now.expires > was.expires);
+}
+
+#[tokio::test]
+async fn a_renewal_answered_by_another_identity_is_refused() {
+    use hexline_core::Enrollee;
+    use hxng_client::testing::Holder;
+    let server = Server::with_identity(&[], 1).await;
+    let alice = Holder::new(&server, "Alice");
+    let session = alice.open().await;
+    let phone = Enrollee::new();
+    let asking = tokio::spawn(phone.clone().enroll(
+        server.url.clone(),
+        Some(session.code.clone()),
+        "Hexline".into(),
+    ));
+    let asked = alice.asked(&session).await;
+    alice.approve(&session, &asked, 1).await;
+    let first = asking.await.unwrap().unwrap();
+
+    // By a code another identity's holder shows.
+    let mallory = Holder::new(&server, "Mallory");
+    let session = mallory.open().await;
+    let renewing = Enrollee::renewing(phone.seed(), first.cert).unwrap();
+    let asking = tokio::spawn(renewing.clone().enroll(
+        server.url.clone(),
+        Some(session.code.clone()),
+        "Hexline".into(),
+    ));
+    let asked = mallory.asked(&session).await;
+    mallory.approve(&session, &asked, 90).await;
+    assert_eq!(
+        refused_as(&asking.await.unwrap().unwrap_err()),
+        "wrong_identity"
+    );
+}
+
+#[tokio::test]
+async fn a_server_with_no_mailbox_says_so() {
+    use hexline_core::Enrollee;
+    let server = Server::start(&[]).await;
+    let none = Enrollee::new()
+        .enroll(
+            server.url.clone(),
+            Some("K7PM-4XWE".into()),
+            "Hexline".into(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused_as(&none), "no_mailbox");
+}
+
+#[tokio::test]
+async fn a_new_device_for_an_identity_on_the_phone_is_kept_only_from_that_identity() {
+    use hexline_core::Enrollee;
+    use hxng_client::testing::Holder;
+    let server = Server::with_identity(&[], 1).await;
+    let alice = Holder::new(&server, "Alice");
+    let session = alice.open().await;
+    let lapsed = Enrollee::new();
+    let asking = tokio::spawn(lapsed.clone().enroll(
+        server.url.clone(),
+        Some(session.code.clone()),
+        "Hexline".into(),
+    ));
+    let asked = alice.asked(&session).await;
+    alice.approve(&session, &asked, 1).await;
+    let kept = asking.await.unwrap().unwrap();
+
+    // The device that takes its place, by a code, from either holder.
+    let mallory = Holder::new(&server, "Mallory");
+    for (holder, want) in [(&mallory, Some("wrong_identity")), (&alice, None)] {
+        let session = holder.open().await;
+        let phone = Enrollee::new();
+        phone.expect_identity_of(kept.cert.clone()).unwrap();
+        let asking = tokio::spawn(phone.clone().enroll(
+            server.url.clone(),
+            Some(session.code.clone()),
+            "Hexline".into(),
+        ));
+        let asked = holder.asked(&session).await;
+        holder.approve(&session, &asked, 90).await;
+        let got = asking.await.unwrap();
+        assert_eq!(got.as_ref().err().map(refused_as), want, "{got:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_enrollment_canceled_before_it_asks_spends_no_code() {
+    use hexline_core::Enrollee;
+    use hxng_client::testing::Holder;
+    let server = Server::with_identity(&[], 1).await;
+    let holder = Holder::new(&server, "Alice");
+    let session = holder.open().await;
+    let left = Enrollee::new();
+    left.cancel();
+    let ended = left
+        .enroll(
+            server.url.clone(),
+            Some(session.code.clone()),
+            "Hexline".into(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused_as(&ended), "canceled");
+    // The code admits one request, and that is still to come.
+    let phone = Enrollee::new();
+    let asking = tokio::spawn(phone.clone().enroll(
+        server.url.clone(),
+        Some(session.code.clone()),
+        "Hexline".into(),
+    ));
+    let asked = holder.asked(&session).await;
+    holder.approve(&session, &asked, 90).await;
+    asking.await.unwrap().unwrap();
+}

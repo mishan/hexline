@@ -72,6 +72,25 @@ class IdentitiesTest {
     }
 
     @Test
+    fun anEnrolledDevicesMailboxAndItsQuietRenewalAreKeptForThatDeviceAlone() {
+        identities().save(SEED.copyOf(), CERT, CARD, "alice@example", null, "hl.example")
+        identities().renewTried(FINGERPRINT, ByteArray(32) { 9 }, 100, true)
+        assertEquals("another device's renewal changes nothing", 0L, identities().list().single().renewTried)
+        val device =
+            identities()
+                .list()
+                .single()
+                .info.device
+        identities().renewTried(FINGERPRINT, device, 100, true)
+        val tried = identities().list().single()
+        assertEquals(listOf("hl.example", 100L, true), listOf(tried.mailbox, tried.renewTried, tried.noHolder))
+        // A certificate kept anew is a renewal done: nothing tried for it yet.
+        identities().save(SEED.copyOf(), CERT, CARD, "alice@example", null, "hl.example")
+        val renewed = identities().list().single()
+        assertEquals(listOf("hl.example", 0L, false), listOf(renewed.mailbox, renewed.renewTried, renewed.noHolder))
+    }
+
+    @Test
     fun aCertificateIsKeptOnlyBesideTheKeyItCertifies() {
         assertThrows(CoreException::class.java) { identities().save(OTHER, CERT, CARD, null, null) }
         assertThrows(CoreException::class.java) { identities().save(SEED.copyOf(), byteArrayOf(1, 2, 3), CARD, null, null) }

@@ -39,15 +39,19 @@ import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import kotlinx.coroutines.delay
 import org.foggyden.hexline.R
+import org.foggyden.hexline.core.CertInfo
 import org.foggyden.hexline.core.ClassicLogin
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.coreVersion
+import org.foggyden.hexline.identity.EnrollProblem
+import org.foggyden.hexline.identity.Enrolling
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
 import org.foggyden.hexline.identity.Standing
@@ -78,14 +82,37 @@ fun ConnectFlow(
     onRestoreSeen: () -> Unit,
     onDelete: (fingerprint: String) -> Unit,
     onTryAgain: (server: Server, fingerprint: String) -> Unit,
+    enrolling: Enrolling,
+    onStartEnroll: (renewing: String?) -> Unit,
+    onRequestEnroll: (mailbox: String, code: String, deviceName: String) -> Unit,
+    onConfirmEnroll: () -> Unit,
+    onDiscardEnroll: () -> Unit,
+    onEnrollSeen: () -> Unit,
 ) {
     val form = rememberSaveable(stateSaver = FormSaver) { mutableStateOf(ConnectForm()) }
+    // The enroll screen, while open: blank for a new device, an identity's
+    // fingerprint to renew it. Null while it is closed.
+    var enrollFor by rememberSaveable { mutableStateOf<String?>(null) }
+    LaunchedEffect(enrolling) { if (enrolling is Enrolling.Done) enrollFor = null }
     // The registrar and handle the restore screen opens with: blank for a
     // new identity, an identity's own to renew it. Null while it is closed.
     var restoreFor by rememberSaveable { mutableStateOf<Pair<String, String>?>(null) }
     LaunchedEffect(restore) { if (restore is Restoring.Done) restoreFor = null }
     val opened = restoreFor
-    if (opened != null) {
+    val enrollingFor = enrollFor
+    if (enrollingFor != null) {
+        val renewing = identities.find { it.fingerprint == enrollingFor }
+        EnrollScreen(
+            enrolling = enrolling,
+            initialMailbox = renewing?.mailbox ?: form.value.url,
+            onStart = { onStartEnroll(enrollingFor.ifEmpty { null }) },
+            onRequest = onRequestEnroll,
+            onConfirm = onConfirmEnroll,
+        ) {
+            enrollFor = null
+            onDiscardEnroll()
+        }
+    } else if (opened != null) {
         RestoreScreen(restore, opened.first, opened.second, onRestore) {
             restoreFor = null
             onRestoreSeen()
@@ -96,16 +123,24 @@ fun ConnectFlow(
             saved = saved,
             identities = identities,
             refusals = refusals,
-            restored = (restore as? Restoring.Done)?.fingerprint,
+            restored = (restore as? Restoring.Done)?.fingerprint ?: (enrolling as? Enrolling.Done)?.fingerprint,
             error = error,
             connecting = connecting,
             onConnect = onConnect,
             onForget = onForget,
             onRestore = { renewing ->
-                onRestoreSeen()
-                restoreFor = (renewing?.registrar.orEmpty()) to (renewing?.handle.orEmpty())
+                if (renewing?.mailbox != null) {
+                    enrollFor = renewing.fingerprint
+                } else {
+                    onRestoreSeen()
+                    restoreFor = (renewing?.registrar.orEmpty()) to (renewing?.handle.orEmpty())
+                }
             },
-            onRestored = onRestoreSeen,
+            onEnroll = { enrollFor = "" },
+            onRestored = {
+                onRestoreSeen()
+                onEnrollSeen()
+            },
             onDelete = onDelete,
             onTryAgain = onTryAgain,
         )
@@ -124,6 +159,7 @@ private fun ConnectScreen(
     onConnect: (server: Server, password: String?, remember: Boolean, link: ClassicLogin?) -> Unit,
     onForget: (Server) -> Unit,
     onRestore: (renewing: StoredIdentity?) -> Unit,
+    onEnroll: () -> Unit,
     onRestored: () -> Unit,
     onDelete: (fingerprint: String) -> Unit,
     onTryAgain: (server: Server, fingerprint: String) -> Unit,
@@ -159,7 +195,7 @@ private fun ConnectScreen(
                     is Standing.Renew -> pluralStringResource(R.plurals.renew_banner, s.days.toInt(), named(kept), s.days.toInt())
                     Standing.Expired -> stringResource(R.string.expired_banner, named(kept))
                     else -> null
-                } ?: continue
+                } ?: stringResource(R.string.no_holder_banner, named(kept)).takeIf { kept.noHolder } ?: continue
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(banner, Modifier.weight(1f), color = MaterialTheme.colorScheme.error)
                 TextButton({ onRestore(kept) }) { Text(stringResource(R.string.renew)) }
@@ -237,7 +273,11 @@ private fun ConnectScreen(
                 }
             }
             TextButton({ onRestore(null) }) { Text(stringResource(R.string.restore_identity)) }
-            if (identity != null && standing(identity, now).usable && refused(form.identityServer(identity), identity) == null) {
+            TextButton(onEnroll) { Text(stringResource(R.string.enroll_identity)) }
+            // Linking writes to the account, which a device may do only with manage.
+            if (identity != null && !identity.info.canManage) {
+                Text(stringResource(R.string.needs_manage), style = MaterialTheme.typography.bodySmall)
+            } else if (identity != null && standing(identity, now).usable && refused(form.identityServer(identity), identity) == null) {
                 Checked(form.linking, { form = form.copy(linking = it) }, stringResource(R.string.have_account))
                 if (form.linking) {
                     OutlinedTextField(
@@ -336,8 +376,10 @@ private fun describeRefusal(
 
 /** What this device's certificate lets it do, in words. */
 @Composable
-private fun capabilities(identity: StoredIdentity): String {
-    val info = identity.info
+private fun capabilities(identity: StoredIdentity): String = capabilities(identity.info)
+
+@Composable
+private fun capabilities(info: CertInfo): String {
     val can =
         listOfNotNull(
             stringResource(R.string.cap_login).takeIf { info.canLogin },
@@ -516,4 +558,141 @@ private fun describe(problem: RestoreProblem): String =
         RestoreProblem.Unreachable -> stringResource(R.string.restore_unreachable)
         RestoreProblem.NotKept -> stringResource(R.string.restore_not_kept)
         RestoreProblem.Other -> stringResource(R.string.restore_failed)
+    }
+
+/**
+ * Makes this phone a device of an identity whose key a holder keeps: by
+ * the code it shows, after which the person sees whose device the phone
+ * has become and keeps it only then (enrollment section 5.5).
+ */
+@Composable
+fun EnrollScreen(
+    enrolling: Enrolling,
+    initialMailbox: String,
+    onStart: () -> Unit,
+    onRequest: (mailbox: String, code: String, deviceName: String) -> Unit,
+    onConfirm: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    LaunchedEffect(Unit) { if (enrolling == Enrolling.Idle || enrolling is Enrolling.Done) onStart() }
+    var mailbox by rememberSaveable { mutableStateOf(initialMailbox) }
+    var code by rememberSaveable { mutableStateOf("") }
+    var deviceName by rememberSaveable { mutableStateOf("Hexline") }
+    Column(
+        Modifier
+            .fillMaxSize()
+            .safeDrawingPadding()
+            .verticalScroll(rememberScrollState())
+            .padding(24.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text(stringResource(R.string.enroll_title), style = MaterialTheme.typography.headlineMedium)
+        when (enrolling) {
+            is Enrolling.Answered -> {
+                Text(
+                    stringResource(R.string.enroll_answered),
+                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                )
+                // Apart, and the fingerprint in its own face: a name cannot be made to look like it.
+                Text(enrolling.name, style = MaterialTheme.typography.titleMedium)
+                Text(
+                    stringResource(R.string.enroll_fingerprint, enrolling.short),
+                    fontFamily = FontFamily.Monospace,
+                )
+                enrolling.replaces?.let {
+                    Text(stringResource(R.string.enroll_replaces))
+                    Text(capabilities(it), style = MaterialTheme.typography.bodySmall)
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onConfirm) { Text(stringResource(R.string.enroll_confirm)) }
+                    TextButton(onCancel) { Text(stringResource(R.string.enroll_discard)) }
+                }
+            }
+            is Enrolling.Waiting -> {
+                Text(
+                    stringResource(R.string.enroll_waiting, enrolling.device),
+                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                )
+                TextButton(onCancel) { Text(stringResource(R.string.cancel)) }
+            }
+            Enrolling.Idle, Enrolling.Starting, is Enrolling.Done -> {
+                Text(stringResource(R.string.enroll_starting))
+                TextButton(onCancel) { Text(stringResource(R.string.cancel)) }
+            }
+            is Enrolling.Failed if enrolling.device.isEmpty() -> {
+                Text(
+                    describe(enrolling),
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onStart) { Text(stringResource(R.string.enroll_start_again)) }
+                    TextButton(onCancel) { Text(stringResource(R.string.cancel)) }
+                }
+            }
+            is Enrolling.Ready, is Enrolling.Failed -> {
+                val device = (enrolling as? Enrolling.Ready)?.device ?: (enrolling as Enrolling.Failed).device
+                Text(stringResource(R.string.enroll_explained))
+                OutlinedTextField(
+                    mailbox,
+                    { mailbox = it },
+                    label = { Text(stringResource(R.string.mailbox)) },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    code,
+                    { code = it },
+                    label = { Text(stringResource(R.string.enroll_code)) },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                if (device.isNotEmpty()) Text(stringResource(R.string.enroll_device, device))
+                OutlinedTextField(
+                    deviceName,
+                    { deviceName = it },
+                    label = { Text(stringResource(R.string.device_name)) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                if (enrolling is Enrolling.Failed) {
+                    Text(
+                        describe(enrolling),
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = { onRequest(mailbox.trim(), code, deviceName.trim()) },
+                        enabled = device.isNotEmpty() && mailbox.isNotBlank() && code.isNotBlank(),
+                    ) { Text(stringResource(R.string.enroll_request)) }
+                    TextButton(onCancel) { Text(stringResource(R.string.cancel)) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun describe(failed: Enrolling.Failed): String =
+    when (failed.problem) {
+        EnrollProblem.BadCode -> stringResource(R.string.enroll_bad_code)
+        EnrollProblem.UnknownCode -> stringResource(R.string.enroll_unknown_code)
+        EnrollProblem.BadMailbox -> stringResource(R.string.enroll_bad_mailbox)
+        EnrollProblem.Cleartext -> stringResource(R.string.enroll_cleartext)
+        EnrollProblem.NoMailbox -> stringResource(R.string.enroll_no_mailbox)
+        EnrollProblem.BadDeviceName -> stringResource(R.string.enroll_bad_device_name)
+        EnrollProblem.Denied ->
+            failed.reason?.let { stringResource(R.string.enroll_denied_because, it) } ?: stringResource(R.string.enroll_denied)
+        EnrollProblem.Expired -> stringResource(R.string.enroll_expired)
+        EnrollProblem.NotForThisPhone -> stringResource(R.string.enroll_not_for_this_phone)
+        EnrollProblem.RateLimited -> stringResource(R.string.enroll_rate_limited)
+        EnrollProblem.Unreachable -> stringResource(R.string.enroll_unreachable)
+        EnrollProblem.NotKept -> stringResource(R.string.enroll_not_kept)
+        EnrollProblem.AnswerNotKept -> stringResource(R.string.enroll_answer_not_kept)
+        EnrollProblem.Unusable -> stringResource(R.string.enroll_unusable)
+        EnrollProblem.Other -> stringResource(R.string.enroll_failed)
     }

@@ -185,6 +185,23 @@ pub async fn get(http: &reqwest::Client, url: &str) -> Result<(u16, Vec<u8>), Er
     Ok((status, bounded(resp).await?))
 }
 
+/// GET `url` as a long poll: its status and its body, waiting up to `wait`
+/// for them where an ordinary call gives up sooner.
+pub async fn get_waiting(
+    http: &reqwest::Client,
+    url: &str,
+    wait: std::time::Duration,
+) -> Result<(u16, Vec<u8>), Error> {
+    let resp = http
+        .get(url)
+        .timeout(wait)
+        .send()
+        .await
+        .map_err(|e| Error::Connect(e.to_string()))?;
+    let status = resp.status().as_u16();
+    Ok((status, bounded(resp).await?))
+}
+
 /// Whether `host` (in [`canonical_host`] form) is this machine.
 fn loopback(host: &str) -> bool {
     let name = match host.strip_prefix('[') {

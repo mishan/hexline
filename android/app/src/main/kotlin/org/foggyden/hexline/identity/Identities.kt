@@ -23,6 +23,12 @@ class StoredIdentity(
     val info: CertInfo,
     /** Where it was restored from, to renew it at. */
     val registrar: String? = null,
+    /** The mailbox its holder certified it through, to renew it at. */
+    val mailbox: String? = null,
+    /** When a quiet renewal was last asked for, in seconds; 0 for never. */
+    val renewTried: Long = 0,
+    /** That renewal found no holder standing by: a code is to be asked for. */
+    val noHolder: Boolean = false,
 ) {
     /** The identity, in the form the core gives it: the only one to pass back. */
     val fingerprint: String get() = info.fingerprint
@@ -64,6 +70,7 @@ class Identities(
         card: ByteArray,
         handle: String?,
         registrar: String?,
+        mailbox: String? = null,
     ): StoredIdentity =
         synchronized(LOCK) {
             val info = certForDevice(cert, card, seed)
@@ -74,7 +81,8 @@ class Identities(
             // leaves one whole device or the other.
             val secret = secretName(info.fingerprint, info.device)
             secrets.put(secret, seed)
-            val stored = StoredIdentity(handle?.ifEmpty { null }, cert, card, info, registrar?.ifEmpty { null })
+            val stored =
+                StoredIdentity(handle?.ifEmpty { null }, cert, card, info, registrar?.ifEmpty { null }, mailbox?.ifEmpty { null })
             write(file, stored)
             before?.let { old ->
                 secretName(old.fingerprint, old.info.device).takeIf { it != secret }?.let(secrets::delete)
@@ -115,6 +123,35 @@ class Identities(
             }
         }
 
+    /**
+     * Notes a quiet renewal of [fingerprint]'s [device] asked for [at], and
+     * whether a holder stood by to answer it; nothing if another device has
+     * taken its place since.
+     */
+    fun renewTried(
+        fingerprint: String,
+        device: ByteArray,
+        at: Long,
+        noHolder: Boolean,
+    ): Unit =
+        synchronized(LOCK) {
+            val file = file(fingerprint)
+            val stored = load(file)?.takeIf { it.info.device.contentEquals(device) } ?: return
+            write(
+                file,
+                StoredIdentity(
+                    stored.handle,
+                    stored.cert,
+                    stored.card,
+                    stored.info,
+                    stored.registrar,
+                    stored.mailbox,
+                    at,
+                    noHolder,
+                ),
+            )
+        }
+
     fun delete(fingerprint: String): Unit =
         synchronized(LOCK) {
             val file = file(fingerprint)
@@ -148,6 +185,9 @@ class Identities(
                 unb64(json.getString("card")),
                 info,
                 json.optString("registrar").ifEmpty { null },
+                json.optString("mailbox").ifEmpty { null },
+                json.optLong("renew_tried"),
+                json.optBoolean("no_holder"),
             )
         } catch (_: Exception) {
             null
@@ -167,6 +207,9 @@ class Identities(
                 .apply {
                     stored.handle?.let { put("handle", it) }
                     stored.registrar?.let { put("registrar", it) }
+                    stored.mailbox?.let { put("mailbox", it) }
+                    if (stored.renewTried != 0L) put("renew_tried", stored.renewTried)
+                    if (stored.noHolder) put("no_holder", true)
                 }
         val atomic = AtomicFile(file)
         val out = atomic.startWrite()
