@@ -229,6 +229,24 @@ class SavedServersTest {
     }
 
     @Test
+    fun anOlderSaveNeverOverwritesANewerOneNorOutlivesAForget() {
+        val a = Server("wss://a.example/ng", "alice")
+        servers().remember(a, null)
+        val older = servers().generation()
+        servers().keepSession(a, byteArrayOf(2), servers().generation())
+        servers().keepSession(a, byteArrayOf(1), older)
+        assertArrayEquals("the newer save stands", byteArrayOf(2), servers().session(a))
+
+        // A forget, then the server remembered again by a newer login: a
+        // save asked for before the forget is still the forgotten one's.
+        val beforeForget = servers().generation()
+        servers().forget(a, servers().generation())
+        servers().remember(a, null, servers().generation())
+        servers().keepSession(a, byteArrayOf(3), beforeForget)
+        assertNull(servers().session(a))
+    }
+
+    @Test
     fun aSessionSavedAfterItWasClearedIsNotWrittenBack() {
         val a = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
         servers().remember(a, null)

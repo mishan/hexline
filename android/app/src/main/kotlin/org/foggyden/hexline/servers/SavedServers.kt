@@ -11,6 +11,7 @@ import org.foggyden.hexline.secrets.SecretUnreadable
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicLong
 
 /** How a server is signed in to. */
 sealed interface SignIn {
@@ -66,7 +67,7 @@ class SavedServers(
      * taken as the act is asked for and handed to it, so acts are ordered
      * here by when they were asked for, not by when they ran.
      */
-    fun generation(): Long = synchronized(LOCK) { ++forgets }
+    fun generation(): Long = tickets.incrementAndGet()
 
     /**
      * [server] is the last; its password is kept, or with null forgotten.
@@ -94,6 +95,9 @@ class SavedServers(
     ): Unit =
         synchronized(LOCK) {
             forgotten(name("list", server), at)
+            // And its session: a save asked for before this is the forgotten one's,
+            // even once a newer login has remembered the server again.
+            forgotten(name("session", server), at)
             write(all().filter { it != server })
             secrets.delete(name("password", server))
             secrets.delete(name("session", server))
@@ -249,6 +253,8 @@ class SavedServers(
     ): Boolean =
         synchronized(LOCK) {
             if (since != null && (forgottenAt[name("session", server)] ?: 0) > since) return false
+            // Nor over one a newer save kept.
+            if (keptSince(name("session", server), since)) return false
             val kept = session?.takeIf { server in all() }
             write(name("session", server), kept).also { if (it && kept != null) kept(name("session", server), since) }
         }
@@ -258,7 +264,7 @@ class SavedServers(
         name: String,
         at: Long?,
     ) {
-        forgottenAt[name] = maxOf(forgottenAt[name] ?: 0, at ?: ++forgets)
+        forgottenAt[name] = maxOf(forgottenAt[name] ?: 0, at ?: generation())
     }
 
     /** [name] kept, as [forgotten] is forgotten. */
@@ -266,7 +272,7 @@ class SavedServers(
         name: String,
         at: Long?,
     ) {
-        keptAt[name] = maxOf(keptAt[name] ?: 0, at ?: ++forgets)
+        keptAt[name] = maxOf(keptAt[name] ?: 0, at ?: generation())
     }
 
     /** Whether [name] was kept after [since]: a clear asked for before it is not this one's. */
@@ -326,8 +332,11 @@ class SavedServers(
         /** One for the process: each change reads the list, then writes it whole. */
         val LOCK = Any()
 
+        // Apart from LOCK, which a write holds across the Keystore: a ticket is
+        // taken on the main thread, and must not wait for one.
+        val tickets = AtomicLong()
+
         // The process's, under LOCK: a login outlives no process.
-        var forgets = 0L
         val forgottenAt = HashMap<String, Long>()
         val keptAt = HashMap<String, Long>()
 
