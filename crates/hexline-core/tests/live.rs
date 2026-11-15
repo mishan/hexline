@@ -308,6 +308,60 @@ async fn a_lost_link_is_resumed_and_what_was_missed_replayed() {
     bob_sink.heard("alice's line", said("back again")).await;
 }
 
+fn session_kept(u: &CoreUpdate) -> bool {
+    matches!(u, CoreUpdate::SessionKept)
+}
+
+/// Waits until `sink` has been told its session is kept `times` times.
+async fn kept_times(sink: &Sink, times: usize) {
+    for _ in 0..300 {
+        if sink.count(session_kept) >= times {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "told the session kept fewer than {times} times: {:?}",
+        sink.all()
+    );
+}
+
+#[tokio::test]
+async fn a_links_session_is_told_kept_once_there_is_one_to_save_on_a_quiet_link() {
+    let server = Server::start(&["alice"]).await;
+    let proxy = Proxy::to(&server).await;
+    let sink = Arc::new(Sink::default());
+    let alice = ServerConnection::new(proxy.url.clone(), sink.clone());
+    alice
+        .login(Some("alice".into()), pw("alice"), None)
+        .await
+        .unwrap();
+    kept_times(&sink, 1).await;
+    assert!(sink.at(roster) < sink.at(session_kept), "{:?}", sink.all());
+    let saved = alice.saved().expect("a session once told it is kept");
+
+    // The link lost and taken back, with nobody there to say anything.
+    proxy.sever();
+    kept_times(&sink, 2).await;
+    let back = sink
+        .at(|u| matches!(u, CoreUpdate::Reconnected { .. }))
+        .unwrap();
+    assert!(back < sink.positions(session_kept)[1], "{:?}", sink.all());
+    assert!(alice.saved().is_some());
+
+    // And a session taken up again by a new connection, as after a restart.
+    alice.hang_up(false);
+    let again_sink = Arc::new(Sink::default());
+    let again = ServerConnection::new(server.url.clone(), again_sink.clone());
+    let info = again
+        .login(Some("alice".into()), pw("alice"), Some(saved))
+        .await
+        .unwrap();
+    assert!(info.resumed, "{info:?}");
+    kept_times(&again_sink, 1).await;
+    assert!(again.saved().is_some());
+}
+
 #[tokio::test]
 async fn a_session_that_expired_while_the_link_was_down_is_logged_in_again() {
     let server = Server::with_grace(&["alice", "bob"], 1).await;

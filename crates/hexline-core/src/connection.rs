@@ -257,6 +257,10 @@ pub enum CoreUpdate {
     Refused {
         code: String,
     },
+    /// What `saved` gives is this link's session now, and is to be kept:
+    /// told once the link's first batch is handed over, so it comes though
+    /// the link says nothing more.
+    SessionKept,
     /// The connection is over for good, and the core will not reconnect:
     /// hung up, kicked, refused, or taken by another device (`replaced`).
     Closed {
@@ -1333,7 +1337,13 @@ async fn pump(
         link.client.close();
         return Ended::Over(Vec::new());
     }
-    *shared.kept.lock().unwrap() = link.kept.take();
+    let kept = link.kept.take();
+    let keeping = kept.is_some();
+    *shared.kept.lock().unwrap() = kept;
+    if keeping && !shared.deliver(vec![CoreUpdate::SessionKept]) {
+        link.client.close();
+        return Ended::Over(Vec::new());
+    }
     let mut lingering = (!*foreground).then(|| shared.linger());
     // Set once the app hangs up: the link is given so long to close.
     let mut closing: Option<Instant> = None;

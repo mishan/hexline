@@ -8,6 +8,7 @@ import org.foggyden.hexline.core.shortHash
 import org.foggyden.hexline.secrets.SecretStore
 import org.foggyden.hexline.secrets.SecretUnavailable
 import org.foggyden.hexline.secrets.SecretUnreadable
+import org.foggyden.hexline.secrets.Secrets
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
@@ -46,7 +47,7 @@ data class Server(
  */
 class SavedServers(
     context: Context,
-    private val secrets: SecretStore = SecretStore(context),
+    private val secrets: Secrets = SecretStore(context),
     private val prefs: SharedPreferences = context.getSharedPreferences("servers", Context.MODE_PRIVATE),
 ) {
     fun all(): List<Server> {

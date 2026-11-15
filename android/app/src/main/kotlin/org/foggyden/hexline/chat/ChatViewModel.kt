@@ -20,14 +20,15 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.foggyden.hexline.core.ClassicLogin
+import org.foggyden.hexline.core.Connection
 import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.CoreUpdate
 import org.foggyden.hexline.core.DeviceIdentity
 import org.foggyden.hexline.core.LoginInfo
 import org.foggyden.hexline.core.Restored
 import org.foggyden.hexline.core.SecretKind
-import org.foggyden.hexline.core.ServerConnection
 import org.foggyden.hexline.core.UpdateSink
+import org.foggyden.hexline.core.coreConnection
 import org.foggyden.hexline.core.refusalLasts
 import org.foggyden.hexline.core.restoreIdentity
 import org.foggyden.hexline.identity.Identities
@@ -53,22 +54,35 @@ import java.io.IOException
  * Everything here but [state] is touched on the main thread alone: the
  * core's batches and the network's callbacks are brought to it.
  */
-class ChatViewModel(
+class ChatViewModel internal constructor(
     app: Application,
-) : AndroidViewModel(app) {
-    private val servers = SavedServers(app)
-    private val identities = Identities(app)
-
+    private val servers: SavedServers,
+    private val identities: Identities,
     /**
      * Where every read and write of [servers] and [identities] this makes
-     * is made ([StoreQueue]). A forget or a delete lets go of what it
-     * names on the main thread before it asks for its own work, so queue
-     * order is the main thread's. A write the person may leave before it
-     * is made is asked for on [StoreQueue.scope], which outlives this.
+     * is made. A forget or a delete lets go of what it names on the main
+     * thread before it asks for its own work, so queue order is the main
+     * thread's. A write the person may leave before it is made is asked
+     * for on [StoreQueue.scope], which outlives this.
      */
-    private val store = StoreQueue.dispatcher
+    private val queue: StoreQueue,
+    private val open: (url: String, sink: UpdateSink) -> Connection,
+    /** Seconds since the epoch, that a certificate's time is judged by. */
+    private val now: () -> Long,
+) : AndroidViewModel(app) {
+    /** The one the app makes: its own stores, the process's queue, the core's connections and the clock. */
+    constructor(app: Application) : this(
+        app,
+        SavedServers(app),
+        Identities(app),
+        StoreQueue.process,
+        ::coreConnection,
+        { System.currentTimeMillis() / 1000 },
+    )
 
-    private fun later(work: () -> Unit) = StoreQueue.scope.launch { work() }
+    private val store = queue.dispatcher
+
+    private fun later(work: () -> Unit) = queue.scope.launch { work() }
 
     private val state = MutableStateFlow(ChatState())
     val chat: StateFlow<ChatState> = state
@@ -92,7 +106,7 @@ class ChatViewModel(
     val restore: StateFlow<Restoring> = restoring
 
     // Read from the store queue too, to see a forget that came first.
-    @Volatile private var connection: ServerConnection? = null
+    @Volatile private var connection: Connection? = null
     private var server: Server? = null
 
     /**
@@ -159,16 +173,28 @@ class ChatViewModel(
                 updates.fold(s) { acc, u -> acc.apply(u) }
             }
             val wasConnecting = before?.link == Link.Connecting
-            val reconnected = updates.any { it is CoreUpdate.Reconnected }
+            val kept = updates.any { it is CoreUpdate.SessionKept }
             // A login after a lapse, refused by the server.
             val refused = updates.firstNotNullOfOrNull { (it as? CoreUpdate.Refused)?.code }
+            // Kicked, replaced, refused after a lapse, or a new login made by
+            // the core that will not survive one: nothing will resume it.
+            // Forgotten from here, so a screen that goes before the main
+            // thread hears of it cannot keep it.
+            val over =
+                updates.any {
+                    (it is CoreUpdate.Closed && !it.canResume) ||
+                        (it is CoreUpdate.Reconnected && it.info?.canResume == false)
+                }
+            if (over && !state.value.leaving) {
+                val at = servers.generation()
+                later { servers.forgetSession(server, at) }
+            }
             viewModelScope.launch {
                 if (refused != null) markRefused(server, device, refused, since)
                 if (sink !== this@Sink) return@launch
+                if (kept) save()
                 // The first page waits for the roster that makes the link live.
                 if (wasConnecting && state.value.link == Link.Live) loadEarlier()
-                // A new login made by the core has a new session to keep.
-                if (reconnected) save()
                 if (state.value.fillAfter != null && state.value.link == Link.Live) fill()
             }
         }
@@ -294,7 +320,7 @@ class ChatViewModel(
                     val device = restoreIdentity(registrar, handle, kind, secret, deviceName).also { made = it }
                     val at = servers.generation()
                     handed = true
-                    StoreQueue.scope
+                    queue.scope
                         .async {
                             try {
                                 val replaced =
@@ -429,7 +455,7 @@ class ChatViewModel(
      * device [to] refused, and not resumed with either.
      */
     private suspend fun loginIdentity(
-        conn: ServerConnection,
+        conn: Connection,
         ask: Attempt,
         to: Server,
         fingerprint: String,
@@ -444,7 +470,7 @@ class ChatViewModel(
             val (stored, mine) =
                 withContext(store) { identities.device(fingerprint)?.also { seed = it.second } }
                     ?: throw NoIdentity()
-            when (standing(stored, System.currentTimeMillis() / 1000)) {
+            when (standing(stored, now())) {
                 Standing.Expired -> throw Unusable(Why.CertExpired)
                 Standing.NotYetValid -> throw Unusable(Why.CertNotYetValid)
                 else -> {}
@@ -479,7 +505,7 @@ class ChatViewModel(
         }
         val mine = Sink(to, since)
         sink = mine
-        val conn = ServerConnection(to.url, mine)
+        val conn = open(to.url, mine)
         conn.setForeground(foreground)
         connection = conn
         server = to
@@ -510,6 +536,8 @@ class ChatViewModel(
                 }
                 // Queued after the remember, which a session is kept only beside.
                 save()
+                // A session the server will not let survive a lapse is no session to keep.
+                if (!info.canResume) later { servers.forgetSession(to, since) }
             } catch (_: NoIdentity) {
                 if (!ask.live) return@launch
                 state.update { it.copy(link = Link.Ended(Why.NoIdentity)) }
@@ -629,7 +657,8 @@ class ChatViewModel(
     private fun save() {
         val (conn, to) = (connection ?: return) to (server ?: return)
         if (!established || state.value.leaving) return
-        val saved = conn.saved()
+        // None until the core's first batch: not a reason to forget the one kept.
+        val saved = conn.saved() ?: return
         // Asked for now: a clear that comes first wins, even if this write lands after it.
         val since = servers.generation()
         later { servers.keepSession(to, saved, since) }
@@ -662,7 +691,8 @@ class ChatViewModel(
         conn.hangUp(leaving)
         conn.close()
         val since = servers.generation()
-        if (established || leaving) later { servers.keepSession(to, saved, since) }
+        // Leaving, the kept one goes; staying, the core's, once it has one.
+        if (leaving || saved != null) later { servers.keepSession(to, saved, since) }
     }
 
     private fun why(e: CoreException): Why =

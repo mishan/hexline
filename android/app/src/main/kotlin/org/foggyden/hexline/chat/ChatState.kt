@@ -238,7 +238,7 @@ data class ChatState(
                             },
                         ),
                 )
-            is CoreUpdate.Other -> this
+            is CoreUpdate.Other, is CoreUpdate.SessionKept -> this
         }
 
     fun notSent(why: Why) = appended { Entry.NotSent(it, why) }

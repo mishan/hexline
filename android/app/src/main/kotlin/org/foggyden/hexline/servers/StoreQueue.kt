@@ -1,5 +1,6 @@
 package org.foggyden.hexline.servers
 
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -12,9 +13,14 @@ import kotlinx.coroutines.SupervisorJob
  * its attempt and then writes does both in one task, so one asked for
  * after it cannot come between.
  */
-object StoreQueue {
-    val dispatcher = Dispatchers.IO.limitedParallelism(1)
-
+class StoreQueue(
+    val dispatcher: CoroutineDispatcher,
+) {
     /** For work that must be made whatever becomes of who asked for it. */
     val scope = CoroutineScope(SupervisorJob() + dispatcher)
+
+    companion object {
+        /** The process's: every screen's work in one order. */
+        val process = StoreQueue(Dispatchers.IO.limitedParallelism(1))
+    }
 }
