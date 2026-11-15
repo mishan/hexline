@@ -193,6 +193,25 @@ class SavedServersTest {
     }
 
     @Test
+    fun aClearAskedForBeforeANewerLoginKeptItsOwnLeavesThatOneBe() {
+        val a = Server("wss://a.example/ng", "alice")
+        servers().remember(a, "pw-old")
+        val since = servers().generation()
+        // A newer login keeps its own, then the older one's clear lands.
+        servers().remember(a, "pw-new")
+        servers().keepSession(a, byteArrayOf(4))
+        servers().forgetPassword(a, since)
+        servers().forgetSession(a, since)
+        assertEquals("pw-new", servers().password(a))
+        assertArrayEquals(byteArrayOf(4), servers().session(a))
+        // Its own clear, asked for after them, still clears.
+        servers().forgetPassword(a, servers().generation())
+        servers().forgetSession(a, servers().generation())
+        assertNull(servers().password(a))
+        assertNull(servers().session(a))
+    }
+
+    @Test
     fun aSessionSavedAfterItWasClearedIsNotWrittenBack() {
         val a = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
         servers().remember(a, null)

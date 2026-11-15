@@ -61,7 +61,10 @@ class SavedServers(
 
     fun last(): Server? = all().firstOrNull()
 
-    /** Counts forgets: what [remember] is given to say when it was asked for. */
+    /**
+     * Counts forgets, and what is kept that a forget might undo: what a
+     * login is given to say when it was asked for.
+     */
     fun generation(): Long = synchronized(LOCK) { forgets }
 
     /**
@@ -79,6 +82,7 @@ class SavedServers(
             if (since != null && (forgottenAt[name("list", server)] ?: 0) > since) return false
             write(listOf(server) + all().filter { it != server })
             write(name("password", server), password?.toByteArray())
+            if (password != null) keptAt[name("password", server)] = ++forgets
             true
         }
 
@@ -191,7 +195,18 @@ class SavedServers(
         prefs.edit { putString(SERVERS, list.toString()) }
     }
 
-    fun forgetPassword(server: Server) = secrets.delete(name("password", server))
+    /**
+     * Forgets [server]'s password; with [since], a [generation], not one
+     * kept since, by a newer login than the one that asked.
+     */
+    fun forgetPassword(
+        server: Server,
+        since: Long? = null,
+    ): Unit =
+        synchronized(LOCK) {
+            if (keptSince(name("password", server), since)) return
+            secrets.delete(name("password", server))
+        }
 
     fun password(server: Server): String? = read(name("password", server))?.let { String(it) }
 
@@ -199,10 +214,16 @@ class SavedServers(
 
     /**
      * Forgets [server]'s session, and any write of one asked for before
-     * this: a save on its way out does not bring it back.
+     * this: a save on its way out does not bring it back. With [since], a
+     * [generation], not one kept since, by a newer login than the one
+     * that asked.
      */
-    fun forgetSession(server: Server): Unit =
+    fun forgetSession(
+        server: Server,
+        since: Long? = null,
+    ): Unit =
         synchronized(LOCK) {
+            if (keptSince(name("session", server), since)) return
             forgottenAt[name("session", server)] = ++forgets
             write(name("session", server), null)
         }
@@ -221,8 +242,15 @@ class SavedServers(
     ): Boolean =
         synchronized(LOCK) {
             if (since != null && (forgottenAt[name("session", server)] ?: 0) > since) return false
-            write(name("session", server), session?.takeIf { server in all() })
+            val kept = session?.takeIf { server in all() }
+            write(name("session", server), kept).also { if (it && kept != null) keptAt[name("session", server)] = ++forgets }
         }
+
+    /** Whether [name] was kept after [since]: a clear asked for before it is not this one's. */
+    private fun keptSince(
+        name: String,
+        since: Long?,
+    ) = since != null && (keptAt[name] ?: 0) > since
 
     /** The one server this kept before it kept them all, and its secrets. */
     private fun forgetTheOneKeptBefore() {
@@ -278,6 +306,7 @@ class SavedServers(
         // The process's, under LOCK: a login outlives no process.
         var forgets = 0L
         val forgottenAt = HashMap<String, Long>()
+        val keptAt = HashMap<String, Long>()
 
         /** Where the one server kept before was. */
         const val OLD_URL = "url"

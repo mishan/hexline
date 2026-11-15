@@ -519,8 +519,10 @@ class ChatViewModel(
                 withContext(Dispatchers.IO) {
                     // Refused for good: the saved session is not coming back.
                     // Busy or unreachable, it may yet.
-                    if (saved != null && code != null && !keepsSession(code)) servers.forgetSession(to)
-                    if (code == "login_failed") servers.forgetPassword(to)
+                    // Its own to clear: not if let go of since, nor what a newer login kept.
+                    if (!ask.live) return@withContext
+                    if (saved != null && code != null && !keepsSession(code)) servers.forgetSession(to, since)
+                    if (code == "login_failed") servers.forgetPassword(to, since)
                 }
                 if (!ask.live) return@launch
                 state.update { it.copy(link = Link.Ended(why(e))) }
