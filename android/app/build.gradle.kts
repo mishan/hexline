@@ -81,8 +81,9 @@ android {
     testOptions {
         // The JVM tests call the core through the same bindings, loaded
         // from a build for the host.
-        // The bindings ask Build.VERSION which cleaner to use; on the JVM
-        // the stub answers 0 and they take JNA's.
+        // The bindings ask Build.VERSION which cleaner to use: on the plain
+        // JVM the stub answers 0 and they take JNA's; under Robolectric,
+        // the framework's.
         unitTests.isReturnDefaultValues = true
         unitTests.all {
             it.dependsOn(buildCore)
@@ -118,6 +119,8 @@ dependencies {
 
     testImplementation(libs.junit)
     testImplementation(libs.jna)
+    testImplementation(libs.coroutines.test)
+    testImplementation(libs.robolectric)
 
     androidTestImplementation(platform(libs.compose.bom))
     androidTestImplementation(libs.compose.ui.test.junit4)

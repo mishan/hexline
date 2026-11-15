@@ -42,12 +42,12 @@ class SecretStore(
     context: Context,
     private val alias: String = "hexline-secrets",
     private val dir: File = File(context.filesDir, "secrets"),
-) {
+) : Secrets {
     init {
         dir.mkdirs()
     }
 
-    fun put(
+    override fun put(
         name: String,
         secret: ByteArray,
     ): Unit =
@@ -84,7 +84,7 @@ class SecretStore(
      * The secret, or null if none was put. [SecretUnreadable] if one was and
      * never will open; [SecretUnavailable] if it cannot be opened now.
      */
-    fun get(name: String): ByteArray? =
+    override fun get(name: String): ByteArray? =
         synchronized(LOCK) {
             val sealed =
                 try {
@@ -111,7 +111,7 @@ class SecretStore(
             }
         }
 
-    fun delete(name: String): Unit =
+    override fun delete(name: String): Unit =
         synchronized(LOCK) {
             AtomicFile(file(name)).delete()
         }

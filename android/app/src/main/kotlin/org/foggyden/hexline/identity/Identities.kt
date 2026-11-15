@@ -10,6 +10,7 @@ import org.foggyden.hexline.core.shortHash
 import org.foggyden.hexline.secrets.SecretStore
 import org.foggyden.hexline.secrets.SecretUnavailable
 import org.foggyden.hexline.secrets.SecretUnreadable
+import org.foggyden.hexline.secrets.Secrets
 import org.json.JSONObject
 import java.io.File
 import java.io.FileNotFoundException
@@ -44,7 +45,7 @@ class StoredIdentity(
  */
 class Identities(
     context: Context,
-    private val secrets: SecretStore = SecretStore(context),
+    private val secrets: Secrets = SecretStore(context),
     private val dir: File = File(context.filesDir, "identities"),
 ) {
     init {
