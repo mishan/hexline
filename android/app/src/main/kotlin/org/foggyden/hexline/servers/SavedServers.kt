@@ -114,7 +114,8 @@ class SavedServers(
 
     /**
      * Keeps [server]'s refusal of [device]; with [since], a [generation],
-     * not if [server] has been forgotten since, as [remember] does not.
+     * not if [server] has been forgotten since, nor [device]'s refusals,
+     * as [remember] does not.
      */
     fun markRefused(
         server: Server,
@@ -123,7 +124,7 @@ class SavedServers(
         since: Long? = null,
     ): Unit =
         synchronized(LOCK) {
-            if (since != null && (forgottenAt[name("list", server)] ?: 0) > since) return
+            if (since != null && listOf(name("list", server), deviceName(device)).any { (forgottenAt[it] ?: 0) > since }) return
             val key = refusalKey(server, device)
             keepRefusals { it.filterNot { e -> e.startsWith("$key=") } + "$key=$code" }
         }
@@ -141,6 +142,7 @@ class SavedServers(
     /** Forgets every server's refusal of [device], once it is deleted or replaced. */
     fun forgetRefusalsOf(device: ByteArray): Unit =
         synchronized(LOCK) {
+            forgottenAt[deviceName(device)] = ++forgets
             val mine = "/" + shortHash(device) + "="
             keepRefusals { it.filterNot { e -> mine in e } }
         }
@@ -151,6 +153,9 @@ class SavedServers(
             val mine = name("refused", server) + "/"
             keepRefusals { it.filterNot { e -> e.startsWith(mine) } }
         }
+
+    /** Where [device]'s forgets are counted, apart from any server's. */
+    private fun deviceName(device: ByteArray) = "device-" + shortHash(device)
 
     private fun keepRefusals(change: (Set<String>) -> List<String>) =
         prefs.edit { putStringSet(REFUSED, change(prefs.getStringSet(REFUSED, null).orEmpty()).toSet()) }
@@ -165,8 +170,11 @@ class SavedServers(
     fun askedToLink(
         server: Server,
         asked: Boolean,
+        since: Long? = null,
     ): Unit =
         synchronized(LOCK) {
+            // Not for a server forgotten since its login began.
+            if (since != null && (forgottenAt[name("list", server)] ?: 0) > since) return
             val names = prefs.getStringSet(LINK_ASKED, null).orEmpty().toMutableSet()
             if (asked) names += name("link", server) else names -= name("link", server)
             prefs.edit { putStringSet(LINK_ASKED, names) }

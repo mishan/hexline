@@ -94,7 +94,7 @@ class ChatViewModel(
      * forget or delete lets go of it then.
      */
     private class Attempt(
-        @Volatile var server: Server?,
+        var server: Server?,
     ) {
         @Volatile var live = true
     }
@@ -107,14 +107,26 @@ class ChatViewModel(
 
     private fun attempt(server: Server?) = Attempt(server).also { attempts += it }
 
-    /** Lets go of every attempt [names] could be, and the connection if it is one of them. */
+    private fun letGo(a: Attempt) {
+        a.live = false
+        attempts -= a
+    }
+
+    /**
+     * Lets go of every attempt [names] could be, and the connection if it
+     * is one of them: that one through [leave], which logs it out.
+     */
     private fun letGo(names: (Server) -> Boolean) {
-        for (a in attempts.filter { a -> a.server?.let(names) ?: true }) {
-            a.live = false
-            attempts -= a
-        }
+        for (a in attempts.filter { a -> a !== current && (a.server?.let(names) ?: true) }) letGo(a)
         if (server?.let(names) == true) leave()
     }
+
+    /**
+     * Identities deleted in this process, on the main thread: a connect
+     * asked for after a delete, whose read of the device may come before
+     * the delete's own, signs in with none of them.
+     */
+    private val deleted = mutableSetOf<String>()
 
     /** The connection has been live: what it saves from now on is its own. */
     private var established = false
@@ -194,7 +206,7 @@ class ChatViewModel(
                 withContext(Dispatchers.IO) {
                     publishIdentities()
                     publishRefusals()
-                    savedServers.value = servers.all()
+                    publishServers()
                     servers.last()?.let { Triple(it, servers.session(it), servers.password(it)) }
                 }
             // A session left without leaving: take it up again, unless let go of while it was read.
@@ -223,11 +235,9 @@ class ChatViewModel(
         remember: Boolean,
         link: ClassicLogin? = null,
     ) {
-        // A connect asked for since takes this one's place.
-        for (a in attempts.filter { it.server == wanted }) {
-            a.live = false
-            attempts -= a
-        }
+        // A connect asked for since takes the place of one not yet started;
+        // one started is the connection's, let go of only by leaving it.
+        for (a in attempts.filter { it.server == wanted && it !== current }) letGo(a)
         val ask = attempt(wanted)
         val since = servers.generation()
         viewModelScope.launch {
@@ -253,12 +263,11 @@ class ChatViewModel(
         // nothing will resume or end.
         letGo { it == server }
         viewModelScope.launch {
-            savedServers.value =
-                withContext(Dispatchers.IO) {
-                    servers.forget(server)
-                    publishRefusals()
-                    servers.all()
-                }
+            withContext(Dispatchers.IO) {
+                servers.forget(server)
+                publishRefusals()
+                publishServers()
+            }
         }
     }
 
@@ -292,6 +301,7 @@ class ChatViewModel(
                         }
                         publishIdentities()
                     }
+                    deleted -= device.fingerprint
                     Restoring.Done(device.fingerprint)
                 } catch (e: CoreException) {
                     Restoring.Failed(restoreProblem(e))
@@ -311,10 +321,7 @@ class ChatViewModel(
 
     /** Logs out of the current connection and lets go of it. */
     private fun leave() {
-        current?.let {
-            it.live = false
-            end(it)
-        }
+        current?.let(::letGo)
         current = null
         sink = null
         connection?.let {
@@ -333,6 +340,7 @@ class ChatViewModel(
      */
     fun deleteIdentity(fingerprint: String) {
         val signedIn = SignIn.Identity(fingerprint)
+        deleted += fingerprint
         letGo { it.signIn == signedIn }
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
@@ -369,6 +377,9 @@ class ChatViewModel(
 
     /** Read and shown under one lock, so a slower read is never shown over a newer one. */
     private fun publishIdentities() = synchronized(kept) { kept.value = identities.list() }
+
+    /** As [publishIdentities], for the saved servers. */
+    private fun publishServers() = synchronized(savedServers) { savedServers.value = servers.all() }
 
     /** As [publishIdentities], for the refusals servers made. */
     private fun publishRefusals() = synchronized(refused) { refused.value = servers.refusals() }
@@ -445,11 +456,13 @@ class ChatViewModel(
         ask: Attempt,
     ) {
         if (state.value.link.let { it == Link.Connecting || it == Link.Live || it is Link.Reconnecting }) return end(ask)
-        state.value = ChatState(link = Link.Connecting)
-        current?.let {
-            it.live = false
-            end(it)
+        if ((to.signIn as? SignIn.Identity)?.fingerprint in deleted) {
+            end(ask)
+            state.value = ChatState(link = Link.Ended(Why.NoIdentity))
+            return
         }
+        state.value = ChatState(link = Link.Connecting)
+        current?.let(::letGo)
         current = ask
         connection?.let {
             connection = null
@@ -482,9 +495,9 @@ class ChatViewModel(
                     if (!ask.live) return@withContext
                     if (!servers.remember(to, keep.takeIf { to.signIn == SignIn.Password }, since)) return@withContext
                     if (to.signIn is SignIn.Identity && !info.resumed) {
-                        servers.askedToLink(to, info.outcome != "linked" && (link != null || servers.linkAsked(to)))
+                        servers.askedToLink(to, info.outcome != "linked" && (link != null || servers.linkAsked(to)), since)
                     }
-                    savedServers.value = servers.all()
+                    publishServers()
                 }
                 save()
             } catch (_: NoIdentity) {

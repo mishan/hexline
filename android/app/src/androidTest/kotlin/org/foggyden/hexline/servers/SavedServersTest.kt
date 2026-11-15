@@ -178,6 +178,21 @@ class SavedServersTest {
     }
 
     @Test
+    fun whatALoginBegunBeforeAForgetOrADeleteKeepsIsNotKept() {
+        val a = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
+        val device = ByteArray(32) { 1 }
+        servers().remember(a, null)
+        val since = servers().generation()
+        servers().forgetRefusalsOf(device)
+        servers().markRefused(a, device, "revoked", since)
+        assertNull("a refusal of a device deleted since", servers().refused(a, device))
+
+        servers().forget(a)
+        servers().askedToLink(a, true, since)
+        assertFalse("a link flag for a server forgotten since", servers().linkAsked(a))
+    }
+
+    @Test
     fun aSessionSavedAfterItWasClearedIsNotWrittenBack() {
         val a = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
         servers().remember(a, null)
