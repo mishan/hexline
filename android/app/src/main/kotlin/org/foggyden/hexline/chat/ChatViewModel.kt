@@ -13,7 +13,6 @@ import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -85,18 +84,37 @@ class ChatViewModel(
     private var server: Server? = null
 
     /**
-     * A connect reading its server's secrets, before it starts: one of its
-     * own, so a connect to the same server asked for after a forget is not
-     * taken for the one the forget canceled.
+     * One connection asked for (a connect, the resume at launch), from the
+     * moment it is asked, on the main thread before anything waits, to its
+     * login landing or failing. A forget or a delete that could name it
+     * lets go of it, on the main thread before its own work, and every
+     * step after a wait asks [live] first: nothing is started, proved, or
+     * kept for a server or an identity let go of. [server] is null while
+     * the launch's resume has yet to read which server it is, and any
+     * forget or delete lets go of it then.
      */
-    private class Pending(
-        val server: Server,
-    )
+    private class Attempt(
+        @Volatile var server: Server?,
+    ) {
+        @Volatile var live = true
+    }
 
-    private var pending: Pending? = null
+    /** Every attempt not yet over; on the main thread. */
+    private val attempts = mutableListOf<Attempt>()
 
-    /** What logs [connection] in: canceled with it, so it never calls on one closed. */
-    private var setup: Job? = null
+    /** The attempt [connection] came of: let go of with it. */
+    private var current: Attempt? = null
+
+    private fun attempt(server: Server?) = Attempt(server).also { attempts += it }
+
+    /** Lets go of every attempt [names] could be, and the connection if it is one of them. */
+    private fun letGo(names: (Server) -> Boolean) {
+        for (a in attempts.filter { a -> a.server?.let(names) ?: true }) {
+            a.live = false
+            attempts -= a
+        }
+        if (server?.let(names) == true) leave()
+    }
 
     /** The connection has been live: what it saves from now on is its own. */
     private var established = false
@@ -169,6 +187,8 @@ class ChatViewModel(
     init {
         connectivity.registerDefaultNetworkCallback(network, Handler(Looper.getMainLooper()))
         ProcessLifecycleOwner.get().lifecycle.addObserver(lifecycle)
+        val ask = attempt(null)
+        val since = servers.generation()
         viewModelScope.launch {
             val found =
                 withContext(Dispatchers.IO) {
@@ -176,11 +196,20 @@ class ChatViewModel(
                     publishRefusals()
                     savedServers.value = servers.all()
                     servers.last()?.let { Triple(it, servers.session(it), servers.password(it)) }
-                } ?: return@launch
+                }
+            // A session left without leaving: take it up again, unless let go of while it was read.
+            if (found == null || found.second == null || !ask.live) {
+                end(ask)
+                return@launch
+            }
             val (last, session, password) = found
-            // A session left without leaving: take it up again.
-            if (session != null) start(last, password, null, session, keep = password, since = servers.generation())
+            ask.server = last
+            start(last, password, null, session, keep = password, since = since, ask = ask)
         }
+    }
+
+    private fun end(ask: Attempt) {
+        attempts -= ask
     }
 
     /**
@@ -194,8 +223,12 @@ class ChatViewModel(
         remember: Boolean,
         link: ClassicLogin? = null,
     ) {
-        val mine = Pending(wanted)
-        pending = mine
+        // A connect asked for since takes this one's place.
+        for (a in attempts.filter { it.server == wanted }) {
+            a.live = false
+            attempts -= a
+        }
+        val ask = attempt(wanted)
         val since = servers.generation()
         viewModelScope.launch {
             val (kept, saved) =
@@ -204,10 +237,9 @@ class ChatViewModel(
                 } else {
                     null to null
                 }
-            // Forgotten, or another connect asked for, while its secrets were read.
-            if (pending !== mine) return@launch
-            pending = null
-            start(wanted, password ?: kept, link, saved, passwordToKeep(password, kept, remember), since)
+            // Let go of while its secrets were read.
+            if (!ask.live) return@launch end(ask)
+            start(wanted, password ?: kept, link, saved, passwordToKeep(password, kept, remember), since, ask)
         }
     }
 
@@ -217,10 +249,9 @@ class ChatViewModel(
      * out) remembers it again.
      */
     fun forget(server: Server) {
-        if (pending?.server == server) pending = null
         // Forgetting a server is leaving it: no session is left behind that
         // nothing will resume or end.
-        if (server == this.server) leave()
+        letGo { it == server }
         viewModelScope.launch {
             savedServers.value =
                 withContext(Dispatchers.IO) {
@@ -280,7 +311,11 @@ class ChatViewModel(
 
     /** Logs out of the current connection and lets go of it. */
     private fun leave() {
-        setup?.cancel()
+        current?.let {
+            it.live = false
+            end(it)
+        }
+        current = null
         sink = null
         connection?.let {
             it.hangUp(true)
@@ -298,8 +333,7 @@ class ChatViewModel(
      */
     fun deleteIdentity(fingerprint: String) {
         val signedIn = SignIn.Identity(fingerprint)
-        if (pending?.server?.signIn == signedIn) pending = null
-        if (server?.signIn == signedIn) leave()
+        letGo { it.signIn == signedIn }
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
                 val device =
@@ -371,6 +405,7 @@ class ChatViewModel(
      */
     private suspend fun loginIdentity(
         conn: ServerConnection,
+        ask: Attempt,
         to: Server,
         fingerprint: String,
         create: Boolean,
@@ -390,8 +425,9 @@ class ChatViewModel(
                 else -> {}
             }
             withContext(Dispatchers.IO) { servers.refused(to, stored.info.device) }?.let { throw Unusable(refusal(it)) }
-            // Let go of while the reads were made: a closed connection takes no call.
-            if (connection !== conn) throw CancellationException("let go of")
+            // Let go of while the reads were made: nothing is proved for it,
+            // and its connection, closed, would take no call.
+            if (!ask.live) throw CancellationException("let go of")
             proving(stored.info.device)
             return conn.loginIdentity(DeviceIdentity(mine, stored.cert, stored.card), create, link, saved)
         } finally {
@@ -406,10 +442,15 @@ class ChatViewModel(
         saved: ByteArray?,
         keep: String?,
         since: Long,
+        ask: Attempt,
     ) {
-        if (state.value.link.let { it == Link.Connecting || it == Link.Live || it is Link.Reconnecting }) return
+        if (state.value.link.let { it == Link.Connecting || it == Link.Live || it is Link.Reconnecting }) return end(ask)
         state.value = ChatState(link = Link.Connecting)
-        setup?.cancel()
+        current?.let {
+            it.live = false
+            end(it)
+        }
+        current = ask
         connection?.let {
             connection = null
             it.close()
@@ -421,58 +462,59 @@ class ChatViewModel(
         connection = conn
         server = to
         established = false
-        setup =
-            viewModelScope.launch {
-                try {
-                    val info =
-                        when (val how = to.signIn) {
-                            SignIn.Password -> conn.login(loginFor(to, password, saved), password, saved)
-                            is SignIn.Identity -> {
-                                // An account named to link and not linked yet is
-                                // never made in its place.
-                                val asked = link != null || withContext(Dispatchers.IO) { servers.linkAsked(to) }
-                                loginIdentity(conn, to, how.fingerprint, !asked, link, saved) { mine.device = it }
-                            }
+        viewModelScope.launch {
+            try {
+                val info =
+                    when (val how = to.signIn) {
+                        SignIn.Password -> conn.login(loginFor(to, password, saved), password, saved)
+                        is SignIn.Identity -> {
+                            // An account named to link and not linked yet is
+                            // never made in its place.
+                            val asked = link != null || withContext(Dispatchers.IO) { servers.linkAsked(to) }
+                            loginIdentity(conn, ask, to, how.fingerprint, !asked, link, saved) { mine.device = it }
                         }
-                    // Forgotten while logging in: nothing of it is kept.
-                    if (connection !== conn) return@launch
-                    established = true
-                    state.update { if (info.resumed) it.copy(outcome = info.outcome) else it.signedIn(info.outcome) }
-                    withContext(Dispatchers.IO) {
-                        if (connection !== conn) return@withContext
-                        if (!servers.remember(to, keep.takeIf { to.signIn == SignIn.Password }, since)) return@withContext
-                        if (to.signIn is SignIn.Identity && !info.resumed) {
-                            servers.askedToLink(to, info.outcome != "linked" && (link != null || servers.linkAsked(to)))
-                        }
-                        savedServers.value = servers.all()
                     }
-                    save()
-                } catch (_: NoIdentity) {
-                    if (connection !== conn) return@launch
-                    state.update { it.copy(link = Link.Ended(Why.NoIdentity)) }
-                } catch (e: Unusable) {
-                    if (connection !== conn) return@launch
-                    state.update { it.copy(link = Link.Ended(e.why)) }
-                } catch (_: SecretUnavailable) {
-                    if (connection !== conn) return@launch
-                    state.update { it.copy(link = Link.Ended(Why.KeyLocked)) }
-                } catch (e: CoreException) {
-                    val code = (e as? CoreException.Refused)?.code
-                    // Kept whether or not this is still the connection: the
-                    // server said it of this device, and a forget since is
-                    // honored by the generation.
-                    if (code != null) markRefused(to, mine.device, code, since)
-                    if (connection !== conn) return@launch
-                    withContext(Dispatchers.IO) {
-                        // Refused for good: the saved session is not coming back.
-                        // Busy or unreachable, it may yet.
-                        if (saved != null && code != null && !keepsSession(code)) servers.forgetSession(to)
-                        if (code == "login_failed") servers.forgetPassword(to)
+                // Let go of while logging in: nothing of it is kept.
+                if (!ask.live) return@launch
+                established = true
+                state.update { if (info.resumed) it.copy(outcome = info.outcome) else it.signedIn(info.outcome) }
+                withContext(Dispatchers.IO) {
+                    if (!ask.live) return@withContext
+                    if (!servers.remember(to, keep.takeIf { to.signIn == SignIn.Password }, since)) return@withContext
+                    if (to.signIn is SignIn.Identity && !info.resumed) {
+                        servers.askedToLink(to, info.outcome != "linked" && (link != null || servers.linkAsked(to)))
                     }
-                    if (connection !== conn) return@launch
-                    state.update { it.copy(link = Link.Ended(why(e))) }
+                    savedServers.value = servers.all()
                 }
+                save()
+            } catch (_: NoIdentity) {
+                if (!ask.live) return@launch
+                state.update { it.copy(link = Link.Ended(Why.NoIdentity)) }
+            } catch (e: Unusable) {
+                if (!ask.live) return@launch
+                state.update { it.copy(link = Link.Ended(e.why)) }
+            } catch (_: SecretUnavailable) {
+                if (!ask.live) return@launch
+                state.update { it.copy(link = Link.Ended(Why.KeyLocked)) }
+            } catch (e: CoreException) {
+                val code = (e as? CoreException.Refused)?.code
+                // Kept whether or not this is still the connection: the
+                // server said it of this device, and a forget since is
+                // honored by the generation.
+                if (code != null) markRefused(to, mine.device, code, since)
+                if (!ask.live) return@launch
+                withContext(Dispatchers.IO) {
+                    // Refused for good: the saved session is not coming back.
+                    // Busy or unreachable, it may yet.
+                    if (saved != null && code != null && !keepsSession(code)) servers.forgetSession(to)
+                    if (code == "login_failed") servers.forgetPassword(to)
+                }
+                if (!ask.live) return@launch
+                state.update { it.copy(link = Link.Ended(why(e))) }
+            } finally {
+                end(ask)
             }
+        }
     }
 
     fun send(text: String) {
