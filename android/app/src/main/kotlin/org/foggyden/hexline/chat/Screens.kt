@@ -74,6 +74,8 @@ internal fun describe(why: Why): String =
         Why.NotHonored -> stringResource(R.string.why_not_honored)
         Why.BadCredentials -> stringResource(R.string.why_bad_credentials)
         Why.KeyLocked -> stringResource(R.string.why_key_locked)
+        Why.CertExpired -> stringResource(R.string.why_cert_expired)
+        Why.CertNotYetValid -> stringResource(R.string.why_cert_not_yet_valid)
         is Why.Refused -> stringResource(R.string.why_refused, why.code)
     }
 

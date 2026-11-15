@@ -11,6 +11,7 @@ import org.foggyden.hexline.secrets.SecretUnreadable
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicLong
 
 /** How a server is signed in to. */
 sealed interface SignIn {
@@ -61,8 +62,12 @@ class SavedServers(
 
     fun last(): Server? = all().firstOrNull()
 
-    /** Counts forgets: what [remember] is given to say when it was asked for. */
-    fun generation(): Long = synchronized(LOCK) { forgets }
+    /**
+     * A ticket for an act asked for now, later than every one before it:
+     * taken as the act is asked for and handed to it, so acts are ordered
+     * here by when they were asked for, not by when they ran.
+     */
+    fun generation(): Long = tickets.incrementAndGet()
 
     /**
      * [server] is the last; its password is kept, or with null forgotten.
@@ -79,18 +84,96 @@ class SavedServers(
             if (since != null && (forgottenAt[name("list", server)] ?: 0) > since) return false
             write(listOf(server) + all().filter { it != server })
             write(name("password", server), password?.toByteArray())
+            if (password != null) kept(name("password", server), since)
             true
         }
 
-    /** [server] is forgotten whole, its secrets with it. */
-    fun forget(server: Server): Unit =
+    /** [server] is forgotten whole, its secrets with it; [at], a [generation], when that was asked for. */
+    fun forget(
+        server: Server,
+        at: Long? = null,
+    ): Unit =
         synchronized(LOCK) {
-            forgottenAt[name("list", server)] = ++forgets
+            forgotten(name("list", server), at)
+            // And its session: a save asked for before this is the forgotten one's,
+            // even once a newer login has remembered the server again.
+            forgotten(name("session", server), at)
             write(all().filter { it != server })
             secrets.delete(name("password", server))
             secrets.delete(name("session", server))
             askedToLink(server, false)
+            forgetRefusals(server)
         }
+
+    /**
+     * What [server] refused [device] as, `revoked` or `rotated`, or null.
+     * Kept for that server and that device alone: a server's word, not
+     * signed by anyone, is no reason to stop signing in elsewhere, and a
+     * new device, as a renewal makes, starts with none.
+     */
+    fun refused(
+        server: Server,
+        device: ByteArray,
+    ): String? = refusals()[refusalKey(server, device)]
+
+    /** Every refusal kept, by [refusalKey]: for a screen to look up without the disk. */
+    fun refusals(): Map<String, String> =
+        prefs
+            .getStringSet(REFUSED, null)
+            .orEmpty()
+            .mapNotNull { it.split('=', limit = 2).takeIf { p -> p.size == 2 }?.let { p -> p[0] to p[1] } }
+            .toMap()
+
+    /**
+     * Keeps [server]'s refusal of [device]; with [since], a [generation],
+     * not if [server] has been forgotten since, nor [device]'s refusals,
+     * as [remember] does not.
+     */
+    fun markRefused(
+        server: Server,
+        device: ByteArray,
+        code: String,
+        since: Long? = null,
+    ): Unit =
+        synchronized(LOCK) {
+            if (since != null && listOf(name("list", server), deviceName(device)).any { (forgottenAt[it] ?: 0) > since }) return
+            val key = refusalKey(server, device)
+            keepRefusals { it.filterNot { e -> e.startsWith("$key=") } + "$key=$code" }
+        }
+
+    /** Forgets [server]'s refusal of [device], for a login to try again. */
+    fun forgetRefusal(
+        server: Server,
+        device: ByteArray,
+    ): Unit =
+        synchronized(LOCK) {
+            val key = refusalKey(server, device)
+            keepRefusals { it.filterNot { e -> e.startsWith("$key=") } }
+        }
+
+    /** Forgets every server's refusal of [device], once it is deleted or replaced; [at] as for [forget]. */
+    fun forgetRefusalsOf(
+        device: ByteArray,
+        at: Long? = null,
+    ): Unit =
+        synchronized(LOCK) {
+            forgotten(deviceName(device), at)
+            val mine = "/" + shortHash(device) + "="
+            keepRefusals { it.filterNot { e -> mine in e } }
+        }
+
+    /** Forgets every device's refusal by [server]. */
+    fun forgetRefusals(server: Server): Unit =
+        synchronized(LOCK) {
+            val mine = name("refused", server) + "/"
+            keepRefusals { it.filterNot { e -> e.startsWith(mine) } }
+        }
+
+    /** Where [device]'s forgets are counted, apart from any server's. */
+    private fun deviceName(device: ByteArray) = "device-" + shortHash(device)
+
+    private fun keepRefusals(change: (Set<String>) -> List<String>) =
+        prefs.edit { putStringSet(REFUSED, change(prefs.getStringSet(REFUSED, null).orEmpty()).toSet()) }
 
     /**
      * Whether an account was named to link [server]'s identity to and the
@@ -102,8 +185,11 @@ class SavedServers(
     fun askedToLink(
         server: Server,
         asked: Boolean,
+        since: Long? = null,
     ): Unit =
         synchronized(LOCK) {
+            // Not for a server forgotten since its login began.
+            if (since != null && (forgottenAt[name("list", server)] ?: 0) > since) return
             val names = prefs.getStringSet(LINK_ASKED, null).orEmpty().toMutableSet()
             if (asked) names += name("link", server) else names -= name("link", server)
             prefs.edit { putStringSet(LINK_ASKED, names) }
@@ -120,22 +206,80 @@ class SavedServers(
         prefs.edit { putString(SERVERS, list.toString()) }
     }
 
-    fun forgetPassword(server: Server) = secrets.delete(name("password", server))
+    /**
+     * Forgets [server]'s password; with [since], a [generation], not one
+     * kept since, by a newer login than the one that asked.
+     */
+    fun forgetPassword(
+        server: Server,
+        since: Long? = null,
+    ): Unit =
+        synchronized(LOCK) {
+            if (keptSince(name("password", server), since)) return
+            secrets.delete(name("password", server))
+        }
 
     fun password(server: Server): String? = read(name("password", server))?.let { String(it) }
 
     fun session(server: Server): ByteArray? = read(name("session", server))
 
     /**
+     * Forgets [server]'s session, and any write of one asked for before
+     * this: a save on its way out does not bring it back. With [since], a
+     * [generation], not one kept since, by a newer login than the one
+     * that asked.
+     */
+    fun forgetSession(
+        server: Server,
+        since: Long? = null,
+    ): Unit =
+        synchronized(LOCK) {
+            if (keptSince(name("session", server), since)) return
+            forgotten(name("session", server), since)
+            write(name("session", server), null)
+        }
+
+    /**
      * The session to resume [server] with, or with null none. A server
      * forgotten, or never saved, keeps none: a connection let go of may
-     * still be saving its own on the way out. False if it could not be
-     * written now.
+     * still be saving its own on the way out. With [since], a
+     * [generation], none if the session was forgotten since. False if it
+     * could not be written now.
      */
     fun keepSession(
         server: Server,
         session: ByteArray?,
-    ): Boolean = synchronized(LOCK) { write(name("session", server), session?.takeIf { server in all() }) }
+        since: Long? = null,
+    ): Boolean =
+        synchronized(LOCK) {
+            if (since != null && (forgottenAt[name("session", server)] ?: 0) > since) return false
+            // Nor over one a newer save kept.
+            if (keptSince(name("session", server), since)) return false
+            val kept = session?.takeIf { server in all() }
+            write(name("session", server), kept).also { if (it && kept != null) kept(name("session", server), since) }
+        }
+
+    /** [name] forgotten, by an act asked for [at] (now, if not said); under [LOCK]. */
+    private fun forgotten(
+        name: String,
+        at: Long?,
+    ) {
+        forgottenAt[name] = maxOf(forgottenAt[name] ?: 0, at ?: generation())
+    }
+
+    /** [name] kept, as [forgotten] is forgotten. */
+    private fun kept(
+        name: String,
+        at: Long?,
+    ) {
+        keptAt[name] = maxOf(keptAt[name] ?: 0, at ?: generation())
+    }
+
+    /** Whether [name] was kept after [since]: a clear asked for before it is not this one's. */
+    private fun keptSince(
+        name: String,
+        since: Long?,
+    ) = since != null && (keptAt[name] ?: 0) > since
 
     /** The one server this kept before it kept them all, and its secrets. */
     private fun forgetTheOneKeptBefore() {
@@ -172,18 +316,10 @@ class SavedServers(
             null
         }
 
-    /** A secret's name, from the server and how it is signed in to: never a file name a person typed. */
     private fun name(
         kind: String,
         server: Server,
-    ): String {
-        val whom =
-            when (val s = server.signIn) {
-                SignIn.Password -> server.login?.let { listOf("login", it) } ?: listOf("guest")
-                is SignIn.Identity -> listOf("identity", s.fingerprint)
-            }
-        return kind + "-" + partsHash(listOf(server.url) + whom)
-    }
+    ) = nameOf(kind, server)
 
     private companion object {
         const val SERVERS = "servers"
@@ -191,16 +327,40 @@ class SavedServers(
         const val LOGIN = "login"
         const val IDENTITY = "identity"
         const val LINK_ASKED = "link_asked"
+        const val REFUSED = "refused"
 
         /** One for the process: each change reads the list, then writes it whole. */
         val LOCK = Any()
 
+        // Apart from LOCK, which a write holds across the Keystore: a ticket is
+        // taken on the main thread, and must not wait for one.
+        val tickets = AtomicLong()
+
         // The process's, under LOCK: a login outlives no process.
-        var forgets = 0L
         val forgottenAt = HashMap<String, Long>()
+        val keptAt = HashMap<String, Long>()
 
         /** Where the one server kept before was. */
         const val OLD_URL = "url"
         const val OLD_LOGIN = "login"
     }
 }
+
+/** A secret's name, from the server and how it is signed in to: never a file name a person typed. */
+private fun nameOf(
+    kind: String,
+    server: Server,
+): String {
+    val whom =
+        when (val s = server.signIn) {
+            SignIn.Password -> server.login?.let { listOf("login", it) } ?: listOf("guest")
+            is SignIn.Identity -> listOf("identity", s.fingerprint)
+        }
+    return kind + "-" + partsHash(listOf(server.url) + whom)
+}
+
+/** Where a refusal of [device] by [server] is kept, in [SavedServers.refusals]. */
+fun refusalKey(
+    server: Server,
+    device: ByteArray,
+): String = nameOf("refused", server) + "/" + shortHash(device)

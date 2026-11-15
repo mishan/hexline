@@ -13,7 +13,9 @@ mod tls;
 pub use connection::{
     ClassicLogin, CoreError, CoreUpdate, DeviceIdentity, LoginInfo, ServerConnection, UpdateSink,
 };
-pub use identity::{cert_for_device, cert_info, new_device, CertInfo, NewDevice};
+pub use identity::{
+    cert_for_device, cert_info, cert_time, new_device, CertInfo, CertTime, NewDevice,
+};
 pub use model::{ChatLine, HistoryPage, Status, User};
 pub use names::{parts_hash, short_hash};
 pub use restore::{restore_identity, Restored, SecretKind};

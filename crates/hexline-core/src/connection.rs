@@ -677,6 +677,7 @@ async fn begin(
         .flatten()
         .filter(|k| k.fingerprint.as_deref() == creds.fingerprint())
     {
+        creds.in_time()?;
         let start = Start::Resume(kept.resumable.clone());
         match establish(url, &start, Some(&kept), true, None).await {
             Err(CoreError::Refused { code, detail }) if gone(&code) => {
@@ -731,6 +732,14 @@ impl Credentials {
         }
     }
 
+    /// An identity's device certificate within its time (`identity::in_time`).
+    fn in_time(&self) -> Result<(), CoreError> {
+        match self {
+            Credentials::Password(_) => Ok(()),
+            Credentials::Identity { device, .. } => crate::identity::in_time(&device.cert),
+        }
+    }
+
     fn may_log_in_again(&self, guest: bool) -> bool {
         match self {
             Credentials::Password(p) => p.login.is_some() || guest,
@@ -755,6 +764,7 @@ async fn log_in(
             create,
             fingerprint,
         } => {
+            crate::identity::in_time(&device.cert)?;
             let start = Start::Login(LoginParams::default());
             // A challenge lapsed between its two requests, or a token the
             // upgrade refused (a server restarted, a slow link): proved
@@ -1043,6 +1053,14 @@ fn ended(code: &str) -> CoreError {
 }
 
 /// Whether a refusal may pass if the core tries again later.
+/// Whether a server's refusal `code` holds against this device until it
+/// is replaced: the server refused the key itself, not this one login, so
+/// asking it again as it is will be refused again.
+#[uniffi::export]
+pub fn refusal_lasts(code: String) -> bool {
+    matches!(code.as_str(), "revoked" | "rotated")
+}
+
 fn for_now(code: &str) -> bool {
     matches!(
         code,
@@ -1127,6 +1145,7 @@ async fn supervise(
             let tried = async {
                 match &known {
                     Some(k) => {
+                        creds.in_time()?;
                         let start = Start::Resume(k.resumable.clone());
                         establish(&url, &start, Some(k), false, None).await
                     }

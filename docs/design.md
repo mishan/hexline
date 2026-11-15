@@ -122,11 +122,17 @@ single tokio runtime lives in the core for the process.
 
 ### 2.1 Three ways a phone gets an identity
 
-| Mode | Phone holds | First run | Renewal (90 days, at one-third left) |
+| Mode | Phone holds | First run | Renewal (90-day certificates) |
 |---|---|---|---|
 | **Holder** | identity seed (wrapped), device keys | Generate identity + device; self-certify; card; register a handle; make the recovery code (§2.2) and the successor (§2.2) and confirm both were written down **before** the registration that commits them; put a passphrase envelope where the registrar serves them | Self-mint, behind a biometric/PIN prompt |
 | **Enrolled device** | device keys only | Scan the QR an `hlid` (or another Hexline holder) draws, or type the code; the mailbox flow of `identity-enrollment.md` §5 | `prev`-renewal through the mailbox to a standing holder (`hlid agent`); `no_holder` falls back to a code, so without an agent expect a code a quarter |
 | **Envelope** | device keys only; seed for seconds | Handle + passphrase (or recovery code) → fetch envelope → unwrap → mint own cert → drop seed (`identity-registrar.md` §9.4) | Same: passphrase, unwrap, mint, drop. Needs registrar envelopes, which are not built (§2.4) |
+
+When renewal is asked for: a holder self-mints silently once a third of
+the certificate's life is left. Envelope and enrolled devices need the
+person (a passphrase, a code), so the app asks from 14 days before expiry
+(decided 2026-11-13), with a banner, and refuses identity sign-in itself
+once the certificate has expired.
 
 A user can move between them: an envelope device can promote itself to
 holder (keep the seed, wrapped), and a holder can demote (forget it).
@@ -378,7 +384,8 @@ Slices, in order:
    (or recovery code), salt lookup, fetch, unwrap, mint the device's own
    cert, drop the identity seed. Renewal asks again.
 4. **Identity in the UI:** a server's sign-in choice, account linking,
-   "revoked", renewal, and screens that need `manage`.
+   "revoked", renewal asked from 14 days before expiry (§2.1), and which
+   capabilities the device has. Screens that need `manage` come with 6c.
 5. **Enrolled-device mode** by typed code. A QR scanner (ZXing core,
    Apache-2.0) comes later.
 6. **Holder mode:** 6a Key B behind a per-use prompt; 6b creation with

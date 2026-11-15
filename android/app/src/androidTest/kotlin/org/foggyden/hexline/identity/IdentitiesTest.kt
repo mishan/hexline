@@ -37,7 +37,7 @@ class IdentitiesTest {
     @Test
     fun anIdentityKeptIsListedWithoutItsSeedAndForgottenWhole() {
         assertTrue(identities().list().isEmpty())
-        val kept = identities().save(SEED.copyOf(), CERT, CARD, "alice@example")
+        val kept = identities().save(SEED.copyOf(), CERT, CARD, "alice@example", null)
         assertEquals(FINGERPRINT, kept.fingerprint)
         val listed = identities().list().single()
         assertEquals(listOf(FINGERPRINT, "alice@example"), listOf(listed.fingerprint, listed.handle))
@@ -56,24 +56,32 @@ class IdentitiesTest {
 
     @Test
     fun aNewDeviceTakesTheIdentitysPlaceAndTheOldSeedGoes() {
-        identities().save(SEED.copyOf(), CERT, CARD, null)
-        identities().save(SEED2.copyOf(), CERT2, CARD, null)
+        identities().save(SEED.copyOf(), CERT, CARD, null, null)
+        identities().save(SEED2.copyOf(), CERT2, CARD, null, null)
         assertArrayEquals(CERT2, identities().list().single().cert)
         assertArrayEquals(SEED2, identities().device(FINGERPRINT)?.second)
         assertEquals("one seed left", 1, secrets.listFiles().orEmpty().size)
     }
 
     @Test
+    fun theRegistrarAnIdentityCameFromIsKeptToRenewItAt() {
+        identities().save(SEED.copyOf(), CERT, CARD, "alice@example", "reg.example")
+        assertEquals("reg.example", identities().list().single().registrar)
+        identities().save(SEED2.copyOf(), CERT2, CARD, "alice@example", "reg.example")
+        assertEquals("a new device keeps it", "reg.example", identities().list().single().registrar)
+    }
+
+    @Test
     fun aCertificateIsKeptOnlyBesideTheKeyItCertifies() {
-        assertThrows(CoreException::class.java) { identities().save(OTHER, CERT, CARD, null) }
-        assertThrows(CoreException::class.java) { identities().save(SEED.copyOf(), byteArrayOf(1, 2, 3), CARD, null) }
+        assertThrows(CoreException::class.java) { identities().save(OTHER, CERT, CARD, null, null) }
+        assertThrows(CoreException::class.java) { identities().save(SEED.copyOf(), byteArrayOf(1, 2, 3), CARD, null, null) }
         assertTrue(identities().list().isEmpty())
         assertTrue("nothing written", secrets.listFiles().isNullOrEmpty() && files().isEmpty())
     }
 
     @Test
     fun aFileAlteredOrCutShortListsAsNothingAndTheRestStillList() {
-        identities().save(SEED.copyOf(), CERT, CARD, null)
+        identities().save(SEED.copyOf(), CERT, CARD, null, null)
         val file = files().single()
         val good = file.readText()
         for (bad in listOf("{", good.replace("\"cert\"", "\"crt\""), good.replace("\"card\":\"", "\"card\":\"AAAA"))) {
@@ -88,7 +96,7 @@ class IdentitiesTest {
 
     @Test
     fun anIdentityLeftOnlyInItsBackupIsListed() {
-        identities().save(SEED.copyOf(), CERT, CARD, null)
+        identities().save(SEED.copyOf(), CERT, CARD, null, null)
         val file = files().single()
         file.renameTo(File(dir, file.name + ".bak"))
         assertEquals(listOf(FINGERPRINT), identities().list().map { it.fingerprint })
@@ -96,7 +104,7 @@ class IdentitiesTest {
 
     @Test
     fun anIdentityWhoseSeedWillNeverOpenIsForgotten() {
-        identities().save(SEED.copyOf(), CERT, CARD, null)
+        identities().save(SEED.copyOf(), CERT, CARD, null, null)
         KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(alias)
         assertNull(identities().device(FINGERPRINT)?.second)
         assertTrue(identities().list().isEmpty())

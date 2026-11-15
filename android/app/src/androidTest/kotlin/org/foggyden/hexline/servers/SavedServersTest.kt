@@ -147,6 +147,129 @@ class SavedServersTest {
     }
 
     @Test
+    fun aRefusalIsKeptForItsServerAndDeviceAloneUntilTheServerIsForgotten() {
+        val a = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
+        val b = Server("wss://b.example/ng", null, SignIn.Identity("fp-x"))
+        val (device, renewed) = ByteArray(32) { 1 } to ByteArray(32) { 2 }
+        servers().remember(a, null)
+        servers().markRefused(a, device, "revoked")
+        assertEquals("revoked", servers().refused(a, device))
+        assertNull("another server", servers().refused(b, device))
+        assertNull("a new device", servers().refused(a, renewed))
+        servers().forget(a)
+        assertNull("forgotten with its server", servers().refused(a, device))
+    }
+
+    @Test
+    fun aDevicesRefusalsGoWithItAndAnotherDevicesStay() {
+        val a = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
+        val b = Server("wss://b.example/ng", null, SignIn.Identity("fp-x"))
+        val (device, other) = ByteArray(32) { 1 } to ByteArray(32) { 2 }
+        for (s in listOf(a, b)) {
+            servers().remember(s, null)
+            servers().markRefused(s, device, "revoked")
+            servers().markRefused(s, other, "rotated")
+        }
+        servers().forgetRefusalsOf(device)
+        assertEquals(listOf(null, null), listOf(servers().refused(a, device), servers().refused(b, device)))
+        assertEquals(listOf("rotated", "rotated"), listOf(servers().refused(a, other), servers().refused(b, other)))
+        servers().forgetRefusal(a, other)
+        assertEquals("tried again there alone", listOf(null, "rotated"), listOf(servers().refused(a, other), servers().refused(b, other)))
+    }
+
+    @Test
+    fun whatALoginBegunBeforeAForgetOrADeleteKeepsIsNotKept() {
+        val a = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
+        val device = ByteArray(32) { 1 }
+        servers().remember(a, null)
+        val since = servers().generation()
+        servers().forgetRefusalsOf(device)
+        servers().markRefused(a, device, "revoked", since)
+        assertNull("a refusal of a device deleted since", servers().refused(a, device))
+
+        servers().forget(a)
+        servers().askedToLink(a, true, since)
+        assertFalse("a link flag for a server forgotten since", servers().linkAsked(a))
+    }
+
+    @Test
+    fun aClearAskedForBeforeANewerLoginKeptItsOwnLeavesThatOneBe() {
+        val a = Server("wss://a.example/ng", "alice")
+        servers().remember(a, "pw-old")
+        val since = servers().generation()
+        // A newer login keeps its own, then the older one's clear lands.
+        servers().remember(a, "pw-new")
+        servers().keepSession(a, byteArrayOf(4))
+        servers().forgetPassword(a, since)
+        servers().forgetSession(a, since)
+        assertEquals("pw-new", servers().password(a))
+        assertArrayEquals(byteArrayOf(4), servers().session(a))
+        // Its own clear, asked for after them, still clears.
+        servers().forgetPassword(a, servers().generation())
+        servers().forgetSession(a, servers().generation())
+        assertNull(servers().password(a))
+        assertNull(servers().session(a))
+    }
+
+    @Test
+    fun actsAreOrderedByWhenTheyWereAskedForNotWhenTheyRan() {
+        val a = Server("wss://a.example/ng", "alice")
+        servers().remember(a, null)
+        // A forget, then a login asked for after it: the forget runs first.
+        val forget = servers().generation()
+        val login = servers().generation()
+        servers().forget(a, forget)
+        assertTrue("a login asked for after a forget", servers().remember(a, "pw", login))
+        // A clear, then a save asked for after it: the clear runs first.
+        val clear = servers().generation()
+        val save = servers().generation()
+        servers().forgetSession(a, clear)
+        servers().keepSession(a, byteArrayOf(4), save)
+        assertArrayEquals("a save asked for after a clear", byteArrayOf(4), servers().session(a))
+    }
+
+    @Test
+    fun anOlderSaveNeverOverwritesANewerOneNorOutlivesAForget() {
+        val a = Server("wss://a.example/ng", "alice")
+        servers().remember(a, null)
+        val older = servers().generation()
+        servers().keepSession(a, byteArrayOf(2), servers().generation())
+        servers().keepSession(a, byteArrayOf(1), older)
+        assertArrayEquals("the newer save stands", byteArrayOf(2), servers().session(a))
+
+        // A forget, then the server remembered again by a newer login: a
+        // save asked for before the forget is still the forgotten one's.
+        val beforeForget = servers().generation()
+        servers().forget(a, servers().generation())
+        servers().remember(a, null, servers().generation())
+        servers().keepSession(a, byteArrayOf(3), beforeForget)
+        assertNull(servers().session(a))
+    }
+
+    @Test
+    fun aSessionSavedAfterItWasClearedIsNotWrittenBack() {
+        val a = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
+        servers().remember(a, null)
+        val since = servers().generation()
+        servers().forgetSession(a)
+        servers().keepSession(a, byteArrayOf(1, 2, 3), since)
+        assertNull("a save from before the clear", servers().session(a))
+        servers().keepSession(a, byteArrayOf(4), servers().generation())
+        assertArrayEquals("one from after it", byteArrayOf(4), servers().session(a))
+    }
+
+    @Test
+    fun aRefusalForAServerForgottenSinceItsLoginBeganIsNotKept() {
+        val a = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
+        val device = ByteArray(32) { 1 }
+        servers().remember(a, null)
+        val since = servers().generation()
+        servers().forget(a)
+        servers().markRefused(a, device, "revoked", since)
+        assertNull(servers().refused(a, device))
+    }
+
+    @Test
     fun aServerForgottenSinceALoginBeganIsNotRememberedByIt() {
         val a = Server("wss://a.example/ng", "alice")
         servers().remember(a, null)

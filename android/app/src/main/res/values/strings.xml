@@ -41,6 +41,36 @@
     <string name="why_no_identity_sign_in">This server does not take sign-in by identity.</string>
     <string name="why_not_honored">The server did not sign you in as your identity, so this app left.</string>
     <string name="why_bad_credentials">The server would not accept this device\'s certificate or card.</string>
+    <string name="why_cert_expired">This device\'s certificate has expired. Renew the identity to sign in with it.</string>
+    <string name="why_cert_not_yet_valid">This device\'s certificate is not valid yet. Check that the phone\'s date and time are right.</string>
+    <plurals name="renew_banner">
+        <item quantity="one">%1$s expires in %2$d day. Renew it so it can still sign in.</item>
+        <item quantity="other">%1$s expires in %2$d days. Renew it so it can still sign in.</item>
+    </plurals>
+    <string name="expired_banner">%1$s has expired. Renew it to sign in with it.</string>
+    <plurals name="expires_in">
+        <item quantity="one">Expires in %d day</item>
+        <item quantity="other">Expires in %d days</item>
+    </plurals>
+    <string name="identity_expired">Expired</string>
+    <string name="identity_not_yet_valid">Not valid yet. Check that the phone\'s date and time are right.</string>
+    <string name="refused_revoked">Refused by %1$s as revoked. Renewing may give this phone a new device of it, if the registrar still keeps it; or try again later.</string>
+    <string name="refused_rotated">Refused by %1$s as replaced by a newer identity. Renewing may give this phone a new device of it, or delete it.</string>
+    <string name="try_again">Try again</string>
+    <string name="standing_expired">expired</string>
+    <string name="standing_not_yet_valid">not valid yet</string>
+    <string name="standing_refused">refused here</string>
+    <string name="whom_unusable">%1$s (%2$s)</string>
+    <string name="device_can">This device can %1$s.</string>
+    <string name="device_can_nothing">This device can do nothing with this identity.</string>
+    <string name="cap_login">sign in</string>
+    <string name="cap_message">send messages</string>
+    <string name="cap_manage">manage the identity\'s links</string>
+    <string name="cap_vouch">vouch for others</string>
+    <string name="renew">Renew</string>
+    <string name="delete">Delete</string>
+    <string name="delete_identity_title">Delete %1$s?</string>
+    <string name="delete_identity_body">This phone stops being a device of this identity. Its backup at the registrar is kept.</string>
     <string name="why_key_locked">This device\'s key cannot be opened right now. Unlock the phone and try again.</string>
     <string name="identity_missing">The identity this server was saved with is no longer on this phone. Pick one.</string>
     <string name="saved_servers">Saved servers</string>

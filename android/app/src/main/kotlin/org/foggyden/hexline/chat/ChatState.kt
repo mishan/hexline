@@ -56,6 +56,12 @@ sealed interface Why {
     /** The server would not read this device's certificate or card. */
     data object BadCredentials : Why
 
+    /** This device's certificate has expired: renew the identity to sign in with it. */
+    data object CertExpired : Why
+
+    /** This device's certificate begins after the phone's clock: the clock is likely wrong. */
+    data object CertNotYetValid : Why
+
     /** The phone's keystore cannot open the device's key now, as while it is locked. */
     data object KeyLocked : Why
 
@@ -82,6 +88,8 @@ fun refusal(code: String): Why =
         "no_identity_sign_in" -> Why.NoIdentitySignIn
         "identity_not_honored" -> Why.NotHonored
         "bad_card", "bad_cert", "card_too_large" -> Why.BadCredentials
+        "cert_expired" -> Why.CertExpired
+        "cert_not_yet_valid" -> Why.CertNotYetValid
         else -> Why.Refused(code)
     }
 

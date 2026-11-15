@@ -2,6 +2,8 @@ package org.foggyden.hexline.chat
 
 import org.foggyden.hexline.core.ClassicLogin
 import org.foggyden.hexline.identity.StoredIdentity
+import org.foggyden.hexline.identity.standing
+import org.foggyden.hexline.identity.usable
 import org.foggyden.hexline.servers.Server
 import org.foggyden.hexline.servers.SignIn
 
@@ -53,8 +55,19 @@ data class ConnectForm(
     /** The identity picked is no longer on this phone. */
     fun missing(identities: List<StoredIdentity>): Boolean = chosen != null && identities.none { it.fingerprint == chosen }
 
-    /** What to connect with, or null while the form is not ready. */
-    fun request(identities: List<StoredIdentity>): ConnectRequest? {
+    /** The server as an identity signs in to it from this form. */
+    fun identityServer(identity: StoredIdentity) = Server(url.trim(), null, SignIn.Identity(identity.fingerprint))
+
+    /**
+     * What to connect with, or null while the form is not ready: with an
+     * identity whose certificate is outside its time, or that this server
+     * refused (as [refused] says), it is not.
+     */
+    fun request(
+        identities: List<StoredIdentity>,
+        now: Long,
+        refused: (Server, StoredIdentity) -> String?,
+    ): ConnectRequest? {
         if (url.isBlank()) return null
         if (!byIdentity) {
             return ConnectRequest(
@@ -65,12 +78,14 @@ data class ConnectForm(
             )
         }
         val identity = identity(identities) ?: return null
+        val server = identityServer(identity)
+        if (!standing(identity, now).usable || refused(server, identity) != null) return null
         val link =
             if (linking) {
                 ClassicLogin(linkLogin.ifBlank { return null }, linkPassword)
             } else {
                 null
             }
-        return ConnectRequest(Server(url.trim(), null, SignIn.Identity(identity.fingerprint)), null, false, link)
+        return ConnectRequest(server, null, false, link)
     }
 }
