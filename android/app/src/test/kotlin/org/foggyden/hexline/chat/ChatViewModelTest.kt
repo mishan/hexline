@@ -191,11 +191,17 @@ class ChatViewModelTest {
     ) {
         core { conn.sink.deliver(listOf(CoreUpdate.Roster(1u, emptyList(), ""))) }
         onMain()
-        conn.session = session
+        sessionKept(conn, session)
     }
 
-    /** A batch of nothing much from [conn]. */
-    private fun batch(conn: FakeConnection) = core { conn.sink.deliver(listOf(CoreUpdate.Subject("news", null))) }
+    /** [conn]'s link's session, kept and told, as the core does once a link's first batch is handed over. */
+    private fun sessionKept(
+        conn: FakeConnection,
+        session: ByteArray?,
+    ) {
+        conn.session = session
+        if (session != null) core { conn.sink.deliver(listOf(CoreUpdate.SessionKept)) }
+    }
 
     /** [conn]'s last batch, [updates]: the core keeps no session after it. */
     private fun over(
@@ -282,7 +288,6 @@ class ChatViewModelTest {
             assertArrayEquals("goes $goes: kept while the core has none", SESSION, outside { servers.session(server) })
             if (!goes) {
                 live(conn)
-                batch(conn)
                 settle()
                 assertArrayEquals("the core's, once it has one", conn.session, outside { servers.session(server) })
             }
@@ -433,7 +438,6 @@ class ChatViewModelTest {
         val newer = opened.last()
         land(newer, LOGGED_IN)
         live(newer)
-        batch(newer)
         settle()
         // Its server had answered before the hang-up reached it.
         refuse(old, CoreException.Refused("login_failed", ""))
@@ -579,30 +583,36 @@ class ChatViewModelTest {
                 "refused after a lapse" to listOf(CoreUpdate.Refused("session_expired"), closed(false)),
                 // No batch: the server said at login that the session would not survive.
                 "not resumable from its login" to null,
+                "a new login after a lapse that will not survive one" to
+                    listOf(CoreUpdate.Reconnected(true, LOGGED_IN.copy(canResume = false)), CoreUpdate.Roster(1u, emptyList(), "")),
             )
         val resumed = mutableListOf<String>()
         for ((name, last) in cases) {
-            fresh()
-            val server = passwordServer(name)
-            saved(server, "pw", SESSION)
-            model()
-            settle()
-            val conn = opened.single()
-            land(conn, LOGGED_IN.copy(canResume = last != null, resumed = true))
-            settle()
-            if (last != null) {
-                live(conn)
-                batch(conn)
+            // The main thread told of it before the screen goes, or not yet.
+            for (heard in listOf(true, false)) {
+                if (last == null && !heard) continue
+                fresh()
+                val label = "$name${if (heard) "" else ", the screen going first"}"
+                val server = passwordServer(label)
+                saved(server, "pw", SESSION)
+                model()
                 settle()
-                over(conn, last)
+                val conn = opened.single()
+                land(conn, LOGGED_IN.copy(canResume = last != null, resumed = true))
                 settle()
+                if (last != null) {
+                    live(conn)
+                    settle()
+                    over(conn, last)
+                    if (heard) settle()
+                }
+                owner.clear()
+                settle()
+                if (outside { servers.session(server) } != null) resumed += "$label: a session kept"
+                model()
+                settle()
+                if (opened.size > 1) resumed += "$label: taken up at launch"
             }
-            owner.clear()
-            settle()
-            if (outside { servers.session(server) } != null) resumed += "$name: a session kept"
-            model()
-            settle()
-            if (opened.size > 1) resumed += "$name: taken up at launch"
         }
         assertEquals(emptyList<String>(), resumed)
     }
@@ -619,15 +629,14 @@ class ChatViewModelTest {
             settle()
             val conn = opened.single()
             land(conn, LOGGED_IN)
+            // Nothing after either session is told: the link stays quiet.
             live(conn)
-            batch(conn)
             settle()
             if (how == "logged in again") {
                 // A new login made by the core, its session kept after its first batch.
                 core { conn.sink.deliver(listOf(CoreUpdate.Reconnected(false, LOGGED_IN))) }
                 onMain()
-                conn.session = ROTATED
-                batch(conn)
+                sessionKept(conn, ROTATED)
                 settle()
             }
             found[how] = outside { servers.session(server) }?.let(::String)

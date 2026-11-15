@@ -149,9 +149,6 @@ class ChatViewModel internal constructor(
 
     /** The connection has been live: what it saves from now on is its own. */
     private var established = false
-
-    /** A link's session not saved yet: the next batch saves it. */
-    private var unsaved = false
     private var foreground = true
 
     /**
@@ -176,28 +173,28 @@ class ChatViewModel internal constructor(
                 updates.fold(s) { acc, u -> acc.apply(u) }
             }
             val wasConnecting = before?.link == Link.Connecting
-            val reconnected = updates.any { it is CoreUpdate.Reconnected }
+            val kept = updates.any { it is CoreUpdate.SessionKept }
             // A login after a lapse, refused by the server.
             val refused = updates.firstNotNullOfOrNull { (it as? CoreUpdate.Refused)?.code }
-            // Kicked, replaced, refused after a lapse: nothing will resume it.
-            val over = updates.any { it is CoreUpdate.Closed && !it.canResume }
+            // Kicked, replaced, refused after a lapse, or a new login made by
+            // the core that will not survive one: nothing will resume it.
+            // Forgotten from here, so a screen that goes before the main
+            // thread hears of it cannot keep it.
+            val over =
+                updates.any {
+                    (it is CoreUpdate.Closed && !it.canResume) ||
+                        (it is CoreUpdate.Reconnected && it.info?.canResume == false)
+                }
+            if (over && !state.value.leaving) {
+                val at = servers.generation()
+                later { servers.forgetSession(server, at) }
+            }
             viewModelScope.launch {
                 if (refused != null) markRefused(server, device, refused, since)
                 if (sink !== this@Sink) return@launch
-                if (over && !state.value.leaving) {
-                    val at = servers.generation()
-                    later { servers.forgetSession(server, at) }
-                    return@launch
-                }
-                // Saved from the batch after a link's first: the core keeps
-                // the session to resume it with only once that is delivered.
-                if (unsaved) save()
-                if (wasConnecting && state.value.link == Link.Live) {
-                    loadEarlier()
-                    unsaved = true
-                }
-                // A new login made by the core has a new session to keep.
-                if (reconnected) unsaved = true
+                if (kept) save()
+                // The first page waits for the roster that makes the link live.
+                if (wasConnecting && state.value.link == Link.Live) loadEarlier()
                 if (state.value.fillAfter != null && state.value.link == Link.Live) fill()
             }
         }
@@ -513,7 +510,6 @@ class ChatViewModel internal constructor(
         connection = conn
         server = to
         established = false
-        unsaved = false
         viewModelScope.launch {
             try {
                 val info =
@@ -663,7 +659,6 @@ class ChatViewModel internal constructor(
         if (!established || state.value.leaving) return
         // None until the core's first batch: not a reason to forget the one kept.
         val saved = conn.saved() ?: return
-        unsaved = false
         // Asked for now: a clear that comes first wins, even if this write lands after it.
         val since = servers.generation()
         later { servers.keepSession(to, saved, since) }
