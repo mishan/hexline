@@ -62,10 +62,11 @@ class SavedServers(
     fun last(): Server? = all().firstOrNull()
 
     /**
-     * Counts forgets, and what is kept that a forget might undo: what a
-     * login is given to say when it was asked for.
+     * A ticket for an act asked for now, later than every one before it:
+     * taken as the act is asked for and handed to it, so acts are ordered
+     * here by when they were asked for, not by when they ran.
      */
-    fun generation(): Long = synchronized(LOCK) { forgets }
+    fun generation(): Long = synchronized(LOCK) { ++forgets }
 
     /**
      * [server] is the last; its password is kept, or with null forgotten.
@@ -82,14 +83,17 @@ class SavedServers(
             if (since != null && (forgottenAt[name("list", server)] ?: 0) > since) return false
             write(listOf(server) + all().filter { it != server })
             write(name("password", server), password?.toByteArray())
-            if (password != null) keptAt[name("password", server)] = ++forgets
+            if (password != null) kept(name("password", server), since)
             true
         }
 
-    /** [server] is forgotten whole, its secrets with it. */
-    fun forget(server: Server): Unit =
+    /** [server] is forgotten whole, its secrets with it; [at], a [generation], when that was asked for. */
+    fun forget(
+        server: Server,
+        at: Long? = null,
+    ): Unit =
         synchronized(LOCK) {
-            forgottenAt[name("list", server)] = ++forgets
+            forgotten(name("list", server), at)
             write(all().filter { it != server })
             secrets.delete(name("password", server))
             secrets.delete(name("session", server))
@@ -143,10 +147,13 @@ class SavedServers(
             keepRefusals { it.filterNot { e -> e.startsWith("$key=") } }
         }
 
-    /** Forgets every server's refusal of [device], once it is deleted or replaced. */
-    fun forgetRefusalsOf(device: ByteArray): Unit =
+    /** Forgets every server's refusal of [device], once it is deleted or replaced; [at] as for [forget]. */
+    fun forgetRefusalsOf(
+        device: ByteArray,
+        at: Long? = null,
+    ): Unit =
         synchronized(LOCK) {
-            forgottenAt[deviceName(device)] = ++forgets
+            forgotten(deviceName(device), at)
             val mine = "/" + shortHash(device) + "="
             keepRefusals { it.filterNot { e -> mine in e } }
         }
@@ -224,7 +231,7 @@ class SavedServers(
     ): Unit =
         synchronized(LOCK) {
             if (keptSince(name("session", server), since)) return
-            forgottenAt[name("session", server)] = ++forgets
+            forgotten(name("session", server), since)
             write(name("session", server), null)
         }
 
@@ -243,8 +250,24 @@ class SavedServers(
         synchronized(LOCK) {
             if (since != null && (forgottenAt[name("session", server)] ?: 0) > since) return false
             val kept = session?.takeIf { server in all() }
-            write(name("session", server), kept).also { if (it && kept != null) keptAt[name("session", server)] = ++forgets }
+            write(name("session", server), kept).also { if (it && kept != null) kept(name("session", server), since) }
         }
+
+    /** [name] forgotten, by an act asked for [at] (now, if not said); under [LOCK]. */
+    private fun forgotten(
+        name: String,
+        at: Long?,
+    ) {
+        forgottenAt[name] = maxOf(forgottenAt[name] ?: 0, at ?: ++forgets)
+    }
+
+    /** [name] kept, as [forgotten] is forgotten. */
+    private fun kept(
+        name: String,
+        at: Long?,
+    ) {
+        keptAt[name] = maxOf(keptAt[name] ?: 0, at ?: ++forgets)
+    }
 
     /** Whether [name] was kept after [since]: a clear asked for before it is not this one's. */
     private fun keptSince(

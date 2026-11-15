@@ -58,6 +58,17 @@ class ChatViewModel(
 ) : AndroidViewModel(app) {
     private val servers = SavedServers(app)
     private val identities = Identities(app)
+
+    /**
+     * Every read and write of [servers] and [identities] this makes, one
+     * at a time and in the order the main thread asked for them. A forget
+     * or a delete lets go of what it names on the main thread before it
+     * asks for its own work, so a task that checks its attempt and then
+     * writes cannot be overtaken by one asked for after it. The stores'
+     * own generations stay, for what the main thread does not order (a
+     * save on the way out, on a thread of its own).
+     */
+    private val store = Dispatchers.IO.limitedParallelism(1)
     private val state = MutableStateFlow(ChatState())
     val chat: StateFlow<ChatState> = state
 
@@ -203,7 +214,7 @@ class ChatViewModel(
         val since = servers.generation()
         viewModelScope.launch {
             val found =
-                withContext(Dispatchers.IO) {
+                withContext(store) {
                     publishIdentities()
                     publishRefusals()
                     publishServers()
@@ -243,7 +254,7 @@ class ChatViewModel(
         viewModelScope.launch {
             val (kept, saved) =
                 if (wanted in savedServers.value) {
-                    withContext(Dispatchers.IO) { servers.password(wanted) to servers.session(wanted).takeIf { link == null } }
+                    withContext(store) { servers.password(wanted) to servers.session(wanted).takeIf { link == null } }
                 } else {
                     null to null
                 }
@@ -262,9 +273,10 @@ class ChatViewModel(
         // Forgetting a server is leaving it: no session is left behind that
         // nothing will resume or end.
         letGo { it == server }
+        val at = servers.generation()
         viewModelScope.launch {
-            withContext(Dispatchers.IO) {
-                servers.forget(server)
+            withContext(store) {
+                servers.forget(server, at)
                 publishRefusals()
                 publishServers()
             }
@@ -286,7 +298,8 @@ class ChatViewModel(
             restoring.value =
                 try {
                     val device = restoreIdentity(registrar, handle, kind, secret, deviceName).also { made = it }
-                    withContext(Dispatchers.IO) {
+                    val at = servers.generation()
+                    withContext(store) {
                         val replaced =
                             identities
                                 .list()
@@ -296,7 +309,7 @@ class ChatViewModel(
                         identities.save(device.seed, device.cert, device.card, handle, registrar)
                         // The new device starts with no server's refusal; the old one's go with it.
                         replaced?.let {
-                            servers.forgetRefusalsOf(it)
+                            servers.forgetRefusalsOf(it, at)
                             publishRefusals()
                         }
                         publishIdentities()
@@ -342,8 +355,10 @@ class ChatViewModel(
         val signedIn = SignIn.Identity(fingerprint)
         deleted += fingerprint
         letGo { it.signIn == signedIn }
+        // Asked for now: what a login asked for after this keeps is not this delete's to clear.
+        val since = servers.generation()
         viewModelScope.launch {
-            withContext(Dispatchers.IO) {
+            withContext(store) {
                 val device =
                     identities
                         .list()
@@ -352,8 +367,8 @@ class ChatViewModel(
                         ?.device
                 identities.delete(fingerprint)
                 publishIdentities()
-                for (s in servers.all().filter { it.signIn == signedIn }) servers.forgetSession(s)
-                device?.let(servers::forgetRefusalsOf)
+                for (s in servers.all().filter { it.signIn == signedIn }) servers.forgetSession(s, since)
+                device?.let { servers.forgetRefusalsOf(it, since) }
                 publishRefusals()
             }
         }
@@ -368,7 +383,7 @@ class ChatViewModel(
         fingerprint: String,
     ) {
         viewModelScope.launch {
-            withContext(Dispatchers.IO) {
+            withContext(store) {
                 identities.list().find { it.fingerprint == fingerprint }?.let { servers.forgetRefusal(server, it.info.device) }
                 publishRefusals()
             }
@@ -396,7 +411,7 @@ class ChatViewModel(
         since: Long,
     ) {
         if (server.signIn !is SignIn.Identity || device == null || !refusalLasts(code)) return
-        withContext(Dispatchers.IO) {
+        withContext(store) {
             servers.markRefused(server, device, code, since)
             publishRefusals()
         }
@@ -428,14 +443,14 @@ class ChatViewModel(
         var seed: ByteArray? = null
         try {
             val (stored, mine) =
-                withContext(Dispatchers.IO) { identities.device(fingerprint)?.also { seed = it.second } }
+                withContext(store) { identities.device(fingerprint)?.also { seed = it.second } }
                     ?: throw NoIdentity()
             when (standing(stored, System.currentTimeMillis() / 1000)) {
                 Standing.Expired -> throw Unusable(Why.CertExpired)
                 Standing.NotYetValid -> throw Unusable(Why.CertNotYetValid)
                 else -> {}
             }
-            withContext(Dispatchers.IO) { servers.refused(to, stored.info.device) }?.let { throw Unusable(refusal(it)) }
+            withContext(store) { servers.refused(to, stored.info.device) }?.let { throw Unusable(refusal(it)) }
             // Let go of while the reads were made: nothing is proved for it,
             // and its connection, closed, would take no call.
             if (!ask.live) throw CancellationException("let go of")
@@ -483,7 +498,7 @@ class ChatViewModel(
                         is SignIn.Identity -> {
                             // An account named to link and not linked yet is
                             // never made in its place.
-                            val asked = link != null || withContext(Dispatchers.IO) { servers.linkAsked(to) }
+                            val asked = link != null || withContext(store) { servers.linkAsked(to) }
                             loginIdentity(conn, ask, to, how.fingerprint, !asked, link, saved) { mine.device = it }
                         }
                     }
@@ -491,7 +506,7 @@ class ChatViewModel(
                 if (!ask.live) return@launch
                 established = true
                 state.update { if (info.resumed) it.copy(outcome = info.outcome) else it.signedIn(info.outcome) }
-                withContext(Dispatchers.IO) {
+                withContext(store) {
                     if (!ask.live) return@withContext
                     if (!servers.remember(to, keep.takeIf { to.signIn == SignIn.Password }, since)) return@withContext
                     if (to.signIn is SignIn.Identity && !info.resumed) {
@@ -516,7 +531,7 @@ class ChatViewModel(
                 // honored by the generation.
                 if (code != null) markRefused(to, mine.device, code, since)
                 if (!ask.live) return@launch
-                withContext(Dispatchers.IO) {
+                withContext(store) {
                     // Refused for good: the saved session is not coming back.
                     // Busy or unreachable, it may yet.
                     // Its own to clear: not if let go of since, nor what a newer login kept.
@@ -622,16 +637,17 @@ class ChatViewModel(
         val saved = conn.saved()
         // Asked for now: a clear that comes first wins, even if this write lands after it.
         val since = servers.generation()
-        viewModelScope.launch(Dispatchers.IO) { servers.keepSession(to, saved, since) }
+        viewModelScope.launch(store) { servers.keepSession(to, saved, since) }
     }
 
     fun disconnect() {
         val (conn, to) = (connection ?: return) to (server ?: return)
         state.update { it.copy(leaving = true) }
+        val at = servers.generation()
         viewModelScope.launch {
             // Forgotten first, so a process gone before the logout lands does
             // not wake up in the chat the person left.
-            withContext(Dispatchers.IO) { servers.forgetSession(to) }
+            withContext(store) { servers.forgetSession(to, at) }
             // Let go of meanwhile (a forget, a delete), which logged it out already.
             if (connection === conn) conn.disconnect()
         }

@@ -212,6 +212,23 @@ class SavedServersTest {
     }
 
     @Test
+    fun actsAreOrderedByWhenTheyWereAskedForNotWhenTheyRan() {
+        val a = Server("wss://a.example/ng", "alice")
+        servers().remember(a, null)
+        // A forget, then a login asked for after it: the forget runs first.
+        val forget = servers().generation()
+        val login = servers().generation()
+        servers().forget(a, forget)
+        assertTrue("a login asked for after a forget", servers().remember(a, "pw", login))
+        // A clear, then a save asked for after it: the clear runs first.
+        val clear = servers().generation()
+        val save = servers().generation()
+        servers().forgetSession(a, clear)
+        servers().keepSession(a, byteArrayOf(4), save)
+        assertArrayEquals("a save asked for after a clear", byteArrayOf(4), servers().session(a))
+    }
+
+    @Test
     fun aSessionSavedAfterItWasClearedIsNotWrittenBack() {
         val a = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
         servers().remember(a, null)
