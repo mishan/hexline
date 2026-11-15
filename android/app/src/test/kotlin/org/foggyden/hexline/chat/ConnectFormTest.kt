@@ -14,12 +14,38 @@ class ConnectFormTest {
     private fun kept(
         fingerprint: String,
         expires: Long = NOW + 90 * DAY,
+        manage: Boolean = true,
     ) = StoredIdentity(
         null,
         byteArrayOf(),
         byteArrayOf(),
-        CertInfo(fingerprint, byteArrayOf(), byteArrayOf(), 0u, expires.toULong(), true, true, false, true, null),
+        CertInfo(fingerprint, byteArrayOf(), byteArrayOf(), 0u, expires.toULong(), true, true, false, manage, null),
     )
+
+    @Test
+    fun anAccountToLinkGoesWithTheIdentityItWasTypedForAndOnlyWithOneThatMayManage() {
+        val linking =
+            ConnectForm(byIdentity = true, chosen = "fp-x")
+                .withUrl(a)
+                .copy(linking = true, linkLogin = "alice", linkPassword = "pw-a")
+        val identities = listOf(kept("fp-x"), kept("fp-y"), kept("fp-web", manage = false))
+        assertEquals("pw-a", linking.request(identities, NOW, none)?.link?.password)
+        assertEquals(
+            "picked again, kept",
+            "pw-a",
+            linking
+                .chose("fp-x")
+                .request(identities, NOW, none)
+                ?.link
+                ?.password,
+        )
+        val other = linking.chose("fp-y")
+        assertFalse("another picked", other.linking)
+        assertNull(other.request(identities, NOW, none)?.link)
+        val web = linking.copy(chosen = "fp-web").request(identities, NOW, none)
+        assertNull("a device that may not manage asks no link", web?.link)
+        assertEquals("but still signs in", "fp-web", (web?.server?.signIn as? SignIn.Identity)?.fingerprint)
+    }
 
     private val none: (Server, StoredIdentity) -> String? = { _, _ -> null }
 

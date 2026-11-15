@@ -838,23 +838,50 @@ class ChatViewModelTest {
     }
 
     @Test
+    fun aSaveConfirmedThenLeftForAnotherEnrollmentDoesNotEndTheOther() {
+        val vm = model()
+        settle()
+        vm.startEnroll(null)
+        settle()
+        vm.requestEnroll("hl.example", "K7PM-4XWE", "Hexline")
+        settle()
+        core { enrollments.single().answer.complete(ENROLLED) }
+        settle()
+        vm.confirmEnroll()
+        assertEquals("nothing left to discard", Enrolling.Saving("Fixture", SHORT), vm.enrollment.value)
+        // Its save still queued, another begun.
+        vm.discardEnroll()
+        vm.startEnroll(null)
+        settle()
+        assertEquals("the second's screen", Enrolling.Ready(DEVICE), vm.enrollment.value)
+        assertTrue("the second still open", !enrollments[1].closed)
+        assertEquals("the first kept, as the person said", "Fixture", stored()?.handle)
+    }
+
+    @Test
+    fun aQuietRenewalIsOfTheRecordAsItIsWhenItsDeviceIsRead() {
+        keepIdentity("old.example")
+        now = ISSUED + (EXPIRES - ISSUED) * 2 / 3 + DAY
+        model()
+        // The launch's first read, then the renewal's list of what is due.
+        onMain()
+        onDisk()
+        onMain()
+        onDisk()
+        // Enrolled again through another mailbox before its device is read.
+        keepIdentity("new.example")
+        settle()
+        assertEquals("new.example", enrollments.single().asked?.first)
+    }
+
+    @Test
     fun aDueDeviceIsRenewedQuietlyOnceADayWhereAHolderStandsBy() {
         val due = ISSUED + (EXPIRES - ISSUED) * 2 / 3 + DAY
         for (answer in listOf("renewed", "no holder", "unreachable", "not due")) {
             fresh()
             keepIdentity("hl.example")
             // Tried long ago, and found no holder then.
-            outside {
-                identities.renewTried(
-                    FINGERPRINT,
-                    identities
-                        .list()
-                        .single()
-                        .info.device,
-                    1,
-                    true,
-                )
-            }
+            outside { identities.renewTried(FINGERPRINT, CERT, 1, true) }
             now = if (answer == "not due") ISSUED + DAY else due
             model()
             settle()

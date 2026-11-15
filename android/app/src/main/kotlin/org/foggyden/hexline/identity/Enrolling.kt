@@ -86,6 +86,12 @@ sealed interface Enrolling {
         val replaces: CertInfo? = null,
     ) : Enrolling
 
+    /** Kept on the phone once the save the person asked for lands: nothing to discard now. */
+    data class Saving(
+        val name: String,
+        val short: String,
+    ) : Enrolling
+
     /** With no [device], there is none to ask with: the person starts again. */
     data class Failed(
         val device: String,

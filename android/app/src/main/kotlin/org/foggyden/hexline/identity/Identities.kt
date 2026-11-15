@@ -124,19 +124,19 @@ class Identities(
         }
 
     /**
-     * Notes a quiet renewal of [fingerprint]'s [device] asked for [at], and
-     * whether a holder stood by to answer it; nothing if another device has
-     * taken its place since.
+     * Notes a quiet renewal of [fingerprint]'s certificate [cert] asked for
+     * [at], and whether a holder stood by to answer it; nothing if another
+     * certificate has taken its place since, the same device's included.
      */
     fun renewTried(
         fingerprint: String,
-        device: ByteArray,
+        cert: ByteArray,
         at: Long,
         noHolder: Boolean,
     ): Unit =
         synchronized(LOCK) {
             val file = file(fingerprint)
-            val stored = load(file)?.takeIf { it.info.device.contentEquals(device) } ?: return
+            val stored = load(file)?.takeIf { it.cert.contentEquals(cert) } ?: return
             write(
                 file,
                 StoredIdentity(

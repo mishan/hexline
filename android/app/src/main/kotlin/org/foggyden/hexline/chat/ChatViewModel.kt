@@ -458,8 +458,11 @@ class ChatViewModel internal constructor(
         val at = servers.generation()
         val seed = mine.seed()
         mine.close()
+        // A start or a discard since makes this save's end no longer the screen's.
+        val token = ++enrollAsked
+        enrolling.value = Enrolling.Saving(answer.name, answer.short)
         viewModelScope.launch {
-            enrolling.value =
+            val ended =
                 try {
                     queue.scope
                         .async {
@@ -489,6 +492,7 @@ class ChatViewModel internal constructor(
                 } catch (_: CoreException) {
                     Enrolling.Failed("", EnrollProblem.NotForThisPhone)
                 }
+            if (token == enrollAsked) enrolling.value = ended
         }
     }
 
@@ -547,10 +551,16 @@ class ChatViewModel internal constructor(
         at: Long,
     ) {
         var seed: ByteArray? = null
-        val mine =
+        // One record for the device, its certificate and its mailbox: the one
+        // chosen, unless another has taken its place since.
+        val (renewing, mine) =
             try {
-                val (stored, held) = withContext(store) { identities.device(kept.fingerprint)?.also { seed = it.second } } ?: return
-                enroll(held to stored.cert, null)
+                val (current, held) =
+                    withContext(store) {
+                        identities.device(kept.fingerprint)?.also { seed = it.second }
+                    } ?: return
+                if (!current.cert.contentEquals(kept.cert) || current.mailbox == null) return
+                current to enroll(held to current.cert, null)
             } catch (_: SecretUnavailable) {
                 return
             } catch (_: CoreException) {
@@ -559,14 +569,14 @@ class ChatViewModel internal constructor(
                 seed?.fill(0)
             }
         try {
-            val answer = mine.enroll(kept.mailbox!!, null, kept.info.name ?: DEVICE_NAME)
+            val answer = mine.enroll(renewing.mailbox!!, null, renewing.info.name ?: DEVICE_NAME)
             val renewed = mine.seed()
             queue.scope
                 .async {
                     try {
-                        // Kept only for the device it renewed: not if deleted or replaced meanwhile.
+                        // Kept only for the certificate it renewed: not if deleted or replaced meanwhile.
                         val now = identities.list().find { it.fingerprint == kept.fingerprint }
-                        if (now != null && now.info.device.contentEquals(kept.info.device)) {
+                        if (now != null && now.cert.contentEquals(renewing.cert)) {
                             identities.save(renewed, answer.cert, answer.card, now.handle, now.registrar, now.mailbox)
                             publishIdentities()
                         }
@@ -579,7 +589,7 @@ class ChatViewModel internal constructor(
             if (e is CoreException.Connect) return
             val noHolder = e is CoreException.Refused && e.code == "no_holder"
             later {
-                identities.renewTried(kept.fingerprint, kept.info.device, at, noHolder)
+                identities.renewTried(kept.fingerprint, renewing.cert, at, noHolder)
                 publishIdentities()
             }
         } catch (_: SecretUnavailable) {

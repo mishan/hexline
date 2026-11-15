@@ -378,7 +378,7 @@ async fn card_kept(
 
 /// The wait a 429's body asks for, flat or under `error` as the registrar
 /// and the ng port each put it.
-fn retry_after(body: &[u8]) -> Option<u64> {
+pub(crate) fn retry_after(body: &[u8]) -> Option<u64> {
     let v: Value = serde_json::from_slice(body).ok()?;
     v.get("retry_after")
         .or_else(|| v.get("error").and_then(|e| e.get("retry_after")))

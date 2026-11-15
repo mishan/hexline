@@ -270,6 +270,11 @@ impl Enrollee {
             return Err(refused("cert_unusable"));
         }
         crate::identity::in_time(&bundle.cert)?;
+        // A renewal that is itself already due would be asked for again at
+        // once, every day: no renewal at all.
+        if self.prev.is_some() && renewal_due(cert.issued, cert.expires, now()) {
+            return Err(refused("short_renewal"));
+        }
         let fingerprint = Fingerprint::of(&cert.identity);
         Ok(Enrolled {
             cert: bundle.cert,
@@ -363,6 +368,11 @@ async fn discovered(http: &hxng_client::reqwest::Client, base: &Url) -> Result<S
         base.join("/.well-known/hotline").expect("a path").as_str(),
     )
     .await?;
+    if status == 429 {
+        return Err(CoreError::RateLimited {
+            retry_after: crate::restore::retry_after(&body),
+        });
+    }
     let doc: Value = (status == 200)
         .then(|| serde_json::from_slice(&body).ok())
         .flatten()
@@ -466,6 +476,77 @@ mod tests {
             "wrong_identity"
         );
         assert_eq!(code(phone.checked(&answer(&alice, None))), "kept");
+    }
+
+    #[test]
+    fn a_renewal_already_due_again_is_refused() {
+        use hl_identity::{Card, IdentityKey};
+        let alice = IdentityKey::generate();
+        let device = DeviceKey::generate();
+        let cert = |issued: u64, life: u64| {
+            DeviceCert::for_keys(&alice, device.public(), device.public_enc(), issued, life)
+                .unwrap()
+                .sign(&alice)
+        };
+        let renewing = Enrollee::renewing(device.seed().to_vec(), cert(now(), 86_400)).unwrap();
+        let card = Card::new(&alice, "Alice", now())
+            .sign(&alice, Vec::new())
+            .unwrap();
+        let answer = |cert: Vec<u8>| {
+            Bundle {
+                cert,
+                card: card.clone(),
+            }
+            .encode()
+        };
+        let code = |r: Result<Enrolled, CoreError>| match r {
+            Ok(_) => "kept".to_owned(),
+            Err(CoreError::Refused { code, .. }) => code,
+            Err(e) => format!("{e:?}"),
+        };
+        assert_eq!(
+            code(renewing.checked(&answer(cert(now(), 3 * 86_400)))),
+            "kept"
+        );
+        // Two of its three days gone already.
+        let stale = cert(now() - 2 * 86_400, 3 * 86_400);
+        assert_eq!(code(renewing.checked(&answer(stale))), "short_renewal");
+        // A first enrollment's certificate is the holder's to make so.
+        let first = Enrollee::new();
+        let theirs = DeviceCert::for_keys(
+            &alice,
+            first.device.public(),
+            first.device.public_enc(),
+            now() - 2 * 86_400,
+            3 * 86_400,
+        )
+        .unwrap()
+        .sign(&alice);
+        assert_eq!(code(first.checked(&answer(theirs))), "kept");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mailbox_asked_too_often_says_how_long_to_wait() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 1024];
+            let _ = s.read(&mut buf).await;
+            let body = r#"{"error":"rate_limited","retry_after":7}"#;
+            let reply = format!(
+                "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let base = mailbox_base(&format!("http://127.0.0.1:{port}")).unwrap();
+        let http = auth::http_client(base.as_str(), None).unwrap();
+        match discovered(&http, &base).await {
+            Err(CoreError::RateLimited { retry_after }) => assert_eq!(retry_after, Some(7)),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

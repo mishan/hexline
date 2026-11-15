@@ -244,7 +244,7 @@ private fun ConnectScreen(
                     Row(
                         Modifier
                             .fillMaxWidth()
-                            .selectable(kept == identity, role = Role.RadioButton) { form = form.copy(chosen = kept.fingerprint) }
+                            .selectable(kept == identity, role = Role.RadioButton) { form = form.chose(kept.fingerprint) }
                             .padding(vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
@@ -607,6 +607,12 @@ fun EnrollScreen(
                     Button(onConfirm) { Text(stringResource(R.string.enroll_confirm)) }
                     TextButton(onCancel) { Text(stringResource(R.string.enroll_discard)) }
                 }
+            }
+            is Enrolling.Saving -> {
+                Text(
+                    stringResource(R.string.enroll_saving, enrolling.name, enrolling.short),
+                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                )
             }
             is Enrolling.Waiting -> {
                 Text(

@@ -72,16 +72,11 @@ class IdentitiesTest {
     }
 
     @Test
-    fun anEnrolledDevicesMailboxAndItsQuietRenewalAreKeptForThatDeviceAlone() {
+    fun anEnrolledDevicesMailboxAndItsQuietRenewalAreKeptForThatCertificateAlone() {
         identities().save(SEED.copyOf(), CERT, CARD, "alice@example", null, "hl.example")
-        identities().renewTried(FINGERPRINT, ByteArray(32) { 9 }, 100, true)
-        assertEquals("another device's renewal changes nothing", 0L, identities().list().single().renewTried)
-        val device =
-            identities()
-                .list()
-                .single()
-                .info.device
-        identities().renewTried(FINGERPRINT, device, 100, true)
+        identities().renewTried(FINGERPRINT, CERT2, 100, true)
+        assertEquals("another certificate's renewal changes nothing", 0L, identities().list().single().renewTried)
+        identities().renewTried(FINGERPRINT, CERT, 100, true)
         val tried = identities().list().single()
         assertEquals(listOf("hl.example", 100L, true), listOf(tried.mailbox, tried.renewTried, tried.noHolder))
         // A certificate kept anew is a renewal done: nothing tried for it yet.
