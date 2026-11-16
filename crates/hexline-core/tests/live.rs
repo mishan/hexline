@@ -367,7 +367,7 @@ async fn a_session_that_expired_while_the_link_was_down_is_logged_in_again() {
     let server = Server::with_grace(&["alice", "bob"], 1).await;
     let proxy = Proxy::to(&server).await;
     let (alice, sink) = logged_in(&proxy.url, "alice").await;
-    let first = saved_field(&alice.saved().unwrap(), "session");
+    let first = saved_field(&saved_soon(&alice).await, "session");
     let (_bob, bob_sink) = logged_in(&server.url, "bob").await;
     proxy.refuse(true);
     proxy.sever();
@@ -388,7 +388,7 @@ async fn a_session_that_expired_while_the_link_was_down_is_logged_in_again() {
     let rosters = sink.positions(roster);
     assert_eq!(rosters.len(), 2, "{:?}", sink.all());
     assert!(rosters[1] > back);
-    assert_ne!(saved_field(&alice.saved().unwrap(), "session"), first);
+    assert_ne!(saved_field(&saved_soon(&alice).await, "session"), first);
     alice.chat("new session".into()).await.unwrap();
     bob_sink.heard("alice's line", said("new session")).await;
 }
@@ -485,7 +485,7 @@ async fn a_saved_session_resumes_after_a_restart_with_a_roster() {
     let (bob, bob_sink) = logged_in(&server.url, "bob").await;
     bob.chat("before".into()).await.unwrap();
     sink.heard("before", said("before")).await;
-    let saved = alice.saved().unwrap();
+    let saved = saved_soon(&alice).await;
     alice.hang_up(false);
     bob_sink
         .heard("alice detached", status_of("alice", Status::Detached))
@@ -509,7 +509,7 @@ async fn a_saved_session_resumes_after_a_restart_with_a_roster() {
     ));
     assert_eq!(sink.at(said("before")), None, "{:?}", sink.all());
     assert_eq!(
-        saved_field(&again.saved().unwrap(), "session"),
+        saved_field(&saved_soon(&again).await, "session"),
         saved_field(&saved, "session")
     );
 }
@@ -518,7 +518,7 @@ async fn a_saved_session_resumes_after_a_restart_with_a_roster() {
 async fn a_session_taken_by_another_device_is_not_taken_back() {
     let server = Server::start(&["alice"]).await;
     let (alice, sink) = logged_in(&server.url, "alice").await;
-    let saved = alice.saved().unwrap();
+    let saved = saved_soon(&alice).await;
     let other = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
     other
         .login(Some("alice".into()), pw("alice"), Some(saved))
@@ -603,7 +603,7 @@ async fn an_accounts_lapsed_session_is_not_made_a_guest_without_its_password() {
     let server = Server::with_grace(&["alice", "bob"], 1).await;
     let (alice, _) = logged_in(&server.url, "alice").await;
     let (_bob, bob_sink) = logged_in(&server.url, "bob").await;
-    let saved = alice.saved().unwrap();
+    let saved = saved_soon(&alice).await;
     alice.hang_up(false);
     bob_sink
         .heard_within(30, "alice's session ending", |u| {
@@ -622,7 +622,7 @@ async fn a_resume_the_server_cannot_replay_is_synced_with_a_roster() {
     let server = Server::start(&["alice", "bob"]).await;
     let (alice, _) = logged_in(&server.url, "alice").await;
     let (bob, bob_sink) = logged_in(&server.url, "bob").await;
-    let mut saved: Value = serde_json::from_slice(&alice.saved().unwrap()).unwrap();
+    let mut saved: Value = serde_json::from_slice(&saved_soon(&alice).await).unwrap();
     alice.hang_up(false);
     bob_sink
         .heard("alice detached", status_of("alice", Status::Detached))
@@ -646,7 +646,7 @@ async fn a_resume_the_server_cannot_replay_is_synced_with_a_roster() {
     ));
     bob.chat("after the sync".into()).await.unwrap();
     sink.heard("a line after it", said("after the sync")).await;
-    let resynced: Value = serde_json::from_slice(&again.saved().unwrap()).unwrap();
+    let resynced: Value = serde_json::from_slice(&saved_soon(&again).await).unwrap();
     assert!(resynced["last_seq"].as_u64() < saved["last_seq"].as_u64());
 }
 
@@ -679,7 +679,7 @@ async fn an_identity_logs_in_and_after_its_session_lapses_proves_its_device_agai
     assert!(info.can_resume, "{info:?}");
     assert_eq!(info.fingerprint.as_deref(), Some(fingerprint.as_str()));
     sink.heard("her roster", roster).await;
-    let first = saved_field(&alice.saved().unwrap(), "session");
+    let first = saved_field(&saved_soon(&alice).await, "session");
     let (_bob, bob_sink) = logged_in(&server.url, "bob").await;
 
     proxy.refuse(true);
@@ -697,9 +697,9 @@ async fn an_identity_logs_in_and_after_its_session_lapses_proves_its_device_agai
             if i.fingerprint.as_deref() == Some(fingerprint.as_str()))
     })
     .await;
-    assert_ne!(saved_field(&alice.saved().unwrap(), "session"), first);
+    assert_ne!(saved_field(&saved_soon(&alice).await, "session"), first);
     assert_eq!(
-        saved_field(&alice.saved().unwrap(), "guest"),
+        saved_field(&saved_soon(&alice).await, "guest"),
         Value::Bool(false)
     );
     // A new session: bob sees alice part and join again.
@@ -1072,7 +1072,7 @@ async fn an_identitys_session_resumes_as_itself_and_another_identitys_is_not_res
         )
     })
     .await;
-    let saved = alice.saved().unwrap();
+    let saved = saved_soon(&alice).await;
     assert_eq!(saved_field(&saved, "fingerprint"), Value::from(fingerprint));
     alice.hang_up(false);
 
@@ -1086,7 +1086,7 @@ async fn an_identitys_session_resumes_as_itself_and_another_identitys_is_not_res
     assert_eq!(info.fingerprint.as_deref(), Some(bobs.as_str()));
     assert!(!info.resumed, "{info:?}");
     assert_ne!(
-        saved_field(&bob.saved().unwrap(), "session"),
+        saved_field(&saved_soon(&bob).await, "session"),
         saved_field(&saved, "session")
     );
 }

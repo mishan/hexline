@@ -27,6 +27,10 @@ make build       # assembleFdroidDebug, assemblePlayDebug
 make connected   # instrumented tests
 ```
 
+The view model's interleaving test runs 500 seeds; `HEXLINE_SEEDS`,
+`HEXLINE_SEED` and `HEXLINE_STEPS` widen it or replay one, with
+`--rerun` so Gradle runs it again.
+
 ## Rules
 
 - Kotlin renders; Rust decides. No protocol, CBOR or crypto in Kotlin,

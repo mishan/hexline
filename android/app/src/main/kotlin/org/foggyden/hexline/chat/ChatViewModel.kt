@@ -1,5 +1,6 @@
 package org.foggyden.hexline.chat
 
+import android.annotation.SuppressLint
 import android.app.Application
 import android.net.ConnectivityManager
 import android.net.Network
@@ -8,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
@@ -84,6 +86,12 @@ class ChatViewModel internal constructor(
     private val enroll: (renewing: Pair<ByteArray, ByteArray>?, expecting: String?) -> Enrollment,
     /** Seconds since the epoch, that a certificate's time is judged by. */
     private val now: () -> Long,
+    /**
+     * The process's, whether the app is in front: it outlives every screen,
+     * and holds no activity for this to leak.
+     */
+    @SuppressLint("StaticFieldLeak")
+    private val process: Lifecycle,
 ) : AndroidViewModel(app) {
     /** The one the app makes: its own stores, the process's queue, the core's connections and the clock. */
     constructor(app: Application) : this(
@@ -94,6 +102,7 @@ class ChatViewModel internal constructor(
         ::coreConnection,
         ::coreEnrollment,
         { System.currentTimeMillis() / 1000 },
+        ProcessLifecycleOwner.get().lifecycle,
     )
 
     private val store = queue.dispatcher
@@ -151,6 +160,9 @@ class ChatViewModel internal constructor(
         var server: Server?,
     ) {
         @Volatile var live = true
+
+        /** Given a connection: what it was answered is its own to keep, whatever is asked for after it. */
+        var started = false
     }
 
     /** Every attempt not yet over; on the main thread. */
@@ -261,7 +273,7 @@ class ChatViewModel internal constructor(
 
     init {
         connectivity.registerDefaultNetworkCallback(network, Handler(Looper.getMainLooper()))
-        ProcessLifecycleOwner.get().lifecycle.addObserver(lifecycle)
+        process.addObserver(lifecycle)
         val ask = attempt(null)
         val since = servers.generation()
         viewModelScope.launch {
@@ -301,8 +313,8 @@ class ChatViewModel internal constructor(
         link: ClassicLogin? = null,
     ) {
         // The last asked for takes the place of any not yet started; one
-        // started is the connection's, let go of only by leaving it.
-        for (a in attempts.filter { it !== current }) letGo(a)
+        // started is its connection's, let go of only by leaving it.
+        for (a in attempts.filter { !it.started }) letGo(a)
         val ask = attempt(wanted)
         val since = servers.generation()
         viewModelScope.launch {
@@ -660,8 +672,12 @@ class ChatViewModel internal constructor(
     ) {
         if (state.value.link.let { it == Link.Connecting || it == Link.Live || it is Link.Reconnecting }) return end(ask)
         state.value = ChatState(link = Link.Connecting)
-        current?.let(::letGo)
+        // The one replaced has had its login's answer, and its link has ended
+        // since (else this would not be starting): what it asked to keep of
+        // that answer (a server remembered, a refused session cleared) is still
+        // made, while the screen, and what it saves, are this one's from here.
         current = ask
+        ask.started = true
         connection?.let {
             connection = null
             it.close()
@@ -687,8 +703,6 @@ class ChatViewModel internal constructor(
                     }
                 // Let go of while logging in: nothing of it is kept.
                 if (!ask.live) return@launch
-                established = true
-                state.update { if (info.resumed) it.copy(outcome = info.outcome) else it.signedIn(info.outcome) }
                 later {
                     if (!ask.live) return@later
                     if (!servers.remember(to, keep.takeIf { to.signIn == SignIn.Password }, since)) return@later
@@ -697,18 +711,23 @@ class ChatViewModel internal constructor(
                     }
                     publishServers()
                 }
-                // Queued after the remember, which a session is kept only beside.
-                save()
                 // A session the server will not let survive a lapse is no session to keep.
                 if (!info.canResume) later { servers.forgetSession(to, since) }
+                // Its link ended, and another begun, before this ran: the core
+                // runs a link from the moment it answers.
+                if (sink !== mine) return@launch
+                established = true
+                state.update { if (info.resumed) it.copy(outcome = info.outcome) else it.signedIn(info.outcome) }
+                // Queued after the remember, which a session is kept only beside.
+                save()
             } catch (_: NoIdentity) {
-                if (!ask.live) return@launch
+                if (!ask.live || sink !== mine) return@launch
                 state.update { it.copy(link = Link.Ended(Why.NoIdentity)) }
             } catch (e: Unusable) {
-                if (!ask.live) return@launch
+                if (!ask.live || sink !== mine) return@launch
                 state.update { it.copy(link = Link.Ended(e.why)) }
             } catch (_: SecretUnavailable) {
-                if (!ask.live) return@launch
+                if (!ask.live || sink !== mine) return@launch
                 state.update { it.copy(link = Link.Ended(Why.KeyLocked)) }
             } catch (e: CoreException) {
                 val code = (e as? CoreException.Refused)?.code
@@ -725,7 +744,7 @@ class ChatViewModel internal constructor(
                     if (saved != null && code != null && !keepsSession(code)) servers.forgetSession(to, since)
                     if (code == "login_failed") servers.forgetPassword(to, since)
                 }
-                if (!ask.live) return@launch
+                if (!ask.live || sink !== mine) return@launch
                 state.update { it.copy(link = Link.Ended(why(e))) }
             } finally {
                 end(ask)
@@ -846,7 +865,7 @@ class ChatViewModel internal constructor(
     // resumed, and let the core finish on its own threads.
     override fun onCleared() {
         connectivity.unregisterNetworkCallback(network)
-        ProcessLifecycleOwner.get().lifecycle.removeObserver(lifecycle)
+        process.removeObserver(lifecycle)
         send(EnrollEvent.Closed)
         sink = null
         val (conn, to) = (connection ?: return) to (server ?: return)

@@ -76,7 +76,14 @@ class QuietRenewal(
         try {
             // Noted, and written, before the holder is asked: a process killed
             // or frozen while it waits has asked, and is not to ask again today.
-            note(renewing, now(), false).join()
+            // As of just before it asks, so one frozen before it asks counts its
+            // day from then.
+            var at = now()
+            note(renewing, at, false).join()
+            while (now() - at > NOTED_WITHIN) {
+                at = now()
+                note(renewing, at, false).join()
+            }
             val answer = mine.enroll(renewing.mailbox!!, null, renewing.info.name ?: DEVICE_NAME)
             val renewed = mine.seed()
             queue.scope
@@ -124,6 +131,9 @@ class QuietRenewal(
 
     private companion object {
         const val DAY = 86_400L
+
+        /** How long before it asks a try may have been noted, in seconds. */
+        const val NOTED_WITHIN = 60L
 
         /** What a device asks to be called when it renews with no name of its own. */
         const val DEVICE_NAME = "Hexline"
