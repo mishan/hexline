@@ -174,7 +174,7 @@ class SavedServers(
     private fun deviceName(device: ByteArray) = "device-" + shortHash(device)
 
     private fun keepRefusals(change: (Set<String>) -> List<String>) =
-        prefs.edit { putStringSet(REFUSED, change(prefs.getStringSet(REFUSED, null).orEmpty()).toSet()) }
+        prefs.edit(commit = true) { putStringSet(REFUSED, change(prefs.getStringSet(REFUSED, null).orEmpty()).toSet()) }
 
     /**
      * Whether an account was named to link [server]'s identity to and the
@@ -193,7 +193,7 @@ class SavedServers(
             if (since != null && (forgottenAt[name("list", server)] ?: 0) > since) return
             val names = prefs.getStringSet(LINK_ASKED, null).orEmpty().toMutableSet()
             if (asked) names += name("link", server) else names -= name("link", server)
-            prefs.edit { putStringSet(LINK_ASKED, names) }
+            prefs.edit(commit = true) { putStringSet(LINK_ASKED, names) }
         }
 
     private fun write(servers: List<Server>) {
@@ -204,7 +204,10 @@ class SavedServers(
             (s.signIn as? SignIn.Identity)?.let { o.put(IDENTITY, it.fingerprint) }
             list.put(o)
         }
-        prefs.edit { putString(SERVERS, list.toString()) }
+        // Committed, not applied, as every write here is: on the store queue a
+        // write is made before the next, and a process killed after it keeps
+        // what it wrote beside the secrets the Keystore already holds.
+        prefs.edit(commit = true) { putString(SERVERS, list.toString()) }
     }
 
     /**
@@ -287,7 +290,7 @@ class SavedServers(
         val url = prefs.getString(OLD_URL, null) ?: return
         val login = prefs.getString(OLD_LOGIN, null).orEmpty()
         for (kind in listOf("password", "session")) secrets.delete(kind + "-" + shortHash("$url\n$login".toByteArray()))
-        prefs.edit {
+        prefs.edit(commit = true) {
             remove(OLD_URL)
             remove(OLD_LOGIN)
         }

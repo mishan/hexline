@@ -15,6 +15,11 @@ zeroize = "1"
 # hxd-ng's pin, advanced with it.
 hl-identity = { git = "https://github.com/mishan/hx-libs.git", rev = "8cb5063c644972051492b1e1eab55e636f18a77d" }
 
+# Dependencies optimized in debug builds too: the JVM tests load a debug
+# core, and a signature checked unoptimized costs them tens of milliseconds.
+[profile.dev.package."*"]
+opt-level = 2
+
 # What every phone downloads, so it is built small.
 [profile.release]
 lto = true

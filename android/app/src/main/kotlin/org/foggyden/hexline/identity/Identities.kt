@@ -101,6 +101,8 @@ class Identities(
                 .map { it.name.removeSuffix(".bak") }
                 .filter { !it.contains('.') }
                 .distinct()
+                // In one order whatever the file system lists them in.
+                .sorted()
                 .mapNotNull { load(File(dir, it)) }
         }
 

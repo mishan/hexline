@@ -1,283 +1,30 @@
 package org.foggyden.hexline.chat
 
 import android.app.Application
-import android.content.SharedPreferences
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.ViewModelProvider
-import androidx.lifecycle.ViewModelStore
-import androidx.lifecycle.viewmodel.CreationExtras
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CoroutineDispatcher
-import kotlinx.coroutines.Delay
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.InternalCoroutinesApi
-import kotlinx.coroutines.MainCoroutineDispatcher
-import kotlinx.coroutines.test.StandardTestDispatcher
-import kotlinx.coroutines.test.TestCoroutineScheduler
-import kotlinx.coroutines.test.TestDispatcher
-import kotlinx.coroutines.test.resetMain
-import kotlinx.coroutines.test.setMain
-import org.foggyden.hexline.core.ClassicLogin
-import org.foggyden.hexline.core.Connection
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.CoreUpdate
-import org.foggyden.hexline.core.DeviceIdentity
-import org.foggyden.hexline.core.Enrolled
-import org.foggyden.hexline.core.Enrollment
-import org.foggyden.hexline.core.HistoryPage
-import org.foggyden.hexline.core.LoginInfo
-import org.foggyden.hexline.core.UpdateSink
-import org.foggyden.hexline.core.certForDevice
 import org.foggyden.hexline.identity.Enrolling
-import org.foggyden.hexline.identity.Identities
 import org.foggyden.hexline.secrets.SecretUnavailable
 import org.foggyden.hexline.secrets.SecretUnreadable
-import org.foggyden.hexline.secrets.Secrets
-import org.foggyden.hexline.servers.SavedServers
-import org.foggyden.hexline.servers.Server
-import org.foggyden.hexline.servers.SignIn
-import org.foggyden.hexline.servers.StoreQueue
-import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
-import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import java.io.File
 import java.io.IOException
-import kotlin.coroutines.CoroutineContext
 
-/**
- * The view model's connections and stores, driven step by step. The main
- * thread and the store queue are each a dispatcher that runs only when
- * told, so a forget or a delete can be made to land between any two of a
- * connection's steps. Main is immediate where the app's is: a call the
- * test makes stands for one from the UI, on the main thread, and runs
- * there until it first waits; what the store queue or the core hands back
- * is dispatched to it. The stores are the real ones over an in-memory
- * stand-in for the Keystore, which refuses to be touched off the queue
- * while a model is alive; the core is a connection whose answers the test
- * gives, from the core's side.
- */
-@OptIn(ExperimentalCoroutinesApi::class, InternalCoroutinesApi::class)
+/** The view model's connections and stores, a case at a time, over [ViewModelHarness]. */
 @RunWith(RobolectricTestRunner::class)
 @Config(application = Application::class)
-class ChatViewModelTest {
-    private val app: Application = RuntimeEnvironment.getApplication()
-
-    /** Whether the store queue is running a task, or the core calling in. */
-    private var onDisk = false
-    private var fromCore = false
-
-    private val main = Main(StandardTestDispatcher(TestCoroutineScheduler()))
-    private val disk = Counted(StandardTestDispatcher(TestCoroutineScheduler())) { onDisk = it }
-
-    /** A model is alive, so the stores are the queue's alone. */
-    private var armed = false
-
-    /** The test's own look at the stores, apart from the model's. */
-    private var exempt = false
-
-    private var cases = 0
-    private var stores = Stores(cases)
-    private val servers get() = stores.servers
-    private val identities get() = stores.identities
-    private val secrets get() = stores.secrets
-
-    private val opened = mutableListOf<FakeConnection>()
-    private val enrollments = mutableListOf<FakeEnrollment>()
-
-    /** What the store held of the identity's last try when the holder was asked. */
-    private var triedWhenAsked: Long? = null
-    private var now = ISSUED + DAY
-    private val owner = ViewModelStore()
-    private val uncaught = mutableListOf<Throwable>()
-
-    init {
-        Dispatchers.setMain(main)
-        Thread.currentThread().setUncaughtExceptionHandler { _, e -> uncaught += e }
-    }
-
-    @After
-    fun tearDown() {
-        Dispatchers.resetMain()
-        Thread.currentThread().uncaughtExceptionHandler = null
-        assertEquals("nothing thrown on the model's threads", emptyList<Throwable>(), uncaught)
-    }
-
-    /** The stores of one case, apart from any other's. */
-    private inner class Stores(
-        n: Int,
-    ) {
-        val secrets = MemorySecrets()
-        val servers = SavedServers(app, secrets, QueuedPrefs(app.getSharedPreferences("servers-$n", 0)))
-        val identities = Identities(app, secrets, File(app.filesDir, "identities-$n"))
-    }
-
-    /** A case's own stores and connections, the model before it cleared. */
-    private fun fresh() {
-        owner.clear()
-        settle()
-        armed = false
-        stores = Stores(++cases)
-        opened.clear()
-        enrollments.clear()
-    }
-
-    private fun model(): ChatViewModel {
-        val factory =
-            object : ViewModelProvider.Factory {
-                @Suppress("UNCHECKED_CAST")
-                override fun <T : ViewModel> create(
-                    modelClass: Class<T>,
-                    extras: CreationExtras,
-                ): T =
-                    ChatViewModel(app, servers, identities, StoreQueue(disk), { url, sink ->
-                        FakeConnection(url, sink).also { opened += it }
-                    }, { renewing, expecting ->
-                        FakeEnrollment(renewing, expecting) { triedWhenAsked = outside { identities.list().singleOrNull()?.renewTried } }
-                            .also { enrollments += it }
-                    }, { now }) as T
-            }
-        armed = true
-        return ViewModelProvider.create(owner, factory)[ChatViewModel::class.java]
-    }
-
-    private fun <T> outside(look: () -> T): T {
-        exempt = true
-        try {
-            return look()
-        } finally {
-            exempt = false
-        }
-    }
-
-    private fun core(call: () -> Unit) {
-        fromCore = true
-        try {
-            call()
-        } finally {
-            fromCore = false
-        }
-    }
-
-    /** The main thread's work so far, up to its next wait on the store. */
-    private fun onMain() = main.inner.scheduler.advanceUntilIdle()
-
-    /** The store's work so far. */
-    private fun onDisk() = disk.inner.scheduler.advanceUntilIdle()
-
-    /** Everything, until neither has anything left to run. */
-    private fun settle() {
-        repeat(SETTLE) {
-            onMain()
-            onDisk()
-            if (main.pending == 0 && disk.pending == 0) return
-        }
-        error("still busy after $SETTLE rounds")
-    }
-
-    /** [conn]'s login landing, as the core answers it. */
-    private fun land(
-        conn: FakeConnection,
-        info: LoginInfo,
-    ) = core { conn.answer.complete(info) }
-
-    private fun refuse(
-        conn: FakeConnection,
-        e: CoreException,
-    ) = core { conn.answer.completeExceptionally(e) }
-
-    /**
-     * [conn]'s first batch, and only after it, as the core keeps it, the
-     * session to resume with: the model has handled the batch by then.
-     */
-    private fun live(
-        conn: FakeConnection,
-        session: ByteArray? = "session of ${conn.url}".toByteArray(),
-    ) {
-        core { conn.sink.deliver(listOf(CoreUpdate.Roster(1u, emptyList(), ""))) }
-        onMain()
-        sessionKept(conn, session)
-    }
-
-    /** [conn]'s link's session, kept and told, as the core does once a link's first batch is handed over. */
-    private fun sessionKept(
-        conn: FakeConnection,
-        session: ByteArray?,
-    ) {
-        conn.session = session
-        if (session != null) core { conn.sink.deliver(listOf(CoreUpdate.SessionKept)) }
-    }
-
-    /** [conn]'s last batch, [updates]: the core keeps no session after it. */
-    private fun over(
-        conn: FakeConnection,
-        updates: List<CoreUpdate>,
-    ) {
-        conn.session = null
-        core { conn.sink.deliver(updates) }
-    }
-
-    private fun kept() = outside { identities.list().any { it.fingerprint == FINGERPRINT } }
-
-    private fun device() =
-        outside {
-            identities
-                .list()
-                .single()
-                .info.device
-        }
-
-    private fun keepIdentity(mailbox: String? = null) =
-        outside { identities.save(SEED.copyOf(), CERT, CARD, "alice@example", null, mailbox) }
-
-    private fun stored() = outside { identities.list().singleOrNull() }
-
-    /** The run the enroll screen shows, which a tap answers to. */
-    private fun gen(vm: ChatViewModel) =
-        when (val e = vm.enrollment.value) {
-            is Enrolling.Ready -> e.gen
-            is Enrolling.Failed -> e.gen
-            is Enrolling.Answered -> e.gen
-            else -> -1
-        }
-
-    /** Keep, as the screen asks it: for the run and the identity shown. */
-    private fun confirm(vm: ChatViewModel) {
-        val shown = vm.enrollment.value as Enrolling.Answered
-        vm.confirmEnroll(shown.gen, shown.fingerprint)
-    }
-
-    private fun shownAs(vm: ChatViewModel): String =
-        when (val e = vm.enrollment.value) {
-            is Enrolling.Ready -> "ready ${e.device}"
-            is Enrolling.Waiting -> "waiting ${e.device}"
-            is Enrolling.Saving -> "saving ${e.name}"
-            is Enrolling.Failed -> "failed ${e.device} ${e.problem}"
-            is Enrolling.Done -> "done ${e.fingerprint}"
-            else -> e.toString()
-        }
-
-    private fun saved(
-        server: Server,
-        password: String? = null,
-        session: ByteArray? = null,
-    ) = outside {
-        servers.remember(server, password)
-        session?.let { servers.keepSession(server, it) }
-    }
-
-    private fun identityServer(name: String) =
-        Server("ws://${name.replace(Regex("[^a-z0-9]+"), "-")}.example/ng", null, SignIn.Identity(FINGERPRINT))
-
-    private fun passwordServer(name: String) = Server("ws://${name.replace(Regex("[^a-z0-9]+"), "-")}.example/ng", "alice", SignIn.Password)
-
+class ChatViewModelTest : ViewModelHarness() {
     @Test
     fun theLastServerAskedForIsTheOneConnectedTo() {
         val first = passwordServer("first")
@@ -306,6 +53,49 @@ class ChatViewModelTest {
         settle()
         assertEquals("the login that landed is remembered", listOf(server), outside { servers.all() })
         assertEquals("pw", outside { servers.password(server) })
+    }
+
+    @Test
+    fun aLoginThatLandedIsRememberedThoughItsLinkEndsAndAnotherIsMadeBeforeItIs() {
+        val server = passwordServer("ended first")
+        val next = passwordServer("next")
+        val vm = model()
+        settle()
+        vm.connect(server, "pw", false)
+        settle()
+        val conn = opened.single()
+        land(conn, LOGGED_IN)
+        // Landed, and its remember asked for, not made.
+        onMain()
+        core { conn.sink.deliver(listOf(CoreUpdate.Roster(1u, emptyList(), ""), CoreUpdate.Kicked, CoreUpdate.Closed(false, false))) }
+        onMain()
+        vm.connect(next, "pw", false)
+        settle()
+        assertTrue("connected to, so offered again", server in outside { servers.all() })
+    }
+
+    @Test
+    fun aLoginWhoseLinkEndsBeforeTheModelHearsOfItIsKeptAndLeavesTheNextScreenAlone() {
+        val server = passwordServer("heard late")
+        val next = passwordServer("next late")
+        val vm = model()
+        settle()
+        vm.connect(server, "pw", false)
+        settle()
+        val conn = opened.single()
+        // The core answers, and runs the link to its end, before the main thread hears of it.
+        land(conn, LOGGED_IN.copy(outcome = "linked"))
+        core { conn.sink.deliver(listOf(CoreUpdate.Roster(1u, emptyList(), ""), CoreUpdate.Closed(false, true))) }
+        vm.connect(next, "pw", false)
+        vm.connect(server, "pw", false)
+        settle()
+        assertTrue("connected to, so offered again", server in outside { servers.all() })
+        val shown = vm.chat.value
+        assertEquals(
+            "the next login's screen",
+            listOf(Link.Connecting, false),
+            listOf(shown.link, shown.entries.any { it is Entry.SignedIn }),
+        )
     }
 
     @Test
@@ -712,44 +502,6 @@ class ChatViewModelTest {
         assertTrue("its refusals", outside { servers.refusals() }.isEmpty())
     }
 
-    /**
-     * The Keystore's part, in memory: a secret is kept as put, or a name
-     * fails as [fails] says. Touched by a live model only on the store
-     * queue.
-     */
-    private inner class MemorySecrets : Secrets {
-        private val kept = HashMap<String, ByteArray>()
-
-        /** By the start of a secret's name, what opening it throws. */
-        val fails = mutableMapOf<String, () -> Exception>()
-
-        /** What keeping any secret throws, if anything. */
-        var putFails: (() -> Exception)? = null
-
-        private fun onQueue() = check(!armed || exempt || onDisk) { "a store touched off its queue" }
-
-        override fun put(
-            name: String,
-            secret: ByteArray,
-        ) {
-            onQueue()
-            putFails?.let { throw it() }
-            kept[name] = secret.copyOf()
-        }
-
-        override fun get(name: String): ByteArray? {
-            onQueue()
-            fails.entries.find { name.startsWith(it.key) }?.let { throw it.value() }
-            return kept[name]?.copyOf()
-        }
-
-        override fun delete(name: String) {
-            onQueue()
-            kept -= name
-        }
-    }
-
-    /** Preferences, as [MemorySecrets] holds secrets: touched by a live model only on the store queue. */
     @Test
     fun aDeviceEnrolledIsKeptOnlyOnceThePersonHasSeenWhoseItIs() {
         for (then in listOf("keep", "discard", "cancel while waiting")) {
@@ -976,6 +728,24 @@ class ChatViewModelTest {
     }
 
     @Test
+    fun aQuietRenewalsTryIsNotedAsOfWhenItsHolderIsAsked() {
+        val due = ISSUED + (EXPIRES - ISSUED) * 2 / 3 + DAY
+        keepIdentity("hl.example")
+        now = due
+        model()
+        // The try written, and the holder not yet asked: the process frozen there for a month.
+        var rounds = 0
+        while (stored()?.renewTried != due) {
+            assertTrue("the try never noted as of $due", ++rounds <= SETTLE)
+            onMain()
+            disk.step()
+        }
+        now += 30 * DAY
+        settle()
+        assertEquals("a later run would ask again a day after this", now, triedWhenAsked)
+    }
+
+    @Test
     fun aQuietRenewalAnsweredForAnotherIdentityKeepsNothing() {
         keepIdentity("hl.example")
         now = ISSUED + (EXPIRES - ISSUED) * 2 / 3 + DAY
@@ -1112,302 +882,22 @@ class ChatViewModelTest {
         assertNull(outside { identities.device(FINGERPRINT) })
     }
 
-    /** An enrollment whose holder answers when the test says, as the core's would. */
-    private class FakeEnrollment(
-        given: Pair<ByteArray, ByteArray>?,
-        /** The identity alone an answer may be from, held to it as the core holds it. */
-        val expecting: String?,
-        /** Told as the holder is asked. */
-        val onAsk: () -> Unit = {},
-    ) : Enrollment {
-        /** Copied as the core copies it: the caller wipes its own. */
-        val renewing = given?.let { it.first.copyOf() to it.second.copyOf() }
-        val answer = CompletableDeferred<Enrolled>()
-        var asked: Triple<String, String?, String>? = null
-        var canceled = false
-        var closed = false
-
-        /** Whether its request was sent: once asked, unless the test says not. */
-        var posted = false
-        private var inFlight = false
-
-        override fun deviceFingerprint() = DEVICE
-
-        override suspend fun enroll(
-            mailbox: String,
-            code: String?,
-            name: String,
-        ): Enrolled {
-            check(!closed) { "a closed enrollment called" }
-            if (inFlight) throw CoreException.Refused("busy", "")
-            inFlight = true
-            onAsk()
-            asked = Triple(mailbox, code, name)
-            posted = true
-            try {
-                val got = answer.await()
-                if (expecting != null && got.fingerprint != expecting) throw CoreException.Refused("wrong_identity", "")
-                return got
-            } finally {
-                inFlight = false
+    @Test
+    fun aWaitBegunBeforeAProcessDiesNeverEndsAfterIt() {
+        for ((name, queue, drop) in listOf(
+            Triple("main", main, { main.queue.drop() }),
+            Triple("store", disk, { disk.drop() }),
+        )) {
+            var woke = false
+            CoroutineScope(queue).launch {
+                delay(1_000)
+                woke = true
             }
+            // Only as far as the wait: its time is not moved on.
+            while (main.queue.step() || disk.step()) continue
+            drop()
+            settle()
+            assertFalse("$name: a wait begun before the process died ended after it", woke)
         }
-
-        override fun cancel() {
-            canceled = true
-            answer.completeExceptionally(CoreException.Refused("canceled", ""))
-        }
-
-        override fun seed() = (renewing?.first ?: SEED).copyOf()
-
-        override fun expectIdentity(fingerprint: String) = error("set when made, by the factory")
-
-        override fun mayHaveAsked() = posted
-
-        override fun close() {
-            closed = true
-        }
-    }
-
-    private inner class QueuedPrefs(
-        private val prefs: SharedPreferences,
-    ) : SharedPreferences by prefs {
-        private fun <T> onQueue(read: () -> T): T {
-            check(!armed || exempt || onDisk) { "preferences touched off the store queue" }
-            return read()
-        }
-
-        override fun getAll(): Map<String, *> = onQueue { prefs.all }
-
-        override fun getString(
-            key: String?,
-            defValue: String?,
-        ) = onQueue { prefs.getString(key, defValue) }
-
-        override fun getStringSet(
-            key: String?,
-            defValues: Set<String>?,
-        ) = onQueue { prefs.getStringSet(key, defValues) }
-
-        override fun getInt(
-            key: String?,
-            defValue: Int,
-        ) = onQueue { prefs.getInt(key, defValue) }
-
-        override fun getLong(
-            key: String?,
-            defValue: Long,
-        ) = onQueue { prefs.getLong(key, defValue) }
-
-        override fun getFloat(
-            key: String?,
-            defValue: Float,
-        ) = onQueue { prefs.getFloat(key, defValue) }
-
-        override fun getBoolean(
-            key: String?,
-            defValue: Boolean,
-        ) = onQueue { prefs.getBoolean(key, defValue) }
-
-        override fun contains(key: String?) = onQueue { prefs.contains(key) }
-
-        override fun edit(): SharedPreferences.Editor = onQueue { prefs.edit() }
-    }
-
-    /**
-     * A connection whose login answers when the test says, as the core's
-     * does: hung up while connecting, a login that would have landed is
-     * closed instead; once closed, nothing it has may be called.
-     */
-    private class FakeConnection(
-        val url: String,
-        val sink: UpdateSink,
-    ) : Connection {
-        val answer = CompletableDeferred<LoginInfo>()
-
-        /** The seed an identity login was given, as it was given. */
-        var proved: ByteArray? = null
-        var resumedWith: ByteArray? = null
-        var password: String? = null
-        var hungUp: Boolean? = null
-        private var closed = false
-
-        /** The session the core would resume with: none until its first batch. */
-        var session: ByteArray? = null
-
-        private fun alive() = check(!closed) { "a closed connection called" }
-
-        private suspend fun answered(): LoginInfo {
-            val info = answer.await()
-            if (hungUp != null) throw CoreException.Closed()
-            return info
-        }
-
-        override suspend fun login(
-            login: String?,
-            password: String?,
-            saved: ByteArray?,
-        ): LoginInfo {
-            alive()
-            this.password = password
-            resumedWith = saved
-            return answered()
-        }
-
-        override suspend fun loginIdentity(
-            device: DeviceIdentity,
-            create: Boolean,
-            link: ClassicLogin?,
-            saved: ByteArray?,
-        ): LoginInfo {
-            alive()
-            proved = device.deviceSeed.copyOf()
-            resumedWith = saved
-            return answered()
-        }
-
-        override suspend fun chat(text: String) = alive()
-
-        override suspend fun disconnect() = alive()
-
-        override fun hangUp(logout: Boolean) {
-            alive()
-            hungUp = logout
-        }
-
-        override suspend fun history(
-            before: ULong?,
-            after: ULong?,
-            limit: UInt,
-        ): HistoryPage {
-            alive()
-            throw CoreException.Refused("not_available", "")
-        }
-
-        override fun networkChanged() = alive()
-
-        override fun saved(): ByteArray? {
-            alive()
-            return session
-        }
-
-        override fun setBackgroundLinger(millis: ULong) = alive()
-
-        override fun setForeground(foreground: Boolean) = alive()
-
-        override fun close() {
-            closed = true
-        }
-    }
-
-    /** A dispatcher that says when it runs, and counts what it has yet to. */
-    private class Counted(
-        val inner: TestDispatcher,
-        val running: (Boolean) -> Unit,
-    ) : CoroutineDispatcher(),
-        Delay by inner {
-        var pending = 0
-
-        override fun dispatch(
-            context: CoroutineContext,
-            block: Runnable,
-        ) {
-            pending++
-            inner.dispatch(context) {
-                pending--
-                running(true)
-                try {
-                    block.run()
-                } finally {
-                    running(false)
-                }
-            }
-        }
-    }
-
-    /**
-     * The test's main thread: what is handed to it waits for [onMain], and
-     * its [immediate] runs inline when the caller is already on it, as
-     * Android's does; only the store queue and the core are not.
-     */
-    private inner class Main(
-        val inner: TestDispatcher,
-    ) : MainCoroutineDispatcher(),
-        Delay by inner {
-        var pending = 0
-
-        override fun dispatch(
-            context: CoroutineContext,
-            block: Runnable,
-        ) {
-            pending++
-            inner.dispatch(context) {
-                pending--
-                block.run()
-            }
-        }
-
-        override val immediate: MainCoroutineDispatcher =
-            object :
-                MainCoroutineDispatcher(),
-                Delay by inner {
-                override val immediate get() = this
-
-                override fun isDispatchNeeded(context: CoroutineContext) = onDisk || fromCore
-
-                override fun dispatch(
-                    context: CoroutineContext,
-                    block: Runnable,
-                ) = this@Main.dispatch(context, block)
-            }
-    }
-
-    private companion object {
-        const val SETTLE = 50
-        const val DAY = 86_400L
-        const val HOUR = 3_600L
-
-        /** A second past the skew a certificate's time is allowed, as a server allows it. */
-        const val PAST_SKEW = 301L
-
-        val SESSION = "a saved session".toByteArray()
-        val LATER = "a later session".toByteArray()
-        val ROTATED = "a new login's session".toByteArray()
-        val LOGGED_IN = LoginInfo("hxd", emptyList(), true, null, null, false)
-
-        fun identityLoggedIn() = LoginInfo("hxd", emptyList(), true, FINGERPRINT, "linked", false)
-
-        fun hex(s: String) = s.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
-
-        // An identity and a device of it, made with hl-identity: the app
-        // cannot sign a certificate of its own. The same as IdentitiesTest's.
-        val SEED = hex("0202020202020202020202020202020202020202020202020202020202020202")
-        val CERT =
-            hex(
-                "a76176016373696758405824fbeefc383034d005006130620730d74936582d87c31f0c23d13e8f50ce590a1dc6843b5bd7284e197e48c54bd4b219fe4d7c4532a2e4b0f97c10530ceb006664657669636558208139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394666973737565641a6b49d20067657870697265731a7e15d500686964656e7469747958208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c6a6465766963655f656e635820198102e1c39f8bcabb16b9ed3135b4abb72e470139ec8364d882e300ed105c04",
-            )
-        val CARD =
-            hex(
-                "a561760163736967584067d88dac70a297fd5f414f8df75ac190a6a6d8f78659c342d4259dda59fae16f57c55711d6c0b05b502616b95d286d97b98b518ff50bf4c013db9a915e30fd0e646e616d65674669787475726567757064617465641a6b49d200686964656e7469747958208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
-            )
-        const val FINGERPRINT = "6htgz65xb7yfs53dmhdanfmk7fgn995n1571rjnz8a36a1fks5z0"
-        const val SHORT = "6htgz65x"
-        const val DEVICE = "9c41e7b2"
-        val ENROLLED get() = enrolled(CERT)
-
-        fun enrolled(
-            cert: ByteArray,
-            fingerprint: String = FINGERPRINT,
-        ) = Enrolled(cert, CARD, fingerprint, fingerprint.take(8), "Fixture", certForDevice(cert, CARD, SEED))
-
-        // The same device, certified again a month on.
-        val RENEWED =
-            hex(
-                "a76176016373696758401b505586185f8c75833ebd49142220abd7461d5b86f995c866c989c28073293088d79e95b6cc118dcc756f9b07d979ad335ff585eee4adefa85a2d22beb4a0016664657669636558208139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394666973737565641a6b715f0067657870697265731a7e3d6200686964656e7469747958208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c6a6465766963655f656e635820198102e1c39f8bcabb16b9ed3135b4abb72e470139ec8364d882e300ed105c04",
-            )
-
-        // The certificate's own window.
-        const val ISSUED = 0x6b49d200L
-        const val EXPIRES = 0x7e15d500L
     }
 }
