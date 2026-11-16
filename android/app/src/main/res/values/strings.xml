@@ -117,6 +117,7 @@
     <string name="enroll_start_again">Start again</string>
     <string name="enroll_answer_not_kept">The holder\'s answer could not be kept on this phone. Start again, and ask the holder for a new code.</string>
     <string name="enroll_vouches">The holder\'s certificate would let this phone vouch for others, which it never does, and was not kept. Ask for one without vouch.</string>
+    <string name="enroll_refused_here">The holder answered, but this phone could not take its answer, and kept nothing. Ask the holder again.</string>
     <string name="enroll_clock">The certificate is outside its time, or the holder found this phone\'s request misdated. Check the phone\'s date and time.</string>
     <string name="enroll_namesake">This phone already holds another identity called %1$s. Check the fingerprint above is the one you meant.</string>
     <string name="enroll_until">Until %1$s.</string>

@@ -41,8 +41,8 @@ class ConnectFlowTest {
                     { _, _ -> },
                     Enrolling.Idle,
                     {},
-                    { _, _, _ -> },
-                    {},
+                    { _, _, _, _ -> },
+                    { _, _ -> },
                     {},
                     {},
                 )

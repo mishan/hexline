@@ -31,6 +31,9 @@ enum class EnrollProblem {
 
     /** The phone's clock, likely: a certificate outside its time, or a renewal the holder found misdated. */
     Clock,
+
+    /** The holder answered, and this phone could not take the answer. */
+    RefusedHere,
     RateLimited,
     Unreachable,
 
@@ -46,6 +49,7 @@ fun enrollProblem(e: CoreException): EnrollProblem =
     when (e) {
         is CoreException.Connect -> EnrollProblem.Unreachable
         is CoreException.RateLimited -> EnrollProblem.RateLimited
+        is CoreException.Protocol -> EnrollProblem.RefusedHere
         is CoreException.Refused ->
             when (e.code) {
                 "bad_code" -> EnrollProblem.BadCode
@@ -61,25 +65,36 @@ fun enrollProblem(e: CoreException): EnrollProblem =
                 "cert_unusable" -> EnrollProblem.Unusable
                 "cert_vouches" -> EnrollProblem.Vouches
                 "cert_expired", "cert_not_yet_valid" -> EnrollProblem.Clock
+                "short_renewal" -> EnrollProblem.RefusedHere
                 "rate_limited" -> EnrollProblem.RateLimited
                 else -> EnrollProblem.Other
             }
         else -> EnrollProblem.Other
     }
 
-/** Where enrolling this phone stands, from its device key made to the certificate kept. */
+/**
+ * What the enroll screen shows: a projection of the view model's state.
+ * [gen] is the run a tap answers to; [renewing] the identity renewed, if any.
+ */
 sealed interface Enrolling {
     data object Idle : Enrolling
 
     /** Making the device key, or reading the one a renewal is for. */
-    data object Starting : Enrolling
+    data class Starting(
+        val gen: Int,
+        val renewing: String?,
+    ) : Enrolling
 
     /** [device] is the fingerprint the holder will show, for the person to compare. */
     data class Ready(
+        val gen: Int,
+        val renewing: String?,
         val device: String,
     ) : Enrolling
 
     data class Waiting(
+        val gen: Int,
+        val renewing: String?,
         val device: String,
     ) : Enrolling
 
@@ -90,6 +105,8 @@ sealed interface Enrolling {
      * phone holds another identity by the same name.
      */
     data class Answered(
+        val gen: Int,
+        val renewing: String?,
         val device: String,
         val name: String,
         val fingerprint: String,
@@ -100,12 +117,15 @@ sealed interface Enrolling {
 
     /** Kept on the phone once the save the person asked for lands: nothing to discard now. */
     data class Saving(
+        val gen: Int,
         val name: String,
         val short: String,
     ) : Enrolling
 
     /** With no [device], there is none to ask with: the person starts again. */
     data class Failed(
+        val gen: Int,
+        val renewing: String?,
         val device: String,
         val problem: EnrollProblem,
         /** The holder's reason, when it said no. */
@@ -117,3 +137,18 @@ sealed interface Enrolling {
         val fingerprint: String,
     ) : Enrolling
 }
+
+/** Whether the enroll screen is open: a run under way, or one that ended other than kept. */
+val Enrolling.open: Boolean get() = this != Enrolling.Idle && this !is Enrolling.Done
+
+/** The identity the run renews, if any. */
+val Enrolling.renewing: String?
+    get() =
+        when (this) {
+            is Enrolling.Starting -> renewing
+            is Enrolling.Ready -> renewing
+            is Enrolling.Waiting -> renewing
+            is Enrolling.Answered -> renewing
+            is Enrolling.Failed -> renewing
+            else -> null
+        }

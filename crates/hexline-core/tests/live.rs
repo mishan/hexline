@@ -1521,7 +1521,7 @@ async fn a_new_device_for_an_identity_on_the_phone_is_kept_only_from_that_identi
     for (holder, want) in [(&mallory, Some("wrong_identity")), (&alice, None)] {
         let session = holder.open().await;
         let phone = Enrollee::new();
-        phone.expect_identity_of(kept.cert.clone()).unwrap();
+        phone.expect_identity(kept.fingerprint.clone()).unwrap();
         let asking = tokio::spawn(phone.clone().enroll(
             server.url.clone(),
             Some(session.code.clone()),
@@ -1580,12 +1580,12 @@ async fn a_poll_the_link_drops_is_asked_again_under_the_same_request() {
     ));
     let asked = holder.asked(&session).await;
     for _ in 0..100 {
-        if phone.posted() {
+        if phone.may_have_asked() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(phone.posted(), "its request reached the mailbox");
+    assert!(phone.may_have_asked(), "its request sent");
     // Into its long poll by now, which is cut off while the holder answers.
     tokio::time::sleep(Duration::from_millis(200)).await;
     proxy.sever();

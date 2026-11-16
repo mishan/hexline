@@ -24,7 +24,6 @@ import org.foggyden.hexline.core.Connection
 import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.CoreUpdate
 import org.foggyden.hexline.core.DeviceIdentity
-import org.foggyden.hexline.core.Enrolled
 import org.foggyden.hexline.core.Enrollment
 import org.foggyden.hexline.core.LoginInfo
 import org.foggyden.hexline.core.Restored
@@ -35,7 +34,6 @@ import org.foggyden.hexline.core.coreConnection
 import org.foggyden.hexline.core.coreEnrollment
 import org.foggyden.hexline.core.newerCard
 import org.foggyden.hexline.core.refusalLasts
-import org.foggyden.hexline.core.renewalDue
 import org.foggyden.hexline.core.restoreIdentity
 import org.foggyden.hexline.identity.EnrollProblem
 import org.foggyden.hexline.identity.Enrolling
@@ -54,6 +52,7 @@ import org.foggyden.hexline.servers.Server
 import org.foggyden.hexline.servers.SignIn
 import org.foggyden.hexline.servers.StoreQueue
 import java.io.IOException
+import java.util.Locale
 
 /**
  * One server's connection and what its screen shows. The session outlives
@@ -79,9 +78,9 @@ class ChatViewModel internal constructor(
     private val open: (url: String, sink: UpdateSink) -> Connection,
     /**
      * A device to enroll, or with a seed and its certificate that device to
-     * renew; with another device's certificate, one kept only from its identity.
+     * renew; with an identity's fingerprint, one kept only from that identity.
      */
-    private val enroll: (renewing: Pair<ByteArray, ByteArray>?, expecting: ByteArray?) -> Enrollment,
+    private val enroll: (renewing: Pair<ByteArray, ByteArray>?, expecting: String?) -> Enrollment,
     /** Seconds since the epoch, that a certificate's time is judged by. */
     private val now: () -> Long,
 ) : AndroidViewModel(app) {
@@ -121,16 +120,12 @@ class ChatViewModel internal constructor(
     private val restoring = MutableStateFlow<Restoring>(Restoring.Idle)
     val restore: StateFlow<Restoring> = restoring
 
+    /** Enrolling this phone, and the device it holds: on the main thread alone. */
+    private var enrollState: EnrollState = EnrollState.Idle()
     private val enrolling = MutableStateFlow<Enrolling>(Enrolling.Idle)
     val enrollment: StateFlow<Enrolling> = enrolling
 
-    /** The device being enrolled, and what its holder answered: on the main thread. */
-    private var enrollee: Enrollment? = null
-    private var enrolled: Enrolled? = null
-    private var enrollMailbox: String? = null
-
-    /** Counts each enrollment asked for, so one asked for since closes what an older made. */
-    private var enrollAsked = 0
+    private val quiet = QuietRenewal(identities, queue, enroll, now) { publishIdentities() }
 
     // Read from the store queue too, to see a forget that came first.
     @Volatile private var connection: Connection? = null
@@ -221,7 +216,11 @@ class ChatViewModel internal constructor(
                 if (sink !== this@Sink) return@launch
                 if (kept) save()
                 // The first page waits for the roster that makes the link live.
-                if (wasConnecting && state.value.link == Link.Live) loadEarlier()
+                if (wasConnecting && state.value.link == Link.Live) {
+                    // Signed in: the connect screen, and any enrolling on it, is left.
+                    send(EnrollEvent.Closed)
+                    loadEarlier()
+                }
                 if (state.value.fillAfter != null && state.value.link == Link.Live) fill()
             }
         }
@@ -268,7 +267,7 @@ class ChatViewModel internal constructor(
                     servers.last()?.let { Triple(it, servers.session(it), servers.password(it)) }
                 }
             // Apart from the resume, which it is not to hold up: a holder may take minutes.
-            launch { renewQuietly() }
+            launch { quiet.run() }
             // A session left without leaving: take it up again, unless let go of while it was read.
             if (found == null || found.second == null || !ask.live) {
                 end(ask)
@@ -382,93 +381,105 @@ class ChatViewModel internal constructor(
         }
     }
 
-    /**
-     * Makes a device to enroll, or for [renewing] (an identity's
-     * fingerprint) the device kept for it: still in its time it asks again
-     * as itself, and expired it is a new device, as a holder renews no
-     * lapsed certificate (enrollment section 8).
-     */
-    fun startEnroll(renewing: String?) {
-        dropEnrollee()
-        enrolling.value = Enrolling.Starting
-        val mine = ++enrollAsked
-        viewModelScope.launch {
-            var seed: ByteArray? = null
-            val made =
-                try {
-                    val kept = renewing?.let { fp -> withContext(store) { identities.device(fp)?.also { seed = it.second } } }
-                    val again = kept?.takeIf { standing(it.first, now()).usable }
-                    // A lapsed device's replacement is still to be that identity's.
-                    enroll(again?.let { it.second to it.first.cert }, kept?.first?.cert?.takeIf { again == null })
-                } catch (_: SecretUnavailable) {
-                    null
-                } catch (_: CoreException) {
-                    null
-                } finally {
-                    seed?.fill(0)
-                }
-            // Another asked for meanwhile, or the screen left.
-            if (mine != enrollAsked || enrolling.value != Enrolling.Starting || made == null) {
-                made?.close()
-                if (mine == enrollAsked && enrolling.value == Enrolling.Starting) {
-                    enrolling.value = Enrolling.Failed("", EnrollProblem.NotKept)
-                }
-                return@launch
-            }
-            enrollee = made
-            enrolling.value = Enrolling.Ready(made.deviceFingerprint())
-        }
-    }
+    /** Opens enrolling for a new identity, or to renew [renewing] (a fingerprint). */
+    fun startEnroll(renewing: String?) = send(EnrollEvent.Start(renewing))
 
-    /** Asks the holder at [mailbox] to certify the device being enrolled, by [code]. */
+    /** Asks the holder at [mailbox] to certify run [gen]'s device, by [code]. */
     fun requestEnroll(
+        gen: Int,
         mailbox: String,
         code: String,
         name: String,
-    ) {
-        val mine = enrollee ?: return
-        val device = mine.deviceFingerprint()
-        enrolling.value = Enrolling.Waiting(device)
-        viewModelScope.launch {
-            val next =
-                try {
-                    val answer = mine.enroll(mailbox, code, name)
-                    if (enrollee !== mine) return@launch
-                    enrolled = answer
-                    enrollMailbox = mailbox
-                    val replaces = kept.value.find { it.fingerprint == answer.fingerprint }?.info
-                    // Another identity on the phone already goes by this name: one may be passing for the other.
-                    val namesake =
-                        replaces == null &&
-                            kept.value.any { it.fingerprint != answer.fingerprint && cardName(it.card) == answer.name }
-                    Enrolling.Answered(device, answer.name, answer.fingerprint, answer.info, replaces, namesake)
-                } catch (e: CoreException) {
-                    if (enrollee !== mine) return@launch
-                    val reason = (e as? CoreException.Refused)?.takeIf { it.code == "denied" }?.detail?.ifEmpty { null }
-                    Enrolling.Failed(device, enrollProblem(e), reason)
-                }
-            enrolling.value = next
+    ) = send(EnrollEvent.Request(gen, mailbox, code, name))
+
+    /** Keeps run [gen]'s answer, if it is still the one for [shown], the identity the screen showed. */
+    fun confirmEnroll(
+        gen: Int,
+        shown: String,
+    ) = send(EnrollEvent.Confirm(gen, shown))
+
+    /** Stops enrolling: a wait for the holder ends, and the device and any answer are dropped. */
+    fun discardEnroll() = send(EnrollEvent.Discard)
+
+    fun enrollSeen() = send(EnrollEvent.Seen)
+
+    /** One step of enrolling, and what it asks for done; on the main thread. */
+    private fun send(event: EnrollEvent) {
+        val (next, effects) = reduce(enrollState, event)
+        enrollState = next
+        enrolling.value = next.shown()
+        effects.forEach(::run)
+    }
+
+    private fun run(effect: EnrollEffect) {
+        when (effect) {
+            is EnrollEffect.Close -> {
+                effect.enrollee.cancel()
+                effect.enrollee.close()
+            }
+            is EnrollEffect.Make -> make(effect.gen, effect.renewing)
+            is EnrollEffect.Enroll -> ask(effect)
+            is EnrollEffect.Save -> save(effect)
         }
     }
+
+    /**
+     * The device for run [gen]: new, or for [renewing] the one kept for it,
+     * which still in its time asks again as itself; lapsed, unreadable or
+     * gone, a new device is made, and still held to that identity
+     * (enrollment section 8).
+     */
+    private fun make(
+        gen: Int,
+        renewing: String?,
+    ) = viewModelScope.launch {
+        var seed: ByteArray? = null
+        val made =
+            try {
+                val kept = renewing?.let { fp -> withContext(store) { identities.device(fp)?.also { seed = it.second } } }
+                val again = kept?.takeIf { standing(it.first, now()).usable }
+                enroll(again?.let { it.second to it.first.cert }, renewing)
+            } catch (_: SecretUnavailable) {
+                null
+            } catch (_: CoreException) {
+                null
+            } finally {
+                seed?.fill(0)
+            }
+        send(EnrollEvent.Made(gen, made, made?.deviceFingerprint().orEmpty()))
+    }
+
+    private fun ask(effect: EnrollEffect.Enroll) =
+        viewModelScope.launch {
+            val answered =
+                try {
+                    val answer = effect.enrollee.enroll(effect.mailbox, effect.code, effect.name)
+                    val replaces = kept.value.find { it.fingerprint == answer.fingerprint }?.info
+                    // Another identity on the phone already goes by this name: one may be passing for the other.
+                    val named = answer.name.lowercase(Locale.ROOT)
+                    val namesake =
+                        replaces == null &&
+                            kept.value.any { it.fingerprint != answer.fingerprint && cardName(it.card)?.lowercase(Locale.ROOT) == named }
+                    EnrollEvent.Answer(effect.gen, answer, replaces, namesake)
+                } catch (e: CoreException) {
+                    val reason = (e as? CoreException.Refused)?.takeIf { it.code == "denied" }?.detail?.ifEmpty { null }
+                    EnrollEvent.Refused(effect.gen, enrollProblem(e), reason)
+                }
+            send(answered)
+        }
 
     /**
      * Keeps the device the holder certified, now that the person has seen
      * whose it has become; the device it replaces for the same identity,
      * and that one's refusals, go.
      */
-    fun confirmEnroll() {
-        val (mine, answer) = (enrollee ?: return) to (enrolled ?: return)
-        val mailbox = enrollMailbox
-        enrollee = null
-        enrolled = null
+    private fun save(effect: EnrollEffect.Save) {
+        val (answer, mailbox) = effect.answer to effect.mailbox
         val at = servers.generation()
-        val seed = mine.seed()
-        mine.close()
-        // A start or a discard since makes this save's end no longer the screen's.
-        val token = ++enrollAsked
-        enrolling.value = Enrolling.Saving(answer.name, answer.short)
+        val seed = effect.enrollee.seed()
+        effect.enrollee.close()
         viewModelScope.launch {
-            val ended =
+            val saved =
                 try {
                     queue.scope
                         .async {
@@ -487,133 +498,15 @@ class ChatViewModel internal constructor(
                                 seed.fill(0)
                             }
                         }.await()
-                    Enrolling.Done(answer.fingerprint)
+                    EnrollEvent.Saved(effect.gen, answer.fingerprint, null)
                 } catch (_: SecretUnavailable) {
-                    Enrolling.Failed("", EnrollProblem.AnswerNotKept)
+                    EnrollEvent.Saved(effect.gen, null, EnrollProblem.AnswerNotKept)
                 } catch (_: IOException) {
-                    Enrolling.Failed("", EnrollProblem.AnswerNotKept)
+                    EnrollEvent.Saved(effect.gen, null, EnrollProblem.AnswerNotKept)
                 } catch (_: CoreException) {
-                    Enrolling.Failed("", EnrollProblem.NotForThisPhone)
+                    EnrollEvent.Saved(effect.gen, null, EnrollProblem.NotForThisPhone)
                 }
-            if (token == enrollAsked) enrolling.value = ended
-        }
-    }
-
-    /** Stops enrolling: a wait for the holder ends, and the device and any answer are dropped. */
-    fun discardEnroll() {
-        dropEnrollee()
-        enrolling.value = Enrolling.Idle
-    }
-
-    private fun dropEnrollee() {
-        enrollAsked++
-        enrollee?.let {
-            it.cancel()
-            it.close()
-        }
-        enrollee = null
-        enrolled = null
-        enrollMailbox = null
-    }
-
-    fun enrollSeen() {
-        if (enrolling.value is Enrolling.Done) enrolling.value = Enrolling.Idle
-    }
-
-    private var renewing = false
-
-    /**
-     * Renews, with nobody typing, each enrolled identity with a third of its
-     * certificate's life left, at the mailbox it was enrolled through, where
-     * a holder stands by for it (enrollment section 8); once a day at most,
-     * an unreachable mailbox aside. Where none stands by, the identity is
-     * marked so the person is asked for a code.
-     */
-    private suspend fun renewQuietly() {
-        if (renewing) return
-        renewing = true
-        try {
-            val at = now()
-            val due =
-                withContext(store) {
-                    identities.list().filter {
-                        it.mailbox != null &&
-                            renewalDue(it.info.issued, it.info.expires, at.toULong()) &&
-                            standing(it, at).usable &&
-                            at - it.renewTried >= DAY
-                    }
-                }
-            for (kept in due) renewQuietly(kept)
-        } finally {
-            renewing = false
-        }
-    }
-
-    private suspend fun renewQuietly(kept: StoredIdentity) {
-        var seed: ByteArray? = null
-        // One record for the device, its certificate and its mailbox: the one
-        // chosen, unless another has taken its place since.
-        val (renewing, mine) =
-            try {
-                val (current, held) =
-                    withContext(store) {
-                        identities.device(kept.fingerprint)?.also { seed = it.second }
-                    } ?: return
-                if (!current.cert.contentEquals(kept.cert) || current.mailbox == null) return
-                current to enroll(held to current.cert, null)
-            } catch (_: SecretUnavailable) {
-                return
-            } catch (_: CoreException) {
-                return
-            } finally {
-                seed?.fill(0)
-            }
-        // Kept, or a holder asked whatever came of it: either way not to be asked again today.
-        var done = false
-        try {
-            val answer = mine.enroll(renewing.mailbox!!, null, renewing.info.name ?: DEVICE_NAME)
-            val renewed = mine.seed()
-            queue.scope
-                .async {
-                    try {
-                        // Kept only for the certificate it renewed: not if deleted or replaced meanwhile.
-                        val now = identities.list().find { it.fingerprint == kept.fingerprint }
-                        if (now != null && now.cert.contentEquals(renewing.cert) && answer.fingerprint == kept.fingerprint) {
-                            identities.save(renewed, answer.cert, newerCard(now.card, answer.card), now.handle, now.registrar, now.mailbox)
-                            publishIdentities()
-                        }
-                    } finally {
-                        renewed.fill(0)
-                    }
-                }.await()
-            done = true
-        } catch (e: CoreException) {
-            // Offline before a holder could be asked: asked again when the app is next in front.
-            if (e is CoreException.Connect && !mine.mayHaveAsked()) return
-            val noHolder = e is CoreException.Refused && e.code == "no_holder"
-            tried(renewing, noHolder)
-            done = true
-        } catch (_: SecretUnavailable) {
-            return
-        } catch (_: IOException) {
-            return
-        } finally {
-            // Let go of while it waited (the screen gone): the wait ends too,
-            // and a holder already asked is not asked again on the next return.
-            if (!done && mine.mayHaveAsked()) tried(renewing, false)
-            mine.cancel()
-            mine.close()
-        }
-    }
-
-    /** Notes [renewing]'s renewal asked for now: when it ended, not when the scan that found it began. */
-    private fun tried(
-        renewing: StoredIdentity,
-        noHolder: Boolean,
-    ) = now().let { at ->
-        later {
-            identities.renewTried(renewing.fingerprint, renewing.cert, at, noHolder)
-            publishIdentities()
+            send(saved)
         }
     }
 
@@ -911,7 +804,7 @@ class ChatViewModel internal constructor(
         this.foreground = foreground
         connection?.setForeground(foreground)
         if (!foreground) save()
-        if (foreground) viewModelScope.launch { renewQuietly() }
+        if (foreground) viewModelScope.launch { quiet.run() }
     }
 
     /**
@@ -948,7 +841,7 @@ class ChatViewModel internal constructor(
     override fun onCleared() {
         connectivity.unregisterNetworkCallback(network)
         ProcessLifecycleOwner.get().lifecycle.removeObserver(lifecycle)
-        dropEnrollee()
+        send(EnrollEvent.Closed)
         sink = null
         val (conn, to) = (connection ?: return) to (server ?: return)
         connection = null
@@ -975,9 +868,5 @@ class ChatViewModel internal constructor(
         const val FILL_PAGE = 200u
         const val FILL_PAGES = 5
         const val FILL_WAIT = 2_000L
-        const val DAY = 86_400L
-
-        /** What a device asks to be called when it renews with no name of its own. */
-        const val DEVICE_NAME = "Hexline"
     }
 }

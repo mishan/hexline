@@ -29,7 +29,6 @@ import org.foggyden.hexline.core.HistoryPage
 import org.foggyden.hexline.core.LoginInfo
 import org.foggyden.hexline.core.UpdateSink
 import org.foggyden.hexline.core.certForDevice
-import org.foggyden.hexline.identity.EnrollProblem
 import org.foggyden.hexline.identity.Enrolling
 import org.foggyden.hexline.identity.Identities
 import org.foggyden.hexline.secrets.SecretUnavailable
@@ -233,6 +232,31 @@ class ChatViewModelTest {
         outside { identities.save(SEED.copyOf(), CERT, CARD, "alice@example", null, mailbox) }
 
     private fun stored() = outside { identities.list().singleOrNull() }
+
+    /** The run the enroll screen shows, which a tap answers to. */
+    private fun gen(vm: ChatViewModel) =
+        when (val e = vm.enrollment.value) {
+            is Enrolling.Ready -> e.gen
+            is Enrolling.Failed -> e.gen
+            is Enrolling.Answered -> e.gen
+            else -> -1
+        }
+
+    /** Keep, as the screen asks it: for the run and the identity shown. */
+    private fun confirm(vm: ChatViewModel) {
+        val shown = vm.enrollment.value as Enrolling.Answered
+        vm.confirmEnroll(shown.gen, shown.fingerprint)
+    }
+
+    private fun shownAs(vm: ChatViewModel): String =
+        when (val e = vm.enrollment.value) {
+            is Enrolling.Ready -> "ready ${e.device}"
+            is Enrolling.Waiting -> "waiting ${e.device}"
+            is Enrolling.Saving -> "saving ${e.name}"
+            is Enrolling.Failed -> "failed ${e.device} ${e.problem}"
+            is Enrolling.Done -> "done ${e.fingerprint}"
+            else -> e.toString()
+        }
 
     private fun saved(
         server: Server,
@@ -728,13 +752,13 @@ class ChatViewModelTest {
             settle()
             vm.startEnroll(null)
             settle()
-            assertEquals(then, Enrolling.Ready(DEVICE), vm.enrollment.value)
+            assertEquals(then, "ready $DEVICE", shownAs(vm))
             val e = enrollments.single()
             assertNull("$then: a new device", e.renewing)
-            vm.requestEnroll("hl.example", "K7PM-4XWE", "Hexline")
+            vm.requestEnroll(gen(vm), "hl.example", "K7PM-4XWE", "Hexline")
             settle()
             assertEquals(then, Triple("hl.example", "K7PM-4XWE", "Hexline"), e.asked)
-            assertEquals(then, Enrolling.Waiting(DEVICE), vm.enrollment.value)
+            assertEquals(then, "waiting $DEVICE", shownAs(vm))
             if (then == "cancel while waiting") {
                 vm.discardEnroll()
                 settle()
@@ -751,7 +775,7 @@ class ChatViewModelTest {
                 listOf(answered.device, answered.name, answered.fingerprint, answered.info.expires, answered.namesake, answered.replaces),
             )
             assertTrue("$then: nothing kept before the person says", stored() == null)
-            if (then == "keep") vm.confirmEnroll() else vm.discardEnroll()
+            if (then == "keep") confirm(vm) else vm.discardEnroll()
             settle()
             assertTrue("$then: the key is let go of", e.closed)
             if (then == "keep") {
@@ -759,7 +783,7 @@ class ChatViewModelTest {
                 // The card's name is the identity's word for itself, not a registrar's handle.
                 assertEquals(listOf(FINGERPRINT, null, "hl.example"), listOf(kept.fingerprint, kept.handle, kept.mailbox))
                 assertArrayEquals(SEED, outside { identities.device(FINGERPRINT)?.second })
-                assertEquals(Enrolling.Done(FINGERPRINT), vm.enrollment.value)
+                assertEquals("done $FINGERPRINT", shownAs(vm))
             } else {
                 assertNull(then, stored())
             }
@@ -779,11 +803,11 @@ class ChatViewModelTest {
             val e = enrollments.single()
             if (expired) {
                 assertNull("a lapsed certificate enrolls afresh", e.renewing)
-                assertArrayEquals("as the same identity's", CERT, e.expecting)
             } else {
                 assertArrayEquals(SEED, e.renewing!!.first)
                 assertArrayEquals(CERT, e.renewing.second)
             }
+            assertEquals("expired $expired: as the same identity's", FINGERPRINT, e.expecting)
         }
     }
 
@@ -800,7 +824,7 @@ class ChatViewModelTest {
         assertEquals(2, enrollments.size)
         assertTrue("the first is let go of", enrollments[0].closed)
         assertTrue("the second is the one shown", !enrollments[1].closed)
-        assertEquals(Enrolling.Ready(DEVICE), vm.enrollment.value)
+        assertEquals("ready $DEVICE", shownAs(vm))
     }
 
     @Test
@@ -812,7 +836,7 @@ class ChatViewModelTest {
             settle()
             vm.startEnroll(null)
             settle()
-            vm.requestEnroll("hl.example", "K7PM-4XWE", "Hexline")
+            vm.requestEnroll(gen(vm), "hl.example", "K7PM-4XWE", "Hexline")
             settle()
             core { enrollments.single().answer.complete(ENROLLED) }
             settle()
@@ -827,20 +851,20 @@ class ChatViewModelTest {
         settle()
         vm.startEnroll(null)
         settle()
-        vm.requestEnroll("hl.example", "K7PM-4XWE", "Hexline")
+        vm.requestEnroll(gen(vm), "hl.example", "K7PM-4XWE", "Hexline")
         settle()
         val e = enrollments.single()
         core { e.answer.complete(ENROLLED) }
         settle()
         secrets.putFails = { SecretUnavailable("seed", IOException("locked")) }
-        vm.confirmEnroll()
+        confirm(vm)
         settle()
-        assertEquals(Enrolling.Failed("", EnrollProblem.AnswerNotKept), vm.enrollment.value)
+        assertEquals("failed  AnswerNotKept", shownAs(vm))
         assertTrue("its device is gone", e.closed)
         secrets.putFails = null
         vm.startEnroll(null)
         settle()
-        assertEquals("a new device to ask with", Enrolling.Ready(DEVICE), vm.enrollment.value)
+        assertEquals("a new device to ask with", "ready $DEVICE", shownAs(vm))
         assertEquals(2, enrollments.size)
     }
 
@@ -850,17 +874,17 @@ class ChatViewModelTest {
         settle()
         vm.startEnroll(null)
         settle()
-        vm.requestEnroll("hl.example", "K7PM-4XWE", "Hexline")
+        vm.requestEnroll(gen(vm), "hl.example", "K7PM-4XWE", "Hexline")
         settle()
         core { enrollments.single().answer.complete(ENROLLED) }
         settle()
-        vm.confirmEnroll()
-        assertEquals("nothing left to discard", Enrolling.Saving("Fixture", SHORT), vm.enrollment.value)
+        confirm(vm)
+        assertEquals("nothing left to discard", "saving Fixture", shownAs(vm))
         // Its save still queued, another begun.
         vm.discardEnroll()
         vm.startEnroll(null)
         settle()
-        assertEquals("the second's screen", Enrolling.Ready(DEVICE), vm.enrollment.value)
+        assertEquals("the second's screen", "ready $DEVICE", shownAs(vm))
         assertTrue("the second still open", !enrollments[1].closed)
         assertEquals("the first kept, as the person said", FINGERPRINT, stored()?.fingerprint)
     }
@@ -897,6 +921,7 @@ class ChatViewModelTest {
                 continue
             }
             val e = enrollments.single()
+            assertEquals("$answer: noted before the holder is asked", due, stored()!!.renewTried)
             assertArrayEquals("$answer: the device it has", SEED, e.renewing!!.first)
             assertEquals(answer, Triple("hl.example", null, "Hexline"), e.asked)
             // The holder takes its time: what is noted is when it ended.
@@ -922,8 +947,8 @@ class ChatViewModelTest {
                 "no holder" -> assertEquals(answer, listOf(due + HOUR, true), listOf(kept.renewTried, kept.noHolder))
                 "left while waiting" ->
                     assertEquals(
-                        "$answer: a holder asked counts",
-                        listOf(due + HOUR, false),
+                        "$answer: a holder asked counts, from when it was asked",
+                        listOf(due, false),
                         listOf(kept.renewTried, kept.noHolder),
                     )
                 else -> assertEquals("$answer: not counted", listOf(1L, true), listOf(kept.renewTried, kept.noHolder))
@@ -962,11 +987,11 @@ class ChatViewModelTest {
         settle()
         vm.startEnroll(FINGERPRINT)
         settle()
-        vm.requestEnroll("new.example", "K7PM-4XWE", "Hexline")
+        vm.requestEnroll(gen(vm), "new.example", "K7PM-4XWE", "Hexline")
         settle()
         core { enrollments.single().answer.complete(enrolled(RENEWED)) }
         settle()
-        vm.confirmEnroll()
+        confirm(vm)
         settle()
         val kept = stored()!!
         assertArrayEquals(RENEWED, kept.cert)
@@ -980,12 +1005,71 @@ class ChatViewModelTest {
         settle()
         vm.startEnroll(null)
         settle()
-        vm.requestEnroll("hl.example", "K7PM-4XWE", "Hexline")
+        vm.requestEnroll(gen(vm), "hl.example", "K7PM-4XWE", "Hexline")
         settle()
         core { enrollments.single().answer.complete(enrolled(CERT, fingerprint = "another")) }
         settle()
         val answered = vm.enrollment.value as Enrolling.Answered
         assertEquals(listOf(true, null), listOf(answered.namesake, answered.replaces))
+    }
+
+    @Test
+    fun aRenewalWhoseDeviceCannotBeReadIsANewDeviceHeldToItsIdentity() {
+        for (device in listOf("gone", "unreadable")) {
+            fresh()
+            if (device == "unreadable") {
+                keepIdentity("hl.example")
+                secrets.fails["device-"] = { SecretUnreadable("seed", IOException("bad")) }
+            }
+            val vm = model()
+            settle()
+            vm.startEnroll(FINGERPRINT)
+            settle()
+            val e = enrollments.single()
+            assertEquals(device, listOf(null, FINGERPRINT), listOf(e.renewing, e.expecting))
+            vm.requestEnroll(gen(vm), "hl.example", "K7PM-4XWE", "Hexline")
+            settle()
+            core { e.answer.complete(enrolled(CERT, fingerprint = "another")) }
+            settle()
+            assertEquals(device, "failed $DEVICE NotForThisPhone", shownAs(vm))
+        }
+    }
+
+    @Test
+    fun aRunTakesOneRequestAndKeepsOnlyTheAnswerItShowed() {
+        val vm = model()
+        settle()
+        vm.startEnroll(null)
+        settle()
+        val first = gen(vm)
+        vm.requestEnroll(first, "hl.example", "K7PM-4XWE", "Hexline")
+        vm.requestEnroll(first, "other.example", "K7PM-4XWE", "Hexline")
+        settle()
+        val e = enrollments.single()
+        assertEquals("asked once", "hl.example", e.asked?.first)
+        core { e.answer.complete(ENROLLED) }
+        settle()
+        vm.confirmEnroll(first, "someone-else")
+        vm.confirmEnroll(first - 1, FINGERPRINT)
+        settle()
+        assertNull("neither the answer shown nor this run's", stored())
+        assertTrue(vm.enrollment.value is Enrolling.Answered)
+    }
+
+    @Test
+    fun signingInLeavesEnrollingAndItsDeviceGoes() {
+        val server = passwordServer("signing in")
+        val vm = model()
+        settle()
+        vm.startEnroll(null)
+        settle()
+        vm.connect(server, "pw", false)
+        settle()
+        land(opened.single(), LOGGED_IN)
+        live(opened.single())
+        settle()
+        assertTrue("its key wiped", enrollments.single().closed)
+        assertEquals(Enrolling.Idle, vm.enrollment.value)
     }
 
     @Test
@@ -1006,8 +1090,8 @@ class ChatViewModelTest {
     /** An enrollment whose holder answers when the test says, as the core's would. */
     private class FakeEnrollment(
         given: Pair<ByteArray, ByteArray>?,
-        /** Another device's certificate, whose identity alone an answer may be from. */
-        val expecting: ByteArray?,
+        /** The identity alone an answer may be from, held to it as the core holds it. */
+        val expecting: String?,
     ) : Enrollment {
         /** Copied as the core copies it: the caller wipes its own. */
         val renewing = given?.let { it.first.copyOf() to it.second.copyOf() }
@@ -1016,8 +1100,9 @@ class ChatViewModelTest {
         var canceled = false
         var closed = false
 
-        /** Whether its request reached the mailbox: once asked, unless the test says not. */
+        /** Whether its request was sent: once asked, unless the test says not. */
         var posted = false
+        private var inFlight = false
 
         override fun deviceFingerprint() = DEVICE
 
@@ -1027,9 +1112,17 @@ class ChatViewModelTest {
             name: String,
         ): Enrolled {
             check(!closed) { "a closed enrollment called" }
+            if (inFlight) throw CoreException.Refused("busy", "")
+            inFlight = true
             asked = Triple(mailbox, code, name)
             posted = true
-            return answer.await()
+            try {
+                val got = answer.await()
+                if (expecting != null && got.fingerprint != expecting) throw CoreException.Refused("wrong_identity", "")
+                return got
+            } finally {
+                inFlight = false
+            }
         }
 
         override fun cancel() {
@@ -1039,9 +1132,7 @@ class ChatViewModelTest {
 
         override fun seed() = (renewing?.first ?: SEED).copyOf()
 
-        override fun expectIdentityOf(cert: ByteArray) = error("set when made, by the factory")
-
-        override fun posted() = posted
+        override fun expectIdentity(fingerprint: String) = error("set when made, by the factory")
 
         override fun mayHaveAsked() = posted
 

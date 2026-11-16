@@ -11,9 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hl_identity::{
-    caps, Bundle, Card, DeviceCert, DeviceKey, EnrollRequest, Fingerprint, PublicKey,
-};
+use hl_identity::{caps, Bundle, Card, DeviceCert, DeviceKey, EnrollRequest, Fingerprint};
 use hxng_client::auth;
 use hxng_client::reqwest::Url;
 use serde_json::{json, Value};
@@ -87,11 +85,11 @@ pub struct Enrollee {
     prev: Option<Vec<u8>>,
     /// The identity an answer must be from: a renewal's, or one this phone
     /// already holds a device of.
-    expected: Mutex<Option<PublicKey>>,
-    /// The request has reached the mailbox, its answer read.
-    posted: AtomicBool,
+    expected: Mutex<Option<Fingerprint>>,
     /// The request was sent, whatever came back: a holder may have been asked.
     sent: AtomicBool,
+    /// An enrollment is under way: one at a time, as one device has one answer.
+    in_flight: AtomicBool,
     stopped: AtomicBool,
     stop: Notify,
 }
@@ -105,8 +103,8 @@ impl Enrollee {
             device: DeviceKey::generate(),
             prev: None,
             expected: Mutex::new(None),
-            posted: AtomicBool::new(false),
             sent: AtomicBool::new(false),
+            in_flight: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             stop: Notify::new(),
         })
@@ -130,21 +128,20 @@ impl Enrollee {
         Ok(Arc::new(Enrollee {
             device,
             prev: Some(cert),
-            expected: Mutex::new(Some(c.identity)),
-            posted: AtomicBool::new(false),
+            expected: Mutex::new(Some(Fingerprint::of(&c.identity))),
             sent: AtomicBool::new(false),
+            in_flight: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             stop: Notify::new(),
         }))
     }
 
-    /// Refuse an answer from any identity but the one `cert` (another
-    /// device's, expired or not) is of: a lapsed device of an identity
-    /// enrolls afresh, and is still to become that identity's.
-    pub fn expect_identity_of(&self, cert: Vec<u8>) -> Result<(), CoreError> {
-        let c = DeviceCert::parse(&cert)
-            .map_err(|e| protocol(&format!("the certificate does not read: {e}")))?;
-        *self.expected.lock().unwrap() = Some(c.identity);
+    /// Refuse an answer from any identity but `fingerprint`'s: a device
+    /// enrolled afresh to renew an identity is still to become that one's,
+    /// whatever became of the device it replaces.
+    pub fn expect_identity(&self, fingerprint: String) -> Result<(), CoreError> {
+        let fp = Fingerprint::parse(&fingerprint).ok_or_else(|| protocol("not a fingerprint"))?;
+        *self.expected.lock().unwrap() = Some(fp);
         Ok(())
     }
 
@@ -161,28 +158,30 @@ impl Enrollee {
     /// device, or for a renewal not of the identity it renews. Refused
     /// `unknown_code`, `no_holder`, `denied` (with the holder's reason),
     /// `expired`, `canceled`, or as the mailbox refused.
+    ///
+    /// One at a time: a second while one is under way is refused `busy`.
     pub async fn enroll(
         self: Arc<Self>,
         mailbox: String,
         code: Option<String>,
         name: String,
     ) -> Result<Enrolled, CoreError> {
-        crate::connection::RUNTIME
-            .spawn(async move { self.run(&mailbox, code.as_deref(), &name).await })
-            .await
-            .unwrap_or_else(|_| Err(protocol("the enrollment stopped")))
+        if self.in_flight.swap(true, Ordering::SeqCst) {
+            return Err(refused("busy"));
+        }
+        // Dropped (the app's call canceled), the task goes with it.
+        let task = Aborting(crate::connection::RUNTIME.spawn(async move {
+            // Aborted or done, the next may begin.
+            let _flight = Flight(&self.in_flight);
+            self.run(&mailbox, code.as_deref(), &name).await
+        }));
+        task.wait().await
     }
 
     /// Stops a wait for an answer, which ends `canceled`.
     pub fn cancel(&self) {
         self.stopped.store(true, Ordering::SeqCst);
         self.stop.notify_waiters();
-    }
-
-    /// Whether a request has reached the mailbox, so a holder may have been
-    /// asked, whatever came of it.
-    pub fn posted(&self) -> bool {
-        self.posted.load(Ordering::SeqCst)
     }
 
     /// Whether a request was sent at all, so a holder may have been asked
@@ -253,7 +252,6 @@ impl Enrollee {
         }
         self.sent.store(true, Ordering::SeqCst);
         let posted = auth::post(&http, &format!("{enroll}/requests"), Some(body)).await?;
-        self.posted.store(true, Ordering::SeqCst);
         let secret = posted
             .get("request")
             .and_then(Value::as_str)
@@ -337,7 +335,7 @@ impl Enrollee {
             .expected
             .lock()
             .unwrap()
-            .is_some_and(|id| id != cert.identity)
+            .is_some_and(|fp| fp != Fingerprint::of(&cert.identity))
         {
             return Err(refused("wrong_identity"));
         }
@@ -370,6 +368,32 @@ impl Enrollee {
             short: fingerprint.short(),
             name: card.name,
         })
+    }
+}
+
+/// Clears an enrollment's in-flight mark however it ends.
+struct Flight<'a>(&'a AtomicBool);
+
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// A spawned enrollment, aborted if what waits for it is dropped.
+struct Aborting(tokio::task::JoinHandle<Result<Enrolled, CoreError>>);
+
+impl Aborting {
+    async fn wait(mut self) -> Result<Enrolled, CoreError> {
+        (&mut self.0)
+            .await
+            .unwrap_or_else(|_| Err(protocol("the enrollment stopped")))
+    }
+}
+
+impl Drop for Aborting {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -578,11 +602,10 @@ mod tests {
             code(phone.checked(&answer(&alice, Some(caps::MESSAGE)))),
             "cert_unusable"
         );
-        // Another device's certificate, long expired, still names its identity.
-        let lapsed = DeviceCert::for_keys(&alice, [1; 32], [2; 32], 0, 1)
-            .unwrap()
-            .sign(&alice);
-        phone.expect_identity_of(lapsed).unwrap();
+        // A renewal whose old device is gone still names its identity.
+        phone
+            .expect_identity(Fingerprint::of(&alice.public()).to_string())
+            .unwrap();
         assert_eq!(
             code(phone.checked(&answer(&mallory, WEB))),
             "wrong_identity"
@@ -694,7 +717,7 @@ mod tests {
             matches!(ended, Err(CoreError::Refused { ref code, .. }) if code == "canceled"),
             "{ended:?}"
         );
-        assert!(!phone.posted());
+        assert!(!phone.may_have_asked());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -751,6 +774,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn one_device_waits_for_one_answer_at_a_time() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held = tokio::spawn(async move { listener.accept().await });
+        let phone = Enrollee::new();
+        let mailbox = format!("http://127.0.0.1:{port}");
+        let first = tokio::spawn(phone.clone().enroll(
+            mailbox.clone(),
+            Some("K7PM-4XWE".into()),
+            "Hexline".into(),
+        ));
+        let _connection = held.await;
+        let second = phone
+            .clone()
+            .enroll(mailbox.clone(), Some("K7PM-4XWE".into()), "Hexline".into())
+            .await;
+        assert!(
+            matches!(second, Err(CoreError::Refused { ref code, .. }) if code == "busy"),
+            "{second:?}"
+        );
+        // The first's call let go of, its task goes, and another may ask.
+        first.abort();
+        let _ = first.await;
+        for _ in 0..100 {
+            if !phone.in_flight.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !phone.in_flight.load(Ordering::SeqCst),
+            "the aborted one's mark cleared"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_request_whose_reply_is_lost_may_have_asked_a_holder() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -781,7 +840,7 @@ mod tests {
             )
             .await;
         assert!(matches!(ended, Err(CoreError::Connect { .. })), "{ended:?}");
-        assert!(phone.may_have_asked() && !phone.posted());
+        assert!(phone.may_have_asked());
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -57,6 +57,8 @@ import org.foggyden.hexline.identity.Restoring
 import org.foggyden.hexline.identity.Standing
 import org.foggyden.hexline.identity.StoredIdentity
 import org.foggyden.hexline.identity.nextChange
+import org.foggyden.hexline.identity.open
+import org.foggyden.hexline.identity.renewing
 import org.foggyden.hexline.identity.standing
 import org.foggyden.hexline.identity.usable
 import org.foggyden.hexline.servers.Server
@@ -84,34 +86,28 @@ fun ConnectFlow(
     onTryAgain: (server: Server, fingerprint: String) -> Unit,
     enrolling: Enrolling,
     onStartEnroll: (renewing: String?) -> Unit,
-    onRequestEnroll: (mailbox: String, code: String, deviceName: String) -> Unit,
-    onConfirmEnroll: () -> Unit,
+    onRequestEnroll: (gen: Int, mailbox: String, code: String, deviceName: String) -> Unit,
+    onConfirmEnroll: (gen: Int, shown: String) -> Unit,
     onDiscardEnroll: () -> Unit,
     onEnrollSeen: () -> Unit,
 ) {
     val form = rememberSaveable(stateSaver = FormSaver) { mutableStateOf(ConnectForm()) }
-    // The enroll screen, while open: blank for a new device, an identity's
-    // fingerprint to renew it. Null while it is closed.
-    var enrollFor by rememberSaveable { mutableStateOf<String?>(null) }
-    LaunchedEffect(enrolling) { if (enrolling is Enrolling.Done) enrollFor = null }
     // The registrar and handle the restore screen opens with: blank for a
     // new identity, an identity's own to renew it. Null while it is closed.
     var restoreFor by rememberSaveable { mutableStateOf<Pair<String, String>?>(null) }
     LaunchedEffect(restore) { if (restore is Restoring.Done) restoreFor = null }
     val opened = restoreFor
-    val enrollingFor = enrollFor
-    if (enrollingFor != null) {
-        val renewing = identities.find { it.fingerprint == enrollingFor }
+    // Open while the view model has a run under way: it holds the device.
+    if (enrolling.open) {
+        val renewing = enrolling.renewing?.let { fp -> identities.find { it.fingerprint == fp } }
         EnrollScreen(
             enrolling = enrolling,
             initialMailbox = renewing?.mailbox ?: form.value.url,
-            onStart = { onStartEnroll(enrollingFor.ifEmpty { null }) },
+            onStart = { onStartEnroll(enrolling.renewing) },
             onRequest = onRequestEnroll,
             onConfirm = onConfirmEnroll,
-        ) {
-            enrollFor = null
-            onDiscardEnroll()
-        }
+            onCancel = onDiscardEnroll,
+        )
     } else if (opened != null) {
         RestoreScreen(restore, opened.first, opened.second, onRestore) {
             restoreFor = null
@@ -130,13 +126,13 @@ fun ConnectFlow(
             onForget = onForget,
             onRestore = { renewing ->
                 if (renewing?.mailbox != null) {
-                    enrollFor = renewing.fingerprint
+                    onStartEnroll(renewing.fingerprint)
                 } else {
                     onRestoreSeen()
                     restoreFor = (renewing?.registrar.orEmpty()) to (renewing?.handle.orEmpty())
                 }
             },
-            onEnroll = { enrollFor = "" },
+            onEnroll = { onStartEnroll(null) },
             onRestored = {
                 onRestoreSeen()
                 onEnrollSeen()
@@ -570,11 +566,10 @@ fun EnrollScreen(
     enrolling: Enrolling,
     initialMailbox: String,
     onStart: () -> Unit,
-    onRequest: (mailbox: String, code: String, deviceName: String) -> Unit,
-    onConfirm: () -> Unit,
+    onRequest: (gen: Int, mailbox: String, code: String, deviceName: String) -> Unit,
+    onConfirm: (gen: Int, shown: String) -> Unit,
     onCancel: () -> Unit,
 ) {
-    LaunchedEffect(Unit) { if (enrolling == Enrolling.Idle || enrolling is Enrolling.Done) onStart() }
     var mailbox by rememberSaveable { mutableStateOf(initialMailbox) }
     var code by rememberSaveable { mutableStateOf("") }
     var deviceName by rememberSaveable { mutableStateOf("Hexline") }
@@ -614,7 +609,7 @@ fun EnrollScreen(
                     Text(stringResource(R.string.enroll_until, expiry(it.expires)), style = MaterialTheme.typography.bodySmall)
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onConfirm) { Text(stringResource(R.string.enroll_confirm)) }
+                    Button({ onConfirm(enrolling.gen, enrolling.fingerprint) }) { Text(stringResource(R.string.enroll_confirm)) }
                     TextButton(onCancel) { Text(stringResource(R.string.enroll_discard)) }
                 }
             }
@@ -631,7 +626,7 @@ fun EnrollScreen(
                 )
                 TextButton(onCancel) { Text(stringResource(R.string.cancel)) }
             }
-            Enrolling.Idle, Enrolling.Starting, is Enrolling.Done -> {
+            Enrolling.Idle, is Enrolling.Starting, is Enrolling.Done -> {
                 Text(stringResource(R.string.enroll_starting))
                 TextButton(onCancel) { Text(stringResource(R.string.cancel)) }
             }
@@ -647,7 +642,9 @@ fun EnrollScreen(
                 }
             }
             is Enrolling.Ready, is Enrolling.Failed -> {
-                val device = (enrolling as? Enrolling.Ready)?.device ?: (enrolling as Enrolling.Failed).device
+                val (gen, device) =
+                    (enrolling as? Enrolling.Ready)?.let { it.gen to it.device }
+                        ?: (enrolling as Enrolling.Failed).let { it.gen to it.device }
                 Text(stringResource(R.string.enroll_explained))
                 OutlinedTextField(
                     mailbox,
@@ -682,7 +679,7 @@ fun EnrollScreen(
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
-                        onClick = { onRequest(mailbox.trim(), code, deviceName.trim()) },
+                        onClick = { onRequest(gen, mailbox.trim(), code, deviceName.trim()) },
                         enabled = device.isNotEmpty() && mailbox.isNotBlank() && code.isNotBlank(),
                     ) { Text(stringResource(R.string.enroll_request)) }
                     TextButton(onCancel) { Text(stringResource(R.string.cancel)) }
@@ -712,6 +709,7 @@ private fun describe(failed: Enrolling.Failed): String =
         EnrollProblem.Unusable -> stringResource(R.string.enroll_unusable)
         EnrollProblem.Vouches -> stringResource(R.string.enroll_vouches)
         EnrollProblem.Clock -> stringResource(R.string.enroll_clock)
+        EnrollProblem.RefusedHere -> stringResource(R.string.enroll_refused_here)
         EnrollProblem.Other -> stringResource(R.string.enroll_failed)
     }
 

@@ -7,18 +7,23 @@ interface Enrollment :
 
 /**
  * A new device to enroll, or with [renewing] (a seed and its certificate)
- * that device asking again. With [expecting], another device's certificate,
- * an answer is kept only from that one's identity.
+ * that device asking again. With [expecting], an identity's fingerprint,
+ * an answer is kept only from that identity.
  */
 fun coreEnrollment(
     renewing: Pair<ByteArray, ByteArray>?,
-    expecting: ByteArray?,
-): Enrollment =
-    CoreEnrollment(
-        (renewing?.let { Enrollee.renewing(it.first, it.second) } ?: Enrollee()).also { e ->
-            expecting?.let { e.expectIdentityOf(it) }
-        },
-    )
+    expecting: String?,
+): Enrollment {
+    val made = renewing?.let { Enrollee.renewing(it.first, it.second) } ?: Enrollee()
+    try {
+        expecting?.let { made.expectIdentity(it) }
+    } catch (e: Exception) {
+        // Not handed over, so nobody else would wipe its key.
+        made.close()
+        throw e
+    }
+    return CoreEnrollment(made)
+}
 
 private class CoreEnrollment(
     private val enrollee: Enrollee,
