@@ -446,12 +446,20 @@ class ChatViewModelInterleavingTest : ViewModelHarness() {
                 9 -> confirmTap()
                 10 -> vm.discardEnroll().let { "discard" }
                 11 -> {
-                    val s = all.random(rnd)
+                    // Now and then the one just connected to, connected to again at once, before the
+                    // forget, or what the connection it let go of had queued, reaches the store.
+                    val again = conns.lastOrNull()?.server?.takeIf { it.signIn == SignIn.Password && rnd.nextInt(3) == 0 }
+                    val s = again ?: all.random(rnd)
                     forgotAt[s.url] = step
                     ended[s.url] = step
                     events += Ev(step, "forget", s.url)
                     vm.forget(s)
-                    "forget ${s.url}"
+                    if (again != null) {
+                        vm.connect(s, password(s), false)
+                        "forget ${s.url}, and connect to it again"
+                    } else {
+                        "forget ${s.url}"
+                    }
                 }
                 12 -> {
                     val fp = listOf(FINGERPRINT, FP3).random(rnd)
@@ -638,7 +646,8 @@ class ChatViewModelInterleavingTest : ViewModelHarness() {
                 val url = s.url
                 // Forgotten, and not landed since: nothing of it is kept.
                 val forgot = events.lastOrNull { it.kind == "forget" && it.url == url }
-                val landedSince = events.any { it.kind == "landed" && it.url == url && it.created > forgot?.step ?: 0 }
+                // A connect in the step of a forget is asked for after it: no act does the two the other way about.
+                val landedSince = events.any { it.kind == "landed" && it.url == url && it.created >= (forgot?.step ?: 0) }
                 if (forgot != null && sure(forgot.step) && !landedSince) {
                     val left = outside { listOfNotNull(s.takeIf { s in remembered }, servers.password(s), servers.session(s)) }
                     if (left.isNotEmpty()) fail("$url forgotten, and still kept: $left")

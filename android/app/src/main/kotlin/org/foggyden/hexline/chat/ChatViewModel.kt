@@ -192,8 +192,13 @@ class ChatViewModel internal constructor(
     private var established = false
     private var foreground = true
 
-    /** Per server, the session write waiting its turn on the store queue, and when it was asked for. */
-    private val sessionWrites = ConcurrentHashMap<Server, Pair<ByteArray, Long>>()
+    /**
+     * Per server and connection, the session write waiting its turn on the
+     * store queue, and when it was asked for. Per connection, so a new
+     * connection's write is queued behind its own login's remember, never
+     * folded into one an earlier connection queued before it.
+     */
+    private val sessionWrites = ConcurrentHashMap<Pair<Server, Connection>, Pair<ByteArray, Long>>()
 
     /**
      * One sink per connection, so a late batch from one no longer current
@@ -850,8 +855,9 @@ class ChatViewModel internal constructor(
         val since = servers.generation()
         // The core tells a busy link's session after every batch: one write
         // waits at a time, taking the newest asked for when its turn comes.
-        if (sessionWrites.put(to, saved to since) == null) {
-            later { sessionWrites.remove(to)?.let { (bytes, at) -> servers.keepSession(to, bytes, at) } }
+        val key = to to conn
+        if (sessionWrites.put(key, saved to since) == null) {
+            later { sessionWrites.remove(key)?.let { (bytes, at) -> servers.keepSession(to, bytes, at) } }
         }
     }
 

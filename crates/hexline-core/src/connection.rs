@@ -1137,7 +1137,7 @@ async fn supervise(
             }
             let earliest = last_try.map_or_else(Instant::now, |t| t + BACKOFF_FIRST);
             if let Held::HangUp { logout } =
-                hold(delay, earliest, &mut control, &mut foreground).await
+                hold(delay, earliest, &mut control, &mut foreground, &shared).await
             {
                 end(&url, &shared, None, logout).await;
                 shared.deliver(vec![shared.closed()]);
@@ -1280,6 +1280,7 @@ async fn hold(
     earliest: Instant,
     control: &mut mpsc::UnboundedReceiver<Control>,
     foreground: &mut bool,
+    shared: &Shared,
 ) -> Held {
     let wait = sleep(delay);
     tokio::pin!(wait);
@@ -1302,9 +1303,15 @@ async fn hold(
             Some(Control::Nudge) => {}
             Some(Control::Foreground(f)) => {
                 let back = f && !*foreground;
+                // A link lost in front, the app gone behind since: its last
+                // cursor was never told, as no batch came after it to tell.
+                let away = !f && *foreground;
                 *foreground = f;
                 if back {
                     return Held::Go;
+                }
+                if away && shared.kept.lock().unwrap().is_some() {
+                    shared.deliver(vec![CoreUpdate::SessionKept]);
                 }
             }
             Some(Control::HangUp { logout }) => return Held::HangUp { logout },
@@ -1546,6 +1553,69 @@ fn event(ev: String, data: Value) -> CoreUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct Told(Mutex<Vec<String>>);
+
+    impl UpdateSink for Told {
+        fn deliver(&self, updates: Vec<CoreUpdate>) {
+            self.0
+                .lock()
+                .unwrap()
+                .extend(updates.iter().map(|u| format!("{u:?}")));
+        }
+    }
+
+    fn kept() -> Kept {
+        Kept {
+            resumable: Resumable {
+                session: "s_1".into(),
+                token: Token::new("secret".into()),
+                last_seq: 7,
+                needs_sync: false,
+            },
+            self_uid: 3,
+            caps: Vec::new(),
+            guest: false,
+            fingerprint: None,
+            outcome: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_link_lost_in_front_tells_its_session_kept_once_the_app_goes_behind() {
+        for (case, keeping, told) in [("a session kept", true, 1), ("none", false, 0)] {
+            let sink = Arc::new(Told::default());
+            let shared = Shared {
+                sink: sink.clone(),
+                client: Mutex::new(None),
+                kept: Mutex::new(keeping.then(kept)),
+                foreground: AtomicBool::new(true),
+                linger_ms: AtomicU64::new(0),
+            };
+            let (tx, mut control) = mpsc::unbounded_channel();
+            tx.send(Control::Foreground(false)).unwrap();
+            tx.send(Control::Foreground(true)).unwrap();
+            let mut foreground = true;
+            let held = hold(
+                Duration::from_secs(3600),
+                Instant::now(),
+                &mut control,
+                &mut foreground,
+                &shared,
+            )
+            .await;
+            assert!(matches!(held, Held::Go), "{case}");
+            let kept = sink
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|u| *u == "SessionKept")
+                .count();
+            assert_eq!(kept, told, "{case}: {:?}", sink.0.lock().unwrap());
+        }
+    }
 
     #[test]
     fn a_batch_is_told_kept_only_away_from_the_front_and_while_the_session_lives_on() {
