@@ -2,6 +2,7 @@ package org.foggyden.hexline.chat
 
 import android.app.Application
 import android.content.SharedPreferences
+import android.net.ConnectivityManager
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
 import androidx.lifecycle.ViewModel
@@ -41,6 +42,8 @@ import org.foggyden.hexline.servers.StoreQueue
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.robolectric.RuntimeEnvironment
+import org.robolectric.Shadows.shadowOf
+import org.robolectric.shadows.ShadowConnectivityManager
 import java.io.File
 import kotlin.coroutines.CoroutineContext
 
@@ -122,12 +125,30 @@ abstract class ViewModelHarness {
     protected fun fresh() {
         owner.clear()
         settle()
+        // A model left registered is kept alive, with its stores, for the rest of the run.
+        assertEquals("network callbacks a cleared model leaves", 0, networkCallbacks().size)
+        // Robolectric also keeps every callback ever registered, and each its
+        // model, until the test ends; a run of seeds is one test, so each
+        // seed starts as a new test would.
+        ShadowConnectivityManager.reset()
         armed = false
         stores = Stores(++cases)
         process = Process()
         opened.clear()
         enrollments.clear()
     }
+
+    /**
+     * Lets go of what a killed process registered with the system. In the app
+     * it goes with the process; here its model's network callback would stay
+     * registered, still called and still keeping the model.
+     */
+    protected fun forgetDeadProcess() {
+        val connectivity = app.getSystemService(ConnectivityManager::class.java)
+        for (callback in networkCallbacks()) connectivity.unregisterNetworkCallback(callback)
+    }
+
+    private fun networkCallbacks() = shadowOf(app.getSystemService(ConnectivityManager::class.java)).networkCallbacks.toList()
 
     protected fun model(): ChatViewModel {
         val factory =

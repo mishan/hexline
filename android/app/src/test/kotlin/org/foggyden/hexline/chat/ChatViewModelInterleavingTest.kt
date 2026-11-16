@@ -514,6 +514,7 @@ class ChatViewModelInterleavingTest : ViewModelHarness() {
             // session it was to clear is still there, nothing ended it.
             for (s in all) if ((ended[s.url] ?: -1) > quietAt && outside { servers.session(s) } != null) ended -= s.url
             starts.clear()
+            forgetDeadProcess()
             owner = ViewModelStore()
             process = Process()
             stores = Stores(cases, stores.secrets)
