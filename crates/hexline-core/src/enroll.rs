@@ -293,11 +293,12 @@ impl Enrollee {
             let reply: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             match status {
                 200 => break bytes(&reply, "bundle")?,
-                202 if tokio::time::Instant::now() < deadline => {
+                // Not yet: asked again, and its deadline ends it at the top of the loop.
+                202 => {
                     tokio::time::sleep_until((asked + POLL_FLOOR).min(deadline)).await;
                     continue;
                 }
-                202 | 404 | 410 => return Err(refused("expired")),
+                404 | 410 => return Err(refused("expired")),
                 403 => {
                     return Err(CoreError::Refused {
                         code: "denied".into(),
@@ -720,6 +721,133 @@ mod tests {
             "{ended:?}"
         );
         assert!(!phone.may_have_asked());
+    }
+
+    /// A mailbox whose requests live `life` seconds and whose polls are
+    /// answered `polls` in turn, the last again and again: each a status and
+    /// a body. Hands back its port, and when each poll came.
+    async fn mailbox(
+        life: u64,
+        polls: Vec<(u16, String)>,
+    ) -> (u16, Arc<Mutex<Vec<std::time::Instant>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let times = asked.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let (status, body) = if head.starts_with("GET /.well-known/hotline") {
+                    (
+                        200,
+                        r#"{"identity":{"endpoints":{"enroll":"/identity/enroll"}}}"#.to_owned(),
+                    )
+                } else if head.starts_with("POST /identity/enroll/requests") {
+                    (201, format!(r#"{{"request":"r1","expires_in":{life}}}"#))
+                } else {
+                    let mut t = times.lock().unwrap();
+                    t.push(std::time::Instant::now());
+                    polls[(t.len() - 1).min(polls.len() - 1)].clone()
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(reply.as_bytes()).await;
+            }
+        });
+        (port, asked)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mailbox_saying_not_yet_is_asked_again_a_second_later_until_it_answers() {
+        use hl_identity::IdentityKey;
+        let alice = IdentityKey::generate();
+        let phone = Enrollee::new();
+        let mut cert = DeviceCert::for_keys(
+            &alice,
+            phone.device.public(),
+            phone.device.public_enc(),
+            now(),
+            86_400,
+        )
+        .unwrap();
+        cert.caps = Some(caps::LOGIN | caps::MESSAGE);
+        let bundle = Bundle {
+            cert: cert.sign(&alice),
+            card: Card::new(&alice, "Alice", now())
+                .sign(&alice, Vec::new())
+                .unwrap(),
+        }
+        .encode();
+        let not_yet = (202, r#"{"expires_in":50}"#.to_owned());
+        let answer = (200, format!(r#"{{"bundle":"{}"}}"#, b64(&bundle)));
+        let (port, asked) = mailbox(60, vec![not_yet.clone(), not_yet, answer]).await;
+        let enrolled = tokio::time::timeout(
+            Duration::from_secs(20),
+            phone.clone().enroll(
+                format!("http://127.0.0.1:{port}"),
+                Some("K7PM-4XWE".into()),
+                "Hexline".into(),
+            ),
+        )
+        .await
+        .expect("answered in time")
+        .unwrap();
+        assert_eq!(enrolled.name, "Alice");
+        let times = asked.lock().unwrap().clone();
+        assert_eq!(times.len(), 3);
+        for pair in times.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= Duration::from_millis(900),
+                "asked again too soon"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_past_its_life_or_gone_from_the_mailbox_has_expired() {
+        // Not yet, past the request's life; and the request gone, either way.
+        for (life, status, body) in [
+            (1, 202, r#"{"expires_in":1}"#),
+            (60, 410, ""),
+            (60, 404, ""),
+        ] {
+            let (port, _) = mailbox(life, vec![(status, body.to_owned())]).await;
+            let ended = tokio::time::timeout(
+                Duration::from_secs(20),
+                Enrollee::new().enroll(
+                    format!("http://127.0.0.1:{port}"),
+                    Some("K7PM-4XWE".into()),
+                    "Hexline".into(),
+                ),
+            )
+            .await
+            .expect("ended in time");
+            assert!(
+                matches!(ended, Err(CoreError::Refused { ref code, .. }) if code == "expired"),
+                "{status}: {ended:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_card_is_read_for_its_name_and_a_tie_keeps_the_card_answered() {
+        use hl_identity::IdentityKey;
+        let alice = IdentityKey::generate();
+        let card = |name: &str| {
+            Card::new(&alice, name, 900)
+                .sign(&alice, Vec::new())
+                .unwrap()
+        };
+        assert_eq!(card_name(card("Alice")).as_deref(), Some("Alice"));
+        assert_eq!(card_name(vec![1, 2, 3]), None);
+        // Of two cards updated at once, the answer's is as good as the one kept.
+        assert_eq!(newer_card(card("Old"), card("New")), card("New"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
