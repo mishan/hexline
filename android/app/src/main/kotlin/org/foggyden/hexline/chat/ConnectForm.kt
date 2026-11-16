@@ -52,6 +52,13 @@ data class ConnectForm(
     fun identity(identities: List<StoredIdentity>): StoredIdentity? =
         if (chosen != null) identities.find { it.fingerprint == chosen } else identities.singleOrNull()
 
+    /** [fingerprint]'s identity picked: an account to link was typed for the one picked before. */
+    fun chose(fingerprint: String): ConnectForm =
+        if (fingerprint == chosen) this else copy(chosen = fingerprint, linking = false, linkLogin = "", linkPassword = "")
+
+    /** [fingerprint]'s identity, just restored or enrolled, picked to sign in with. */
+    fun restored(fingerprint: String): ConnectForm = copy(byIdentity = true).chose(fingerprint)
+
     /** The identity picked is no longer on this phone. */
     fun missing(identities: List<StoredIdentity>): Boolean = chosen != null && identities.none { it.fingerprint == chosen }
 
@@ -80,8 +87,9 @@ data class ConnectForm(
         val identity = identity(identities) ?: return null
         val server = identityServer(identity)
         if (!standing(identity, now).usable || refused(server, identity) != null) return null
+        // Linking writes to the account, which only a device that may manage may ask.
         val link =
-            if (linking) {
+            if (linking && identity.info.canManage) {
                 ClassicLogin(linkLogin.ifBlank { return null }, linkPassword)
             } else {
                 null

@@ -478,10 +478,6 @@ pub async fn back_up(
     secret: &hl_identity::envelope::Secret<'_>,
 ) -> hl_identity::IdentityKey {
     use hl_identity::{EnvelopePut, IdentityKey, KeyEnvelope, RegisterRequest};
-    let b64 = |b: &[u8]| {
-        use base64::Engine;
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
-    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -518,4 +514,158 @@ pub async fn back_up(
         resp.text().await.unwrap_or_default()
     );
     id
+}
+
+/// A holder of an identity key at `server`'s enrollment mailbox
+/// (hxd-ng's `identity-enrollment.md` §5), as `hlid enroll` and `hlid
+/// agent` are, with what a person at its prompt decides left to the test.
+pub struct Holder {
+    http: reqwest::Client,
+    mailbox: String,
+    pub id: hl_identity::IdentityKey,
+    pub card: Vec<u8>,
+}
+
+/// One session the holder opened, with the code it shows.
+pub struct HolderSession {
+    secret: String,
+    pub code: String,
+}
+
+/// A request the mailbox delivered to a session, to answer.
+pub struct Asked {
+    id: String,
+    pub request: hl_identity::EnrollRequest,
+}
+
+impl Holder {
+    /// A holder of a new identity called `name`.
+    pub fn new(server: &Server, name: &str) -> Holder {
+        let (id, d) = device(name);
+        Holder {
+            http: crate::auth::http_client(&server.http, None).unwrap(),
+            mailbox: format!("{}/identity/enroll", server.http),
+            id,
+            card: d.card,
+        }
+    }
+
+    /// A session, and its code.
+    pub async fn open(&self) -> HolderSession {
+        let opened = crate::auth::post(&self.http, &format!("{}/sessions", self.mailbox), None)
+            .await
+            .unwrap();
+        HolderSession {
+            secret: opened["session"].as_str().unwrap().to_owned(),
+            code: opened["code"].as_str().unwrap().to_owned(),
+        }
+    }
+
+    /// A session standing by for this identity's renewals (§8).
+    pub async fn stand_by(&self) -> HolderSession {
+        let s = self.open().await;
+        let claim = hl_identity::SessionClaim::new(
+            self.id.public(),
+            hl_identity::enroll::session_key(&s.secret),
+        )
+        .sign(&self.id);
+        // Answered 204, with no JSON to read.
+        let resp = self
+            .http
+            .post(format!("{}/sessions/{}/identity", self.mailbox, s.secret))
+            .json(&serde_json::json!({ "claim": b64(&claim) }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 204);
+        s
+    }
+
+    /// The next request the session is sent.
+    pub async fn asked(&self, s: &HolderSession) -> Asked {
+        loop {
+            let (status, body) = crate::auth::get_waiting(
+                &self.http,
+                &format!("{}/sessions/{}", self.mailbox, s.secret),
+                Duration::from_secs(35),
+            )
+            .await
+            .unwrap();
+            assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+            let reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if let Some(first) = reply["pending"].as_array().and_then(|p| p.first()) {
+                let raw = unb64(first["request"].as_str().unwrap());
+                return Asked {
+                    id: first["id"].as_str().unwrap().to_owned(),
+                    request: hl_identity::EnrollRequest::parse(&raw).unwrap(),
+                };
+            }
+        }
+    }
+
+    /// Certify what `asked` asks to be, for as long as `days`, with the
+    /// capabilities `hlid`'s default `--caps web` gives: login and messages.
+    pub async fn approve(&self, s: &HolderSession, asked: &Asked, days: u64) {
+        let r = &asked.request;
+        self.answer_with(s, asked, r.device, r.device_enc, days)
+            .await;
+    }
+
+    /// Answer `asked` with a certificate for the keys given, whatever it
+    /// asked to be certified.
+    pub async fn answer_with(
+        &self,
+        s: &HolderSession,
+        asked: &Asked,
+        device: hl_identity::PublicKey,
+        device_enc: [u8; 32],
+        days: u64,
+    ) {
+        use hl_identity::{caps, Bundle, DeviceCert};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut cert =
+            DeviceCert::for_keys(&self.id, device, device_enc, now, days * 86_400).unwrap();
+        cert.caps = Some(asked.request.caps.unwrap_or(u64::MAX) & (caps::LOGIN | caps::MESSAGE));
+        cert.name = asked.request.name.clone();
+        let bundle = Bundle {
+            cert: cert.sign(&self.id),
+            card: self.card.clone(),
+        };
+        self.answer(
+            s,
+            serde_json::json!({ "id": asked.id, "bundle": b64(&bundle.encode()) }),
+        )
+        .await;
+    }
+
+    /// Say no to `asked`, giving `reason`.
+    pub async fn deny(&self, s: &HolderSession, asked: &Asked, reason: &str) {
+        self.answer(s, serde_json::json!({ "id": asked.id, "denied": reason }))
+            .await;
+    }
+
+    async fn answer(&self, s: &HolderSession, body: serde_json::Value) {
+        crate::auth::post(
+            &self.http,
+            &format!("{}/sessions/{}/answers", self.mailbox, s.secret),
+            Some(body),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+fn b64(b: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+}
+
+fn unb64(s: &str) -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s)
+        .unwrap()
 }

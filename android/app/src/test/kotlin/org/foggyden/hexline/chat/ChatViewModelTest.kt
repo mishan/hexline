@@ -23,9 +23,13 @@ import org.foggyden.hexline.core.Connection
 import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.CoreUpdate
 import org.foggyden.hexline.core.DeviceIdentity
+import org.foggyden.hexline.core.Enrolled
+import org.foggyden.hexline.core.Enrollment
 import org.foggyden.hexline.core.HistoryPage
 import org.foggyden.hexline.core.LoginInfo
 import org.foggyden.hexline.core.UpdateSink
+import org.foggyden.hexline.core.certForDevice
+import org.foggyden.hexline.identity.Enrolling
 import org.foggyden.hexline.identity.Identities
 import org.foggyden.hexline.secrets.SecretUnavailable
 import org.foggyden.hexline.secrets.SecretUnreadable
@@ -86,6 +90,10 @@ class ChatViewModelTest {
     private val secrets get() = stores.secrets
 
     private val opened = mutableListOf<FakeConnection>()
+    private val enrollments = mutableListOf<FakeEnrollment>()
+
+    /** What the store held of the identity's last try when the holder was asked. */
+    private var triedWhenAsked: Long? = null
     private var now = ISSUED + DAY
     private val owner = ViewModelStore()
     private val uncaught = mutableListOf<Throwable>()
@@ -118,6 +126,7 @@ class ChatViewModelTest {
         armed = false
         stores = Stores(++cases)
         opened.clear()
+        enrollments.clear()
     }
 
     private fun model(): ChatViewModel {
@@ -130,6 +139,9 @@ class ChatViewModelTest {
                 ): T =
                     ChatViewModel(app, servers, identities, StoreQueue(disk), { url, sink ->
                         FakeConnection(url, sink).also { opened += it }
+                    }, { renewing, expecting ->
+                        FakeEnrollment(renewing, expecting) { triedWhenAsked = outside { identities.list().singleOrNull()?.renewTried } }
+                            .also { enrollments += it }
                     }, { now }) as T
             }
         armed = true
@@ -222,7 +234,35 @@ class ChatViewModelTest {
                 .info.device
         }
 
-    private fun keepIdentity() = outside { identities.save(SEED.copyOf(), CERT, CARD, "alice@example", null) }
+    private fun keepIdentity(mailbox: String? = null) =
+        outside { identities.save(SEED.copyOf(), CERT, CARD, "alice@example", null, mailbox) }
+
+    private fun stored() = outside { identities.list().singleOrNull() }
+
+    /** The run the enroll screen shows, which a tap answers to. */
+    private fun gen(vm: ChatViewModel) =
+        when (val e = vm.enrollment.value) {
+            is Enrolling.Ready -> e.gen
+            is Enrolling.Failed -> e.gen
+            is Enrolling.Answered -> e.gen
+            else -> -1
+        }
+
+    /** Keep, as the screen asks it: for the run and the identity shown. */
+    private fun confirm(vm: ChatViewModel) {
+        val shown = vm.enrollment.value as Enrolling.Answered
+        vm.confirmEnroll(shown.gen, shown.fingerprint)
+    }
+
+    private fun shownAs(vm: ChatViewModel): String =
+        when (val e = vm.enrollment.value) {
+            is Enrolling.Ready -> "ready ${e.device}"
+            is Enrolling.Waiting -> "waiting ${e.device}"
+            is Enrolling.Saving -> "saving ${e.name}"
+            is Enrolling.Failed -> "failed ${e.device} ${e.problem}"
+            is Enrolling.Done -> "done ${e.fingerprint}"
+            else -> e.toString()
+        }
 
     private fun saved(
         server: Server,
@@ -683,6 +723,9 @@ class ChatViewModelTest {
         /** By the start of a secret's name, what opening it throws. */
         val fails = mutableMapOf<String, () -> Exception>()
 
+        /** What keeping any secret throws, if anything. */
+        var putFails: (() -> Exception)? = null
+
         private fun onQueue() = check(!armed || exempt || onDisk) { "a store touched off its queue" }
 
         override fun put(
@@ -690,6 +733,7 @@ class ChatViewModelTest {
             secret: ByteArray,
         ) {
             onQueue()
+            putFails?.let { throw it() }
             kept[name] = secret.copyOf()
         }
 
@@ -706,6 +750,425 @@ class ChatViewModelTest {
     }
 
     /** Preferences, as [MemorySecrets] holds secrets: touched by a live model only on the store queue. */
+    @Test
+    fun aDeviceEnrolledIsKeptOnlyOnceThePersonHasSeenWhoseItIs() {
+        for (then in listOf("keep", "discard", "cancel while waiting")) {
+            fresh()
+            val vm = model()
+            settle()
+            vm.startEnroll(null)
+            settle()
+            assertEquals(then, "ready $DEVICE", shownAs(vm))
+            val e = enrollments.single()
+            assertNull("$then: a new device", e.renewing)
+            vm.requestEnroll(gen(vm), "hl.example", "K7PM-4XWE", "Hexline")
+            settle()
+            assertEquals(then, Triple("hl.example", "K7PM-4XWE", "Hexline"), e.asked)
+            assertEquals(then, "waiting $DEVICE", shownAs(vm))
+            if (then == "cancel while waiting") {
+                vm.discardEnroll()
+                settle()
+                assertTrue("$then: the wait ends and the key goes", e.canceled && e.closed)
+                assertTrue(then, stored() == null)
+                continue
+            }
+            core { e.answer.complete(ENROLLED) }
+            settle()
+            val answered = vm.enrollment.value as Enrolling.Answered
+            assertEquals(
+                then,
+                listOf(DEVICE, "Fixture", FINGERPRINT, EXPIRES.toULong(), false, null),
+                listOf(answered.device, answered.name, answered.fingerprint, answered.info.expires, answered.namesake, answered.replaces),
+            )
+            assertTrue("$then: nothing kept before the person says", stored() == null)
+            if (then == "keep") confirm(vm) else vm.discardEnroll()
+            settle()
+            assertTrue("$then: the key is let go of", e.closed)
+            if (then == "keep") {
+                val kept = stored()!!
+                // The card's name is the identity's word for itself, not a registrar's handle.
+                assertEquals(listOf(FINGERPRINT, null, "hl.example"), listOf(kept.fingerprint, kept.handle, kept.mailbox))
+                assertArrayEquals(SEED, outside { identities.device(FINGERPRINT)?.second })
+                assertEquals("done $FINGERPRINT", shownAs(vm))
+            } else {
+                assertNull(then, stored())
+            }
+        }
+    }
+
+    @Test
+    fun aRenewalByCodeIsTheDeviceKeptWhileInItsTimeAndANewOneOnceExpired() {
+        for (expired in listOf(false, true)) {
+            fresh()
+            keepIdentity("hl.example")
+            now = if (expired) EXPIRES + PAST_SKEW else ISSUED + DAY
+            val vm = model()
+            settle()
+            vm.startEnroll(FINGERPRINT)
+            settle()
+            val e = enrollments.single()
+            if (expired) {
+                assertNull("a lapsed certificate enrolls afresh", e.renewing)
+            } else {
+                assertArrayEquals(SEED, e.renewing!!.first)
+                assertArrayEquals(CERT, e.renewing.second)
+            }
+            assertEquals("expired $expired: as the same identity's", FINGERPRINT, e.expecting)
+        }
+    }
+
+    @Test
+    fun anEnrollmentAskedForAgainWhileTheFirstReadsItsDeviceLetsTheFirstGo() {
+        keepIdentity("hl.example")
+        val vm = model()
+        settle()
+        vm.startEnroll(FINGERPRINT)
+        // Its device's read is queued, not made.
+        onMain()
+        vm.startEnroll(FINGERPRINT)
+        settle()
+        assertEquals(2, enrollments.size)
+        assertTrue("the first is let go of", enrollments[0].closed)
+        assertTrue("the second is the one shown", !enrollments[1].closed)
+        assertEquals("ready $DEVICE", shownAs(vm))
+    }
+
+    @Test
+    fun anAnswerForAnIdentityOnThePhoneSaysWhatItReplaces() {
+        for (held in listOf(false, true)) {
+            fresh()
+            if (held) keepIdentity("hl.example")
+            val vm = model()
+            settle()
+            vm.startEnroll(null)
+            settle()
+            vm.requestEnroll(gen(vm), "hl.example", "K7PM-4XWE", "Hexline")
+            settle()
+            core { enrollments.single().answer.complete(ENROLLED) }
+            settle()
+            val answered = vm.enrollment.value as Enrolling.Answered
+            assertEquals("held $held", held, answered.replaces != null)
+        }
+    }
+
+    @Test
+    fun anAnswerThePhoneCouldNotKeepAsksToStartAgain() {
+        val vm = model()
+        settle()
+        vm.startEnroll(null)
+        settle()
+        vm.requestEnroll(gen(vm), "hl.example", "K7PM-4XWE", "Hexline")
+        settle()
+        val e = enrollments.single()
+        core { e.answer.complete(ENROLLED) }
+        settle()
+        secrets.putFails = { SecretUnavailable("seed", IOException("locked")) }
+        confirm(vm)
+        settle()
+        assertEquals("failed  AnswerNotKept", shownAs(vm))
+        assertTrue("its device is gone", e.closed)
+        secrets.putFails = null
+        vm.startEnroll(null)
+        settle()
+        assertEquals("a new device to ask with", "ready $DEVICE", shownAs(vm))
+        assertEquals(2, enrollments.size)
+    }
+
+    @Test
+    fun aSaveConfirmedThenLeftForAnotherEnrollmentDoesNotEndTheOther() {
+        val vm = model()
+        settle()
+        vm.startEnroll(null)
+        settle()
+        vm.requestEnroll(gen(vm), "hl.example", "K7PM-4XWE", "Hexline")
+        settle()
+        core { enrollments.single().answer.complete(ENROLLED) }
+        settle()
+        confirm(vm)
+        assertEquals("nothing left to discard", "saving Fixture", shownAs(vm))
+        // Its save still queued, another begun.
+        vm.discardEnroll()
+        vm.startEnroll(null)
+        settle()
+        assertEquals("the second's screen", "ready $DEVICE", shownAs(vm))
+        assertTrue("the second still open", !enrollments[1].closed)
+        assertEquals("the first kept, as the person said", FINGERPRINT, stored()?.fingerprint)
+    }
+
+    @Test
+    fun aQuietRenewalIsOfTheRecordAsItIsWhenItsDeviceIsRead() {
+        keepIdentity("old.example")
+        now = ISSUED + (EXPIRES - ISSUED) * 2 / 3 + DAY
+        model()
+        // The launch's first read, then the renewal's list of what is due.
+        onMain()
+        onDisk()
+        onMain()
+        onDisk()
+        // Enrolled again through another mailbox before its device is read.
+        keepIdentity("new.example")
+        settle()
+        assertEquals("new.example", enrollments.single().asked?.first)
+    }
+
+    @Test
+    fun aDueDeviceIsRenewedQuietlyOnceADayWhereAHolderStandsBy() {
+        val due = ISSUED + (EXPIRES - ISSUED) * 2 / 3 + DAY
+        for (answer in listOf("renewed", "no holder", "unreachable", "left while waiting", "not due")) {
+            fresh()
+            keepIdentity("hl.example")
+            // Tried long ago, and found no holder then.
+            outside { identities.renewTried(FINGERPRINT, CERT, 1, true) }
+            now = if (answer == "not due") ISSUED + DAY else due
+            model()
+            settle()
+            if (answer == "not due") {
+                assertTrue(answer, enrollments.isEmpty())
+                continue
+            }
+            val e = enrollments.single()
+            assertEquals("$answer: written before the holder is asked", due, triedWhenAsked)
+            assertArrayEquals("$answer: the device it has", SEED, e.renewing!!.first)
+            assertEquals(answer, Triple("hl.example", null, "Hexline"), e.asked)
+            // The holder takes its time: what is noted is when it ended.
+            now += HOUR
+            when (answer) {
+                "renewed" -> core { e.answer.complete(enrolled(RENEWED)) }
+                "no holder" -> core { e.answer.completeExceptionally(CoreException.Refused("no_holder", "")) }
+                "left while waiting" -> owner.clear()
+                else -> {
+                    // Unreachable before its request reached the mailbox.
+                    e.posted = false
+                    core { e.answer.completeExceptionally(CoreException.Connect("offline")) }
+                }
+            }
+            settle()
+            assertTrue("$answer: let go of", e.closed)
+            val kept = stored()!!
+            when (answer) {
+                "renewed" -> {
+                    assertEquals(answer, listOf(0L, false, "hl.example"), listOf(kept.renewTried, kept.noHolder, kept.mailbox))
+                    assertArrayEquals("$answer: the new certificate kept", RENEWED, kept.cert)
+                }
+                "no holder" -> assertEquals(answer, listOf(due + HOUR, true), listOf(kept.renewTried, kept.noHolder))
+                "left while waiting" ->
+                    assertEquals(
+                        "$answer: a holder asked counts, from when it was asked",
+                        listOf(due, false),
+                        listOf(kept.renewTried, kept.noHolder),
+                    )
+                else -> assertEquals("$answer: not counted", listOf(1L, true), listOf(kept.renewTried, kept.noHolder))
+            }
+            if (answer == "renewed") continue
+            // The app again, the same day, and the next.
+            if (answer != "left while waiting") owner.clear()
+            settle()
+            model()
+            settle()
+            assertEquals("$answer: asked again the same day", if (answer == "unreachable") 2 else 1, enrollments.size)
+            owner.clear()
+            settle()
+            now += DAY
+            model()
+            settle()
+            assertEquals("$answer: and the next", if (answer == "unreachable") 3 else 2, enrollments.size)
+        }
+    }
+
+    @Test
+    fun aQuietRenewalAnsweredForAnotherIdentityKeepsNothing() {
+        keepIdentity("hl.example")
+        now = ISSUED + (EXPIRES - ISSUED) * 2 / 3 + DAY
+        model()
+        settle()
+        core { enrollments.single().answer.complete(enrolled(RENEWED, fingerprint = "someone-else")) }
+        settle()
+        assertArrayEquals(CERT, stored()!!.cert)
+    }
+
+    @Test
+    fun aRenewalByCodeKeepsTheNewCertificateWithTheHandleItHad() {
+        keepIdentity("old.example")
+        val vm = model()
+        settle()
+        vm.startEnroll(FINGERPRINT)
+        settle()
+        vm.requestEnroll(gen(vm), "new.example", "K7PM-4XWE", "Hexline")
+        settle()
+        core { enrollments.single().answer.complete(enrolled(RENEWED)) }
+        settle()
+        confirm(vm)
+        settle()
+        val kept = stored()!!
+        assertArrayEquals(RENEWED, kept.cert)
+        assertEquals(listOf("alice@example", "new.example"), listOf(kept.handle, kept.mailbox))
+    }
+
+    @Test
+    fun anAnswerForANewIdentityByANameThePhoneHoldsSaysSo() {
+        keepIdentity("hl.example")
+        val vm = model()
+        settle()
+        vm.startEnroll(null)
+        settle()
+        vm.requestEnroll(gen(vm), "hl.example", "K7PM-4XWE", "Hexline")
+        settle()
+        core { enrollments.single().answer.complete(enrolled(CERT, fingerprint = "another")) }
+        settle()
+        val answered = vm.enrollment.value as Enrolling.Answered
+        assertEquals(listOf(true, null), listOf(answered.namesake, answered.replaces))
+    }
+
+    @Test
+    fun aRenewalWhoseDeviceCannotBeReadIsANewDeviceHeldToItsIdentity() {
+        for (device in listOf("gone", "unreadable")) {
+            fresh()
+            if (device == "unreadable") {
+                keepIdentity("hl.example")
+                secrets.fails["device-"] = { SecretUnreadable("seed", IOException("bad")) }
+            }
+            val vm = model()
+            settle()
+            vm.startEnroll(FINGERPRINT)
+            settle()
+            val e = enrollments.single()
+            assertEquals(device, listOf(null, FINGERPRINT), listOf(e.renewing, e.expecting))
+            vm.requestEnroll(gen(vm), "hl.example", "K7PM-4XWE", "Hexline")
+            settle()
+            core { e.answer.complete(enrolled(CERT, fingerprint = "another")) }
+            settle()
+            assertEquals(device, "failed $DEVICE NotForThisPhone", shownAs(vm))
+        }
+    }
+
+    @Test
+    fun aRunTakesOneRequestAndKeepsOnlyTheAnswerItShowed() {
+        val vm = model()
+        settle()
+        vm.startEnroll(null)
+        settle()
+        val first = gen(vm)
+        vm.requestEnroll(first, "hl.example", "K7PM-4XWE", "Hexline")
+        vm.requestEnroll(first, "other.example", "K7PM-4XWE", "Hexline")
+        settle()
+        val e = enrollments.single()
+        assertEquals("asked once", "hl.example", e.asked?.first)
+        core { e.answer.complete(ENROLLED) }
+        settle()
+        vm.confirmEnroll(first, "someone-else")
+        vm.confirmEnroll(first - 1, FINGERPRINT)
+        settle()
+        assertNull("neither the answer shown nor this run's", stored())
+        assertTrue(vm.enrollment.value is Enrolling.Answered)
+    }
+
+    @Test
+    fun signingInLeavesEnrollingAndItsDeviceGoes() {
+        val server = passwordServer("signing in")
+        val vm = model()
+        settle()
+        vm.startEnroll(null)
+        settle()
+        vm.connect(server, "pw", false)
+        settle()
+        land(opened.single(), LOGGED_IN)
+        live(opened.single())
+        settle()
+        assertTrue("its key wiped", enrollments.single().closed)
+        assertEquals(Enrolling.Idle, vm.enrollment.value)
+    }
+
+    @Test
+    fun aRenewalsTryTheStoreCannotWriteIsLostAndNothingElse() {
+        keepIdentity("hl.example")
+        now = ISSUED + (EXPIRES - ISSUED) * 2 / 3 + DAY
+        val dir = File(app.filesDir, "identities-$cases")
+        try {
+            // Nothing can be written there now.
+            dir.setWritable(false)
+            model()
+            settle()
+            val e = enrollments.single()
+            core { e.answer.completeExceptionally(CoreException.Refused("no_holder", "")) }
+            settle()
+            assertTrue("the holder was still asked", e.asked != null)
+        } finally {
+            dir.setWritable(true)
+        }
+    }
+
+    @Test
+    fun aRenewalAnsweredAfterItsIdentityIsDeletedKeepsNothing() {
+        keepIdentity("hl.example")
+        now = ISSUED + (EXPIRES - ISSUED) * 2 / 3 + DAY
+        val vm = model()
+        settle()
+        val e = enrollments.single()
+        vm.deleteIdentity(FINGERPRINT)
+        settle()
+        core { e.answer.complete(ENROLLED) }
+        settle()
+        assertNull(stored())
+        assertNull(outside { identities.device(FINGERPRINT) })
+    }
+
+    /** An enrollment whose holder answers when the test says, as the core's would. */
+    private class FakeEnrollment(
+        given: Pair<ByteArray, ByteArray>?,
+        /** The identity alone an answer may be from, held to it as the core holds it. */
+        val expecting: String?,
+        /** Told as the holder is asked. */
+        val onAsk: () -> Unit = {},
+    ) : Enrollment {
+        /** Copied as the core copies it: the caller wipes its own. */
+        val renewing = given?.let { it.first.copyOf() to it.second.copyOf() }
+        val answer = CompletableDeferred<Enrolled>()
+        var asked: Triple<String, String?, String>? = null
+        var canceled = false
+        var closed = false
+
+        /** Whether its request was sent: once asked, unless the test says not. */
+        var posted = false
+        private var inFlight = false
+
+        override fun deviceFingerprint() = DEVICE
+
+        override suspend fun enroll(
+            mailbox: String,
+            code: String?,
+            name: String,
+        ): Enrolled {
+            check(!closed) { "a closed enrollment called" }
+            if (inFlight) throw CoreException.Refused("busy", "")
+            inFlight = true
+            onAsk()
+            asked = Triple(mailbox, code, name)
+            posted = true
+            try {
+                val got = answer.await()
+                if (expecting != null && got.fingerprint != expecting) throw CoreException.Refused("wrong_identity", "")
+                return got
+            } finally {
+                inFlight = false
+            }
+        }
+
+        override fun cancel() {
+            canceled = true
+            answer.completeExceptionally(CoreException.Refused("canceled", ""))
+        }
+
+        override fun seed() = (renewing?.first ?: SEED).copyOf()
+
+        override fun expectIdentity(fingerprint: String) = error("set when made, by the factory")
+
+        override fun mayHaveAsked() = posted
+
+        override fun close() {
+            closed = true
+        }
+    }
+
     private inner class QueuedPrefs(
         private val prefs: SharedPreferences,
     ) : SharedPreferences by prefs {
@@ -902,6 +1365,7 @@ class ChatViewModelTest {
     private companion object {
         const val SETTLE = 50
         const val DAY = 86_400L
+        const val HOUR = 3_600L
 
         /** A second past the skew a certificate's time is allowed, as a server allows it. */
         const val PAST_SKEW = 301L
@@ -927,6 +1391,20 @@ class ChatViewModelTest {
                 "a561760163736967584067d88dac70a297fd5f414f8df75ac190a6a6d8f78659c342d4259dda59fae16f57c55711d6c0b05b502616b95d286d97b98b518ff50bf4c013db9a915e30fd0e646e616d65674669787475726567757064617465641a6b49d200686964656e7469747958208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
             )
         const val FINGERPRINT = "6htgz65xb7yfs53dmhdanfmk7fgn995n1571rjnz8a36a1fks5z0"
+        const val SHORT = "6htgz65x"
+        const val DEVICE = "9c41e7b2"
+        val ENROLLED get() = enrolled(CERT)
+
+        fun enrolled(
+            cert: ByteArray,
+            fingerprint: String = FINGERPRINT,
+        ) = Enrolled(cert, CARD, fingerprint, fingerprint.take(8), "Fixture", certForDevice(cert, CARD, SEED))
+
+        // The same device, certified again a month on.
+        val RENEWED =
+            hex(
+                "a76176016373696758401b505586185f8c75833ebd49142220abd7461d5b86f995c866c989c28073293088d79e95b6cc118dcc756f9b07d979ad335ff585eee4adefa85a2d22beb4a0016664657669636558208139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394666973737565641a6b715f0067657870697265731a7e3d6200686964656e7469747958208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c6a6465766963655f656e635820198102e1c39f8bcabb16b9ed3135b4abb72e470139ec8364d882e300ed105c04",
+            )
 
         // The certificate's own window.
         const val ISSUED = 0x6b49d200L

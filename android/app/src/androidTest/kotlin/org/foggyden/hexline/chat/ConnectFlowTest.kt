@@ -9,6 +9,7 @@ import androidx.compose.ui.test.performTextInput
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.foggyden.hexline.R
+import org.foggyden.hexline.identity.Enrolling
 import org.foggyden.hexline.identity.Restoring
 import org.junit.Rule
 import org.junit.Test
@@ -38,6 +39,12 @@ class ConnectFlowTest {
                     {},
                     {},
                     { _, _ -> },
+                    Enrolling.Idle,
+                    {},
+                    { _, _, _, _ -> },
+                    { _, _ -> },
+                    {},
+                    {},
                 )
             }
         }

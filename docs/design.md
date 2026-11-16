@@ -185,6 +185,8 @@ entry Hexline adds. The same goes for an account's password typed to
 link an identity: Kotlin holds it as a `String`; the core wipes its own
 copy when the login is done, but not the copy in the JSON body it builds
 for the auth request, and the HTTP client's buffers are out of its reach.
+A seed crossing the FFI either way (`Enrollee::seed`, a login's device)
+also passes through a uniffi `RustBuffer` that is freed and not wiped.
 Backups: `android:allowBackup="false"` and `dataExtractionRules`
 excluding everything; a Keystore key never leaves the device anyway, so
 a backed-up blob would be undecryptable.
@@ -400,3 +402,47 @@ password login is: the proof is bound to the host, so the device key is
 not exposed, but the one-use token is. Over `ws://` to another machine
 the auth body says `downstream: "cleartext"`, so the session is not
 shown to others as encrypted.
+
+Enrolled-device mode (decided 2026-11-15), by `identity-enrollment.md`'s
+typed-code ceremony:
+
+- **The mailbox** is a field prefilled with the server being added, and
+  editable, since the code is good only at the mailbox the holder opened
+  it at (§5.1).
+- **What the phone shows.** The device's eight-character fingerprint is
+  beside the code entry, for the person to compare with the holder's
+  prompt (§6). The answer is kept only once the person confirms whose
+  device the phone has become ("a device of alice 3f2a8c1d"): with a
+  typed code a hostile mailbox can substitute the answer, and this is
+  the person's one look at it. Declining drops the certificate and the
+  device key.
+- **What is asked for:** `login | message | manage`, no lifetime (the
+  holder's), and a name the person may edit, "Hexline" by default rather
+  than the phone's model, which every server shown the certificate would
+  see.
+- **Renewal** is quiet: from a third of the certificate's life left, on
+  start and on coming to the front, once a day at most (an unreachable
+  mailbox aside), at the mailbox the device was enrolled through, which
+  is kept with it, routed by its certificate to a holder standing by
+  (§8). With no holder standing by (`no_holder`), or still not renewed at
+  14 days, the banner asks for a code; renewing by a code is the same
+  device while its certificate is in its time, and a new device once it
+  has lapsed, as a holder renews no lapsed certificate. If the mailbox
+  is gone, the person names another.
+- **Plain http** (decided 2026-11-15): a mailbox is reached over https,
+  or over plain http only on this machine (as `downstream: "cleartext"`
+  judges loopback), and refused `cleartext_mailbox` elsewhere, which the
+  screen explains: over it anyone on the path could see the code and
+  swap the request or the answer, leaving both bindings to the person's
+  comparison alone. A renewal at a stored http mailbox follows the same
+  rule.
+- **The 14-day banner** applies whatever a certificate's lifetime: a
+  holder issuing seven-day certificates shows it from the start. Known
+  and kept, as the quiet renewal at a third left usually comes first.
+- **The code** is read leniently in the core: any case, spaces and the
+  hyphen ignored, and Crockford's look-alikes taken for what they look
+  like, as the mailbox reads them.
+- **The live tests' holder** is `hxng-client`'s, on hl-identity's own
+  request and bundle objects, rather than `hlid` driven by its stdin: it
+  answers, denies, answers for another device, and stands by, with no
+  second binary for CI to install.

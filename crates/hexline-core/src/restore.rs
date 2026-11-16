@@ -183,7 +183,7 @@ const MAX_CERT: usize = 512;
 /// Whether `name` makes a certificate a server reads: one signed with
 /// keys made for the purpose, so no fetch is charged for a name that
 /// would make the restored device useless.
-fn check_name(name: &str) -> Result<(), CoreError> {
+pub(crate) fn check_name(name: &str) -> Result<(), CoreError> {
     certify(&IdentityKey::generate(), &DeviceKey::generate(), name).map(drop)
 }
 
@@ -215,7 +215,7 @@ fn registrar_base(registrar: &str) -> Result<Url, CoreError> {
 /// `path` as discovery gives it, on the registrar's own origin and no
 /// other: a path that would move it (`@host`, `//host`, `.suffix`, a port)
 /// is refused.
-fn endpoint(base: &Url, path: &str) -> Result<String, CoreError> {
+pub(crate) fn endpoint(base: &Url, path: &str) -> Result<String, CoreError> {
     if !path.starts_with('/') || path.starts_with("//") {
         return Err(refused("not_a_registrar"));
     }
@@ -378,7 +378,7 @@ async fn card_kept(
 
 /// The wait a 429's body asks for, flat or under `error` as the registrar
 /// and the ng port each put it.
-fn retry_after(body: &[u8]) -> Option<u64> {
+pub(crate) fn retry_after(body: &[u8]) -> Option<u64> {
     let v: Value = serde_json::from_slice(body).ok()?;
     v.get("retry_after")
         .or_else(|| v.get("error").and_then(|e| e.get("retry_after")))
@@ -398,7 +398,7 @@ fn derive(secret: &Secret<'_>, kdf: Kdf) -> Result<Keys, CoreError> {
         .map_err(|e| protocol(&format!("deriving: {e}")))
 }
 
-fn bytes(reply: &Value, key: &str) -> Result<Vec<u8>, CoreError> {
+pub(crate) fn bytes(reply: &Value, key: &str) -> Result<Vec<u8>, CoreError> {
     use base64::Engine;
     reply
         .get(key)
@@ -411,7 +411,7 @@ fn bytes(reply: &Value, key: &str) -> Result<Vec<u8>, CoreError> {
         .ok_or_else(|| protocol(&format!("the reply's {key} does not read")))
 }
 
-fn b64(b: &[u8]) -> String {
+pub(crate) fn b64(b: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
 }
