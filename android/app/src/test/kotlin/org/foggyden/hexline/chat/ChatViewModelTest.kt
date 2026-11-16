@@ -28,6 +28,7 @@ import org.foggyden.hexline.core.Enrollment
 import org.foggyden.hexline.core.HistoryPage
 import org.foggyden.hexline.core.LoginInfo
 import org.foggyden.hexline.core.UpdateSink
+import org.foggyden.hexline.core.certForDevice
 import org.foggyden.hexline.identity.EnrollProblem
 import org.foggyden.hexline.identity.Enrolling
 import org.foggyden.hexline.identity.Identities
@@ -743,14 +744,20 @@ class ChatViewModelTest {
             }
             core { e.answer.complete(ENROLLED) }
             settle()
-            assertEquals(then, Enrolling.Answered(DEVICE, "Fixture", SHORT), vm.enrollment.value)
+            val answered = vm.enrollment.value as Enrolling.Answered
+            assertEquals(
+                then,
+                listOf(DEVICE, "Fixture", FINGERPRINT, EXPIRES.toULong(), false, null),
+                listOf(answered.device, answered.name, answered.fingerprint, answered.info.expires, answered.namesake, answered.replaces),
+            )
             assertTrue("$then: nothing kept before the person says", stored() == null)
             if (then == "keep") vm.confirmEnroll() else vm.discardEnroll()
             settle()
             assertTrue("$then: the key is let go of", e.closed)
             if (then == "keep") {
                 val kept = stored()!!
-                assertEquals(listOf(FINGERPRINT, "Fixture", "hl.example"), listOf(kept.fingerprint, kept.handle, kept.mailbox))
+                // The card's name is the identity's word for itself, not a registrar's handle.
+                assertEquals(listOf(FINGERPRINT, null, "hl.example"), listOf(kept.fingerprint, kept.handle, kept.mailbox))
                 assertArrayEquals(SEED, outside { identities.device(FINGERPRINT)?.second })
                 assertEquals(Enrolling.Done(FINGERPRINT), vm.enrollment.value)
             } else {
@@ -855,7 +862,7 @@ class ChatViewModelTest {
         settle()
         assertEquals("the second's screen", Enrolling.Ready(DEVICE), vm.enrollment.value)
         assertTrue("the second still open", !enrollments[1].closed)
-        assertEquals("the first kept, as the person said", "Fixture", stored()?.handle)
+        assertEquals("the first kept, as the person said", FINGERPRINT, stored()?.fingerprint)
     }
 
     @Test
@@ -877,7 +884,7 @@ class ChatViewModelTest {
     @Test
     fun aDueDeviceIsRenewedQuietlyOnceADayWhereAHolderStandsBy() {
         val due = ISSUED + (EXPIRES - ISSUED) * 2 / 3 + DAY
-        for (answer in listOf("renewed", "no holder", "unreachable", "not due")) {
+        for (answer in listOf("renewed", "no holder", "unreachable", "left while waiting", "not due")) {
             fresh()
             keepIdentity("hl.example")
             // Tried long ago, and found no holder then.
@@ -893,21 +900,35 @@ class ChatViewModelTest {
             assertArrayEquals("$answer: the device it has", SEED, e.renewing!!.first)
             assertEquals(answer, Triple("hl.example", null, "Hexline"), e.asked)
             when (answer) {
-                "renewed" -> core { e.answer.complete(ENROLLED) }
+                "renewed" -> core { e.answer.complete(enrolled(RENEWED)) }
                 "no holder" -> core { e.answer.completeExceptionally(CoreException.Refused("no_holder", "")) }
-                else -> core { e.answer.completeExceptionally(CoreException.Connect("offline")) }
+                "left while waiting" -> owner.clear()
+                else -> {
+                    // Unreachable before its request reached the mailbox.
+                    e.posted = false
+                    core { e.answer.completeExceptionally(CoreException.Connect("offline")) }
+                }
             }
             settle()
             assertTrue("$answer: let go of", e.closed)
             val kept = stored()!!
             when (answer) {
-                "renewed" -> assertEquals(answer, listOf(0L, false, "hl.example"), listOf(kept.renewTried, kept.noHolder, kept.mailbox))
+                "renewed" -> {
+                    assertEquals(answer, listOf(0L, false, "hl.example"), listOf(kept.renewTried, kept.noHolder, kept.mailbox))
+                    assertArrayEquals("$answer: the new certificate kept", RENEWED, kept.cert)
+                }
                 "no holder" -> assertEquals(answer, listOf(due, true), listOf(kept.renewTried, kept.noHolder))
+                "left while waiting" ->
+                    assertEquals(
+                        "$answer: a holder asked counts",
+                        listOf(due, false),
+                        listOf(kept.renewTried, kept.noHolder),
+                    )
                 else -> assertEquals("$answer: not counted", listOf(1L, true), listOf(kept.renewTried, kept.noHolder))
             }
             if (answer == "renewed") continue
             // The app again, the same day, and the next.
-            owner.clear()
+            if (answer != "left while waiting") owner.clear()
             settle()
             model()
             settle()
@@ -919,6 +940,50 @@ class ChatViewModelTest {
             settle()
             assertEquals("$answer: and the next", if (answer == "unreachable") 3 else 2, enrollments.size)
         }
+    }
+
+    @Test
+    fun aQuietRenewalAnsweredForAnotherIdentityKeepsNothing() {
+        keepIdentity("hl.example")
+        now = ISSUED + (EXPIRES - ISSUED) * 2 / 3 + DAY
+        model()
+        settle()
+        core { enrollments.single().answer.complete(enrolled(RENEWED, fingerprint = "someone-else")) }
+        settle()
+        assertArrayEquals(CERT, stored()!!.cert)
+    }
+
+    @Test
+    fun aRenewalByCodeKeepsTheNewCertificateWithTheHandleItHad() {
+        keepIdentity("old.example")
+        val vm = model()
+        settle()
+        vm.startEnroll(FINGERPRINT)
+        settle()
+        vm.requestEnroll("new.example", "K7PM-4XWE", "Hexline")
+        settle()
+        core { enrollments.single().answer.complete(enrolled(RENEWED)) }
+        settle()
+        vm.confirmEnroll()
+        settle()
+        val kept = stored()!!
+        assertArrayEquals(RENEWED, kept.cert)
+        assertEquals(listOf("alice@example", "new.example"), listOf(kept.handle, kept.mailbox))
+    }
+
+    @Test
+    fun anAnswerForANewIdentityByANameThePhoneHoldsSaysSo() {
+        keepIdentity("hl.example")
+        val vm = model()
+        settle()
+        vm.startEnroll(null)
+        settle()
+        vm.requestEnroll("hl.example", "K7PM-4XWE", "Hexline")
+        settle()
+        core { enrollments.single().answer.complete(enrolled(CERT, fingerprint = "another")) }
+        settle()
+        val answered = vm.enrollment.value as Enrolling.Answered
+        assertEquals(listOf(true, null), listOf(answered.namesake, answered.replaces))
     }
 
     @Test
@@ -949,6 +1014,9 @@ class ChatViewModelTest {
         var canceled = false
         var closed = false
 
+        /** Whether its request reached the mailbox: once asked, unless the test says not. */
+        var posted = false
+
         override fun deviceFingerprint() = DEVICE
 
         override suspend fun enroll(
@@ -958,6 +1026,7 @@ class ChatViewModelTest {
         ): Enrolled {
             check(!closed) { "a closed enrollment called" }
             asked = Triple(mailbox, code, name)
+            posted = true
             return answer.await()
         }
 
@@ -969,6 +1038,8 @@ class ChatViewModelTest {
         override fun seed() = (renewing?.first ?: SEED).copyOf()
 
         override fun expectIdentityOf(cert: ByteArray) = error("set when made, by the factory")
+
+        override fun posted() = posted
 
         override fun close() {
             closed = true
@@ -1198,7 +1269,18 @@ class ChatViewModelTest {
         const val FINGERPRINT = "6htgz65xb7yfs53dmhdanfmk7fgn995n1571rjnz8a36a1fks5z0"
         const val SHORT = "6htgz65x"
         const val DEVICE = "9c41e7b2"
-        val ENROLLED get() = Enrolled(CERT, CARD, FINGERPRINT, SHORT, "Fixture")
+        val ENROLLED get() = enrolled(CERT)
+
+        fun enrolled(
+            cert: ByteArray,
+            fingerprint: String = FINGERPRINT,
+        ) = Enrolled(cert, CARD, fingerprint, fingerprint.take(8), "Fixture", certForDevice(cert, CARD, SEED))
+
+        // The same device, certified again a month on.
+        val RENEWED =
+            hex(
+                "a76176016373696758401b505586185f8c75833ebd49142220abd7461d5b86f995c866c989c28073293088d79e95b6cc118dcc756f9b07d979ad335ff585eee4adefa85a2d22beb4a0016664657669636558208139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394666973737565641a6b715f0067657870697265731a7e3d6200686964656e7469747958208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c6a6465766963655f656e635820198102e1c39f8bcabb16b9ed3135b4abb72e470139ec8364d882e300ed105c04",
+            )
 
         // The certificate's own window.
         const val ISSUED = 0x6b49d200L

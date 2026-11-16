@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hl_identity::{caps, Bundle, DeviceCert, DeviceKey, EnrollRequest, Fingerprint, PublicKey};
+use hl_identity::{
+    caps, Bundle, Card, DeviceCert, DeviceKey, EnrollRequest, Fingerprint, PublicKey,
+};
 use hxng_client::auth;
 use hxng_client::reqwest::Url;
 use serde_json::{json, Value};
@@ -40,6 +42,24 @@ const POLL_FLOOR: Duration = Duration::from_secs(1);
 /// (`hotline-ng.md` §6.1), as a restored device's is held to.
 const MAX_CERT: usize = 512;
 
+/// The longest wait between two polls a dropped link makes.
+const MOST_BACKOFF: Duration = Duration::from_secs(8);
+
+/// A holder's reason for saying no, as words it may have chosen: short,
+/// and nothing but letters, digits, `_`, `-` and spaces, or none. The app
+/// shows them as the holder's.
+fn denial(reason: &str) -> String {
+    let fits = reason.len() <= 32
+        && reason
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ' '));
+    if fits {
+        reason.to_owned()
+    } else {
+        String::new()
+    }
+}
+
 /// A certificate this phone may keep, from a holder's answer, with what
 /// the phone shows before it is kept: whose device it has become (§5.5).
 #[derive(Debug, uniffi::Record)]
@@ -52,6 +72,8 @@ pub struct Enrolled {
     pub short: String,
     /// The name the identity's card gives it.
     pub name: String,
+    /// What the certificate lets the device do, and for how long.
+    pub info: crate::CertInfo,
 }
 
 /// This phone asking to be a device of an identity: a device key made
@@ -66,6 +88,8 @@ pub struct Enrollee {
     /// The identity an answer must be from: a renewal's, or one this phone
     /// already holds a device of.
     expected: Mutex<Option<PublicKey>>,
+    /// The request has reached the mailbox: a holder may have been asked.
+    posted: AtomicBool,
     stopped: AtomicBool,
     stop: Notify,
 }
@@ -79,6 +103,7 @@ impl Enrollee {
             device: DeviceKey::generate(),
             prev: None,
             expected: Mutex::new(None),
+            posted: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             stop: Notify::new(),
         })
@@ -103,6 +128,7 @@ impl Enrollee {
             device,
             prev: Some(cert),
             expected: Mutex::new(Some(c.identity)),
+            posted: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             stop: Notify::new(),
         }))
@@ -149,6 +175,12 @@ impl Enrollee {
         self.stop.notify_waiters();
     }
 
+    /// Whether a request has reached the mailbox, so a holder may have been
+    /// asked, whatever came of it.
+    pub fn posted(&self) -> bool {
+        self.posted.load(Ordering::SeqCst)
+    }
+
     /// The device's seed, for the app to keep beside the certificate and
     /// then wipe.
     pub fn seed(&self) -> Vec<u8> {
@@ -157,7 +189,27 @@ impl Enrollee {
 }
 
 impl Enrollee {
+    /// [`Enrollee::attempt`], ended by [`Enrollee::cancel`] wherever it is,
+    /// discovery and the request's post included.
     async fn run(
+        &self,
+        mailbox: &str,
+        code: Option<&str>,
+        name: &str,
+    ) -> Result<Enrolled, CoreError> {
+        let stopped = self.stop.notified();
+        tokio::pin!(stopped);
+        stopped.as_mut().enable();
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(refused("canceled"));
+        }
+        tokio::select! {
+            _ = &mut stopped => Err(refused("canceled")),
+            done = self.attempt(mailbox, code, name) => done,
+        }
+    }
+
+    async fn attempt(
         &self,
         mailbox: &str,
         code: Option<&str>,
@@ -175,9 +227,6 @@ impl Enrollee {
         let base = mailbox_base(mailbox)?;
         let http = auth::http_client(base.as_str(), None)?;
         let enroll = discovered(&http, &base).await?;
-        if self.stopped.load(Ordering::SeqCst) {
-            return Err(refused("canceled"));
-        }
 
         let mut request = EnrollRequest::new(&self.device, now());
         request.name = Some(name.to_owned());
@@ -193,6 +242,7 @@ impl Enrollee {
             body["code"] = json!(code);
         }
         let posted = auth::post(&http, &format!("{enroll}/requests"), Some(body)).await?;
+        self.posted.store(true, Ordering::SeqCst);
         let secret = posted
             .get("request")
             .and_then(Value::as_str)
@@ -205,18 +255,23 @@ impl Enrollee {
             .min(REQUEST_LIFE);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(life + 5);
         let url = format!("{enroll}/requests/{secret}");
+        // Asked for, the request is waited on whatever the link does: a
+        // dropped poll is asked again under the same secret until the
+        // request's life is out.
+        let mut backoff = POLL_FLOOR;
         let bundle = loop {
             let asked = tokio::time::Instant::now();
-            let stopped = self.stop.notified();
-            tokio::pin!(stopped);
-            stopped.as_mut().enable();
-            if self.stopped.load(Ordering::SeqCst) {
-                return Err(refused("canceled"));
-            }
-            let (status, body) = tokio::select! {
-                _ = &mut stopped => return Err(refused("canceled")),
-                got = auth::get_waiting(&http, &url, LONG_POLL) => got?,
+            let (status, body) = match auth::get_waiting(&http, &url, LONG_POLL).await {
+                Ok(got) => got,
+                Err(hxng_client::driver::Error::Connect(_)) if asked < deadline => {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MOST_BACKOFF);
+                    continue;
+                }
+                Err(hxng_client::driver::Error::Connect(_)) => return Err(refused("expired")),
+                Err(e) => return Err(e.into()),
             };
+            backoff = POLL_FLOOR;
             let reply: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             match status {
                 200 => break bytes(&reply, "bundle")?,
@@ -228,11 +283,12 @@ impl Enrollee {
                 403 => {
                     return Err(CoreError::Refused {
                         code: "denied".into(),
-                        detail: reply
-                            .get("denied")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
+                        detail: denial(
+                            reply
+                                .get("denied")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        ),
                     })
                 }
                 429 => {
@@ -269,6 +325,11 @@ impl Enrollee {
         if bundle.cert.len() > MAX_CERT || !cert.allows(caps::LOGIN) {
             return Err(refused("cert_unusable"));
         }
+        // The phone never holds vouch (design §2.3): a holder granting it
+        // grants more than any screen here would use.
+        if cert.allows(caps::VOUCH) {
+            return Err(refused("cert_vouches"));
+        }
         crate::identity::in_time(&bundle.cert)?;
         // A renewal that is itself already due would be asked for again at
         // once, every day: no renewal at all.
@@ -276,7 +337,14 @@ impl Enrollee {
             return Err(refused("short_renewal"));
         }
         let fingerprint = Fingerprint::of(&cert.identity);
+        let info = crate::cert_info(
+            bundle.cert.clone(),
+            bundle.card.clone(),
+            self.device.public().to_vec(),
+            self.device.public_enc().to_vec(),
+        )?;
         Ok(Enrolled {
+            info,
             cert: bundle.cert,
             card: bundle.card,
             fingerprint: fingerprint.to_string(),
@@ -307,6 +375,23 @@ pub fn enrollment_code(code: &str) -> Result<String, CoreError> {
         return Err(refused("bad_code"));
     }
     Ok(format!("{}-{}", &symbols[..4], &symbols[4..]))
+}
+
+/// The name `card` gives its identity, if it reads.
+#[uniffi::export]
+pub fn card_name(card: Vec<u8>) -> Option<String> {
+    Card::parse(&card).ok().map(|c| c.name)
+}
+
+/// Of two cards of one identity, the newer by its `updated`: a renewal's
+/// answer may carry a card older than one this phone already keeps.
+/// `offered` where they are not both of one identity.
+#[uniffi::export]
+pub fn newer_card(kept: Vec<u8>, offered: Vec<u8>) -> Vec<u8> {
+    match (Card::parse(&kept), Card::parse(&offered)) {
+        (Ok(k), Ok(o)) if k.identity == o.identity && k.updated > o.updated => kept,
+        _ => offered,
+    }
 }
 
 /// Whether a certificate from `issued` to `expires` is due to be renewed at
@@ -431,7 +516,8 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_is_kept_only_from_the_identity_expected_and_only_if_it_signs_in() {
+    fn an_answer_is_kept_only_from_the_identity_expected_and_only_if_it_signs_in_without_vouching()
+    {
         use hl_identity::{Card, IdentityKey};
         let alice = IdentityKey::generate();
         let mallory = IdentityKey::generate();
@@ -457,10 +543,17 @@ mod tests {
             Err(CoreError::Refused { code, .. }) => code,
             Err(e) => format!("{e:?}"),
         };
+        const WEB: Option<u64> = Some(caps::LOGIN | caps::MESSAGE);
         assert_eq!(
-            code(phone.checked(&answer(&mallory, None))),
+            code(phone.checked(&answer(&mallory, WEB))),
             "kept",
             "none expected"
+        );
+        // No caps is every cap, vouch among them.
+        assert_eq!(code(phone.checked(&answer(&mallory, None))), "cert_vouches");
+        assert_eq!(
+            code(phone.checked(&answer(&mallory, Some(caps::LOGIN | caps::VOUCH)))),
+            "cert_vouches"
         );
         assert_eq!(
             code(phone.checked(&answer(&alice, Some(caps::MESSAGE)))),
@@ -472,10 +565,10 @@ mod tests {
             .sign(&alice);
         phone.expect_identity_of(lapsed).unwrap();
         assert_eq!(
-            code(phone.checked(&answer(&mallory, None))),
+            code(phone.checked(&answer(&mallory, WEB))),
             "wrong_identity"
         );
-        assert_eq!(code(phone.checked(&answer(&alice, None))), "kept");
+        assert_eq!(code(phone.checked(&answer(&alice, WEB))), "kept");
     }
 
     #[test]
@@ -483,10 +576,15 @@ mod tests {
         use hl_identity::{Card, IdentityKey};
         let alice = IdentityKey::generate();
         let device = DeviceKey::generate();
+        let web = |mut c: DeviceCert| {
+            c.caps = Some(caps::LOGIN | caps::MESSAGE);
+            c.sign(&alice)
+        };
         let cert = |issued: u64, life: u64| {
-            DeviceCert::for_keys(&alice, device.public(), device.public_enc(), issued, life)
-                .unwrap()
-                .sign(&alice)
+            web(
+                DeviceCert::for_keys(&alice, device.public(), device.public_enc(), issued, life)
+                    .unwrap(),
+            )
         };
         let renewing = Enrollee::renewing(device.seed().to_vec(), cert(now(), 86_400)).unwrap();
         let card = Card::new(&alice, "Alice", now())
@@ -513,16 +611,71 @@ mod tests {
         assert_eq!(code(renewing.checked(&answer(stale))), "short_renewal");
         // A first enrollment's certificate is the holder's to make so.
         let first = Enrollee::new();
-        let theirs = DeviceCert::for_keys(
+        let theirs = web(DeviceCert::for_keys(
             &alice,
             first.device.public(),
             first.device.public_enc(),
             now() - 2 * 86_400,
             3 * 86_400,
         )
-        .unwrap()
-        .sign(&alice);
+        .unwrap());
         assert_eq!(code(first.checked(&answer(theirs))), "kept");
+    }
+
+    #[test]
+    fn a_holders_reason_is_kept_only_as_words_it_could_have_chosen() {
+        for (said, shown) in [
+            ("not_mine", "not_mine"),
+            ("declined", "declined"),
+            ("too many", "too many"),
+            ("Call me at evil.example", ""),
+            ("\u{202e}reversed", ""),
+            (&"x".repeat(33), ""),
+        ] {
+            assert_eq!(denial(said), shown, "{said:?}");
+        }
+    }
+
+    #[test]
+    fn the_newer_card_of_one_identity_is_kept() {
+        use hl_identity::IdentityKey;
+        let alice = IdentityKey::generate();
+        let card = |updated| {
+            Card::new(&alice, "Alice", updated)
+                .sign(&alice, Vec::new())
+                .unwrap()
+        };
+        let bob = IdentityKey::generate();
+        let bobs = Card::new(&bob, "Bob", 900).sign(&bob, Vec::new()).unwrap();
+        assert_eq!(newer_card(card(900), card(100)), card(900));
+        assert_eq!(newer_card(card(100), card(900)), card(900));
+        assert_eq!(newer_card(bobs, card(100)), card(100), "another identity's");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_ends_an_enrollment_still_finding_its_mailbox() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Takes the connection and never answers.
+        let held = tokio::spawn(async move { listener.accept().await });
+        let phone = Enrollee::new();
+        let asking = tokio::spawn(phone.clone().enroll(
+            format!("http://127.0.0.1:{port}"),
+            Some("K7PM-4XWE".into()),
+            "Hexline".into(),
+        ));
+        // Held open until the test is done.
+        let _connection = held.await;
+        phone.cancel();
+        let ended = tokio::time::timeout(Duration::from_secs(5), asking)
+            .await
+            .expect("canceled at once")
+            .unwrap();
+        assert!(
+            matches!(ended, Err(CoreError::Refused { ref code, .. }) if code == "canceled"),
+            "{ended:?}"
+        );
+        assert!(!phone.posted());
     }
 
     #[tokio::test(flavor = "multi_thread")]

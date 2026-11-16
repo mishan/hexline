@@ -25,6 +25,12 @@ enum class EnrollProblem {
 
     /** The certificate would not sign in: no login, or larger than a server takes. */
     Unusable,
+
+    /** The certificate would let the phone vouch, which it never holds. */
+    Vouches,
+
+    /** The phone's clock, likely: a certificate outside its time, or a renewal the holder found misdated. */
+    Clock,
     RateLimited,
     Unreachable,
 
@@ -48,10 +54,13 @@ fun enrollProblem(e: CoreException): EnrollProblem =
                 "cleartext_mailbox" -> EnrollProblem.Cleartext
                 "no_mailbox" -> EnrollProblem.NoMailbox
                 "bad_device_name" -> EnrollProblem.BadDeviceName
+                "denied" if e.detail == "bad_renewal" -> EnrollProblem.Clock
                 "denied" -> EnrollProblem.Denied
                 "expired" -> EnrollProblem.Expired
                 "wrong_device", "wrong_identity" -> EnrollProblem.NotForThisPhone
                 "cert_unusable" -> EnrollProblem.Unusable
+                "cert_vouches" -> EnrollProblem.Vouches
+                "cert_expired", "cert_not_yet_valid" -> EnrollProblem.Clock
                 "rate_limited" -> EnrollProblem.RateLimited
                 else -> EnrollProblem.Other
             }
@@ -75,15 +84,18 @@ sealed interface Enrolling {
     ) : Enrolling
 
     /**
-     * The holder certified this phone a device of [name] ([short]): kept
-     * only once confirmed, in place of [replaces], the device of that
-     * identity the phone holds now, if any.
+     * The holder certified this phone a device of [name] ([fingerprint]),
+     * as [info] says: kept only once confirmed, in place of [replaces], the
+     * device of that identity the phone holds now, if any. [namesake]: the
+     * phone holds another identity by the same name.
      */
     data class Answered(
         val device: String,
         val name: String,
-        val short: String,
+        val fingerprint: String,
+        val info: CertInfo,
         val replaces: CertInfo? = null,
+        val namesake: Boolean = false,
     ) : Enrolling
 
     /** Kept on the phone once the save the person asked for lands: nothing to discard now. */

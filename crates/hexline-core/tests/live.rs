@@ -1563,3 +1563,41 @@ async fn an_enrollment_canceled_before_it_asks_spends_no_code() {
     holder.approve(&session, &asked, 90).await;
     asking.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn a_poll_the_link_drops_is_asked_again_under_the_same_request() {
+    use hexline_core::Enrollee;
+    use hxng_client::testing::Holder;
+    let server = Server::with_identity(&[], 1).await;
+    let proxy = Proxy::to(&server).await;
+    let holder = Holder::new(&server, "Alice");
+    let session = holder.open().await;
+    let phone = Enrollee::new();
+    let asking = tokio::spawn(phone.clone().enroll(
+        proxy.url.clone(),
+        Some(session.code.clone()),
+        "Hexline".into(),
+    ));
+    let asked = holder.asked(&session).await;
+    for _ in 0..100 {
+        if phone.posted() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(phone.posted(), "its request reached the mailbox");
+    // Into its long poll by now, which is cut off while the holder answers.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    proxy.sever();
+    holder.approve(&session, &asked, 90).await;
+    let enrolled = tokio::time::timeout(Duration::from_secs(20), asking)
+        .await
+        .expect("answered")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        enrolled.fingerprint,
+        hl_identity::Fingerprint::of(&holder.id.public()).to_string()
+    );
+    assert!(enrolled.info.can_login && !enrolled.info.can_vouch);
+}

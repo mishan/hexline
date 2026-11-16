@@ -595,13 +595,23 @@ fun EnrollScreen(
                 )
                 // Apart, and the fingerprint in its own face: a name cannot be made to look like it.
                 Text(enrolling.name, style = MaterialTheme.typography.titleMedium)
+                // Whole, in groups to read: a short prefix is cheap to grind out.
                 Text(
-                    stringResource(R.string.enroll_fingerprint, enrolling.short),
+                    stringResource(R.string.enroll_fingerprint, enrolling.fingerprint.chunked(4).joinToString(" ")),
                     fontFamily = FontFamily.Monospace,
+                )
+                if (enrolling.namesake) {
+                    Text(stringResource(R.string.enroll_namesake, enrolling.name), color = MaterialTheme.colorScheme.error)
+                }
+                Text(capabilities(enrolling.info), style = MaterialTheme.typography.bodySmall)
+                Text(
+                    stringResource(R.string.enroll_until, expiry(enrolling.info.expires)),
+                    style = MaterialTheme.typography.bodySmall,
                 )
                 enrolling.replaces?.let {
                     Text(stringResource(R.string.enroll_replaces))
                     Text(capabilities(it), style = MaterialTheme.typography.bodySmall)
+                    Text(stringResource(R.string.enroll_until, expiry(it.expires)), style = MaterialTheme.typography.bodySmall)
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onConfirm) { Text(stringResource(R.string.enroll_confirm)) }
@@ -700,5 +710,13 @@ private fun describe(failed: Enrolling.Failed): String =
         EnrollProblem.NotKept -> stringResource(R.string.enroll_not_kept)
         EnrollProblem.AnswerNotKept -> stringResource(R.string.enroll_answer_not_kept)
         EnrollProblem.Unusable -> stringResource(R.string.enroll_unusable)
+        EnrollProblem.Vouches -> stringResource(R.string.enroll_vouches)
+        EnrollProblem.Clock -> stringResource(R.string.enroll_clock)
         EnrollProblem.Other -> stringResource(R.string.enroll_failed)
     }
+
+/** A certificate's end, as a date the person reads. */
+private fun expiry(expires: ULong): String =
+    java.text.DateFormat
+        .getDateInstance(java.text.DateFormat.MEDIUM)
+        .format(java.util.Date(expires.toLong() * 1000))

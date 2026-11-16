@@ -436,6 +436,9 @@ typed-code ceremony:
   swap the request or the answer, leaving both bindings to the person's
   comparison alone. A renewal at a stored http mailbox follows the same
   rule.
+- **The 14-day banner** applies whatever a certificate's lifetime: a
+  holder issuing seven-day certificates shows it from the start. Known
+  and kept, as the quiet renewal at a third left usually comes first.
 - **The code** is read leniently in the core: any case, spaces and the
   hyphen ignored, and Crockford's look-alikes taken for what they look
   like, as the mailbox reads them.

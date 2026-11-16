@@ -30,8 +30,10 @@ import org.foggyden.hexline.core.LoginInfo
 import org.foggyden.hexline.core.Restored
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.UpdateSink
+import org.foggyden.hexline.core.cardName
 import org.foggyden.hexline.core.coreConnection
 import org.foggyden.hexline.core.coreEnrollment
+import org.foggyden.hexline.core.newerCard
 import org.foggyden.hexline.core.refusalLasts
 import org.foggyden.hexline.core.renewalDue
 import org.foggyden.hexline.core.restoreIdentity
@@ -435,7 +437,11 @@ class ChatViewModel internal constructor(
                     enrolled = answer
                     enrollMailbox = mailbox
                     val replaces = kept.value.find { it.fingerprint == answer.fingerprint }?.info
-                    Enrolling.Answered(device, answer.name, answer.short, replaces)
+                    // Another identity on the phone already goes by this name: one may be passing for the other.
+                    val namesake =
+                        replaces == null &&
+                            kept.value.any { it.fingerprint != answer.fingerprint && cardName(it.card) == answer.name }
+                    Enrolling.Answered(device, answer.name, answer.fingerprint, answer.info, replaces, namesake)
                 } catch (e: CoreException) {
                     if (enrollee !== mine) return@launch
                     val reason = (e as? CoreException.Refused)?.takeIf { it.code == "denied" }?.detail?.ifEmpty { null }
@@ -467,15 +473,12 @@ class ChatViewModel internal constructor(
                     queue.scope
                         .async {
                             try {
-                                val replaced =
-                                    identities
-                                        .list()
-                                        .find { it.fingerprint == answer.fingerprint }
-                                        ?.info
-                                        ?.device
-                                val kept = identities.save(seed, answer.cert, answer.card, answer.name, null, mailbox)
+                                val before = identities.list().find { it.fingerprint == answer.fingerprint }
+                                // The handle is a registrar's word, not the card's name, and a newer card stays.
+                                val card = before?.let { newerCard(it.card, answer.card) } ?: answer.card
+                                val kept = identities.save(seed, answer.cert, card, before?.handle, null, mailbox)
                                 // A new device starts with no server's refusal; the old one's go with it.
-                                replaced?.takeIf { !it.contentEquals(kept.info.device) }?.let {
+                                before?.info?.device?.takeIf { !it.contentEquals(kept.info.device) }?.let {
                                     servers.forgetRefusalsOf(it, at)
                                     publishRefusals()
                                 }
@@ -568,6 +571,8 @@ class ChatViewModel internal constructor(
             } finally {
                 seed?.fill(0)
             }
+        // Kept, or a holder asked whatever came of it: either way not to be asked again today.
+        var done = false
         try {
             val answer = mine.enroll(renewing.mailbox!!, null, renewing.info.name ?: DEVICE_NAME)
             val renewed = mine.seed()
@@ -576,31 +581,41 @@ class ChatViewModel internal constructor(
                     try {
                         // Kept only for the certificate it renewed: not if deleted or replaced meanwhile.
                         val now = identities.list().find { it.fingerprint == kept.fingerprint }
-                        if (now != null && now.cert.contentEquals(renewing.cert)) {
-                            identities.save(renewed, answer.cert, answer.card, now.handle, now.registrar, now.mailbox)
+                        if (now != null && now.cert.contentEquals(renewing.cert) && answer.fingerprint == kept.fingerprint) {
+                            identities.save(renewed, answer.cert, newerCard(now.card, answer.card), now.handle, now.registrar, now.mailbox)
                             publishIdentities()
                         }
                     } finally {
                         renewed.fill(0)
                     }
                 }.await()
+            done = true
         } catch (e: CoreException) {
-            // Offline: not asked, so asked again when the app is next in front.
-            if (e is CoreException.Connect) return
+            // Offline before a holder could be asked: asked again when the app is next in front.
+            if (e is CoreException.Connect && !mine.posted()) return
             val noHolder = e is CoreException.Refused && e.code == "no_holder"
-            later {
-                identities.renewTried(kept.fingerprint, renewing.cert, at, noHolder)
-                publishIdentities()
-            }
+            tried(renewing, at, noHolder)
+            done = true
         } catch (_: SecretUnavailable) {
             return
         } catch (_: IOException) {
             return
         } finally {
-            // Let go of while it waited (the screen gone): the wait ends too.
+            // Let go of while it waited (the screen gone): the wait ends too,
+            // and a holder already asked is not asked again on the next return.
+            if (!done && mine.posted()) tried(renewing, at, false)
             mine.cancel()
             mine.close()
         }
+    }
+
+    private fun tried(
+        renewing: StoredIdentity,
+        at: Long,
+        noHolder: Boolean,
+    ) = later {
+        identities.renewTried(renewing.fingerprint, renewing.cert, at, noHolder)
+        publishIdentities()
     }
 
     fun restoreSeen() {

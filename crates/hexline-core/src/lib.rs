@@ -14,7 +14,7 @@ mod tls;
 pub use connection::{
     ClassicLogin, CoreError, CoreUpdate, DeviceIdentity, LoginInfo, ServerConnection, UpdateSink,
 };
-pub use enroll::{enrollment_code, renewal_due, Enrolled, Enrollee};
+pub use enroll::{card_name, enrollment_code, newer_card, renewal_due, Enrolled, Enrollee};
 pub use identity::{
     cert_for_device, cert_info, cert_time, new_device, CertInfo, CertTime, NewDevice,
 };
