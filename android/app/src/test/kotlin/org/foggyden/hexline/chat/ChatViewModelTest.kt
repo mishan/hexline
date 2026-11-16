@@ -1,6 +1,9 @@
 package org.foggyden.hexline.chat
 
 import android.app.Application
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.CoreUpdate
 import org.foggyden.hexline.identity.Enrolling
@@ -8,6 +11,7 @@ import org.foggyden.hexline.secrets.SecretUnavailable
 import org.foggyden.hexline.secrets.SecretUnreadable
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -876,5 +880,24 @@ class ChatViewModelTest : ViewModelHarness() {
         settle()
         assertNull(stored())
         assertNull(outside { identities.device(FINGERPRINT) })
+    }
+
+    @Test
+    fun aWaitBegunBeforeAProcessDiesNeverEndsAfterIt() {
+        for ((name, queue, drop) in listOf(
+            Triple("main", main, { main.queue.drop() }),
+            Triple("store", disk, { disk.drop() }),
+        )) {
+            var woke = false
+            CoroutineScope(queue).launch {
+                delay(1_000)
+                woke = true
+            }
+            // Only as far as the wait: its time is not moved on.
+            while (main.queue.step() || disk.step()) continue
+            drop()
+            settle()
+            assertFalse("$name: a wait begun before the process died ended after it", woke)
+        }
     }
 }

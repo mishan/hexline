@@ -9,10 +9,12 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.viewmodel.CreationExtras
+import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Delay
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.DisposableHandle
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.MainCoroutineDispatcher
@@ -67,8 +69,8 @@ abstract class ViewModelHarness {
     protected var onDisk = false
     protected var fromCore = false
 
-    protected val main = Main(StandardTestDispatcher(TestCoroutineScheduler()))
-    protected val disk = Stepped(StandardTestDispatcher(TestCoroutineScheduler())) { onDisk = it }
+    protected val main = Main(Stepped())
+    protected val disk = Stepped { onDisk = it }
 
     /** A model is alive, so the stores are the queue's alone. */
     protected var armed = false
@@ -572,12 +574,25 @@ abstract class ViewModelHarness {
      * [inner]'s clock, which only [drain] moves.
      */
     protected open class Stepped(
-        val inner: TestDispatcher,
         val running: (Boolean) -> Unit = {},
     ) : CoroutineDispatcher(),
-        Delay by inner {
+        Delay {
         private val tasks = ArrayDeque<Runnable>()
         val pending get() = tasks.size
+
+        /** Where its waits are timed; a process that dies takes its own with it. */
+        private var inner: TestDispatcher = StandardTestDispatcher(TestCoroutineScheduler())
+
+        override fun scheduleResumeAfterDelay(
+            timeMillis: Long,
+            continuation: CancellableContinuation<Unit>,
+        ) = (inner as Delay).scheduleResumeAfterDelay(timeMillis, continuation)
+
+        override fun invokeOnTimeout(
+            timeMillis: Long,
+            block: Runnable,
+            context: CoroutineContext,
+        ): DisposableHandle = (inner as Delay).invokeOnTimeout(timeMillis, block, context)
 
         override fun dispatch(
             context: CoroutineContext,
@@ -606,8 +621,15 @@ abstract class ViewModelHarness {
             } while (tasks.isNotEmpty())
         }
 
-        /** Every task waiting, never run: the process they were for has gone. */
-        fun drop() = tasks.clear()
+        /**
+         * Every task waiting, never run: the process they were for has gone.
+         * Its waits go too, or a later [drain] would end them and run what
+         * the dead process meant to do after.
+         */
+        fun drop() {
+            tasks.clear()
+            inner = StandardTestDispatcher(TestCoroutineScheduler())
+        }
     }
 
     /**
@@ -616,10 +638,9 @@ abstract class ViewModelHarness {
      * Android's does; only the store queue and the core are not.
      */
     protected inner class Main(
-        inner: TestDispatcher,
+        val queue: Stepped,
     ) : MainCoroutineDispatcher(),
-        Delay by inner {
-        val queue = Stepped(inner)
+        Delay by queue {
         val pending get() = queue.pending
 
         override fun dispatch(
@@ -630,7 +651,7 @@ abstract class ViewModelHarness {
         override val immediate: MainCoroutineDispatcher =
             object :
                 MainCoroutineDispatcher(),
-                Delay by inner {
+                Delay by queue {
                 override val immediate get() = this
 
                 override fun isDispatchNeeded(context: CoroutineContext) = onDisk || fromCore
