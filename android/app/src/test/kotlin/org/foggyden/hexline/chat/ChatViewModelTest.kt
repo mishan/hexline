@@ -899,6 +899,8 @@ class ChatViewModelTest {
             val e = enrollments.single()
             assertArrayEquals("$answer: the device it has", SEED, e.renewing!!.first)
             assertEquals(answer, Triple("hl.example", null, "Hexline"), e.asked)
+            // The holder takes its time: what is noted is when it ended.
+            now += HOUR
             when (answer) {
                 "renewed" -> core { e.answer.complete(enrolled(RENEWED)) }
                 "no holder" -> core { e.answer.completeExceptionally(CoreException.Refused("no_holder", "")) }
@@ -917,11 +919,11 @@ class ChatViewModelTest {
                     assertEquals(answer, listOf(0L, false, "hl.example"), listOf(kept.renewTried, kept.noHolder, kept.mailbox))
                     assertArrayEquals("$answer: the new certificate kept", RENEWED, kept.cert)
                 }
-                "no holder" -> assertEquals(answer, listOf(due, true), listOf(kept.renewTried, kept.noHolder))
+                "no holder" -> assertEquals(answer, listOf(due + HOUR, true), listOf(kept.renewTried, kept.noHolder))
                 "left while waiting" ->
                     assertEquals(
                         "$answer: a holder asked counts",
-                        listOf(due, false),
+                        listOf(due + HOUR, false),
                         listOf(kept.renewTried, kept.noHolder),
                     )
                 else -> assertEquals("$answer: not counted", listOf(1L, true), listOf(kept.renewTried, kept.noHolder))
@@ -1040,6 +1042,8 @@ class ChatViewModelTest {
         override fun expectIdentityOf(cert: ByteArray) = error("set when made, by the factory")
 
         override fun posted() = posted
+
+        override fun mayHaveAsked() = posted
 
         override fun close() {
             closed = true
@@ -1242,6 +1246,7 @@ class ChatViewModelTest {
     private companion object {
         const val SETTLE = 50
         const val DAY = 86_400L
+        const val HOUR = 3_600L
 
         /** A second past the skew a certificate's time is allowed, as a server allows it. */
         const val PAST_SKEW = 301L

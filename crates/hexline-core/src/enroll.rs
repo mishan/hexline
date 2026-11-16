@@ -88,8 +88,10 @@ pub struct Enrollee {
     /// The identity an answer must be from: a renewal's, or one this phone
     /// already holds a device of.
     expected: Mutex<Option<PublicKey>>,
-    /// The request has reached the mailbox: a holder may have been asked.
+    /// The request has reached the mailbox, its answer read.
     posted: AtomicBool,
+    /// The request was sent, whatever came back: a holder may have been asked.
+    sent: AtomicBool,
     stopped: AtomicBool,
     stop: Notify,
 }
@@ -104,6 +106,7 @@ impl Enrollee {
             prev: None,
             expected: Mutex::new(None),
             posted: AtomicBool::new(false),
+            sent: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             stop: Notify::new(),
         })
@@ -129,6 +132,7 @@ impl Enrollee {
             prev: Some(cert),
             expected: Mutex::new(Some(c.identity)),
             posted: AtomicBool::new(false),
+            sent: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             stop: Notify::new(),
         }))
@@ -179,6 +183,12 @@ impl Enrollee {
     /// asked, whatever came of it.
     pub fn posted(&self) -> bool {
         self.posted.load(Ordering::SeqCst)
+    }
+
+    /// Whether a request was sent at all, so a holder may have been asked
+    /// even where the mailbox's reply was lost or the send cut short.
+    pub fn may_have_asked(&self) -> bool {
+        self.sent.load(Ordering::SeqCst)
     }
 
     /// The device's seed, for the app to keep beside the certificate and
@@ -241,6 +251,7 @@ impl Enrollee {
         if let Some(code) = &code {
             body["code"] = json!(code);
         }
+        self.sent.store(true, Ordering::SeqCst);
         let posted = auth::post(&http, &format!("{enroll}/requests"), Some(body)).await?;
         self.posted.store(true, Ordering::SeqCst);
         let secret = posted
@@ -261,14 +272,22 @@ impl Enrollee {
         let mut backoff = POLL_FLOOR;
         let bundle = loop {
             let asked = tokio::time::Instant::now();
-            let (status, body) = match auth::get_waiting(&http, &url, LONG_POLL).await {
+            // Never past the request's life, however long a poll may wait.
+            let left = deadline.saturating_duration_since(asked);
+            if left.is_zero() {
+                return Err(refused("expired"));
+            }
+            let (status, body) = match auth::get_waiting(&http, &url, LONG_POLL.min(left)).await {
                 Ok(got) => got,
-                Err(hxng_client::driver::Error::Connect(_)) if asked < deadline => {
-                    tokio::time::sleep(backoff).await;
+                Err(hxng_client::driver::Error::Connect(_)) => {
+                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if left.is_zero() {
+                        return Err(refused("expired"));
+                    }
+                    tokio::time::sleep(backoff.min(left)).await;
                     backoff = (backoff * 2).min(MOST_BACKOFF);
                     continue;
                 }
-                Err(hxng_client::driver::Error::Connect(_)) => return Err(refused("expired")),
                 Err(e) => return Err(e.into()),
             };
             backoff = POLL_FLOOR;
@@ -676,6 +695,93 @@ mod tests {
             "{ended:?}"
         );
         assert!(!phone.posted());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wait_ends_with_its_requests_life_however_long_a_poll_hangs() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // A mailbox whose requests live a second, and whose polls never answer.
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let body = if head.starts_with("GET /.well-known/hotline") {
+                    r#"{"identity":{"endpoints":{"enroll":"/identity/enroll"}}}"#
+                } else if head.starts_with("POST /identity/enroll/requests") {
+                    r#"{"request":"r1","expires_in":1}"#
+                } else {
+                    held.push(s);
+                    continue;
+                };
+                let status = if head.starts_with("POST") {
+                    "201 Created"
+                } else {
+                    "200 OK"
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(reply.as_bytes()).await;
+            }
+        });
+        let started = std::time::Instant::now();
+        let ended = Enrollee::new()
+            .enroll(
+                format!("http://127.0.0.1:{port}"),
+                Some("K7PM-4XWE".into()),
+                "Hexline".into(),
+            )
+            .await;
+        assert!(
+            matches!(ended, Err(CoreError::Refused { ref code, .. }) if code == "expired"),
+            "{ended:?}"
+        );
+        // Its life and the slack after it, not a long poll more.
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_whose_reply_is_lost_may_have_asked_a_holder() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Discovery answered; the post taken and its reply never sent.
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                if buf[..n].starts_with(b"GET /.well-known/hotline") {
+                    let body = r#"{"identity":{"endpoints":{"enroll":"/identity/enroll"}}}"#;
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(reply.as_bytes()).await;
+                }
+            }
+        });
+        let phone = Enrollee::new();
+        let ended = phone
+            .clone()
+            .enroll(
+                format!("http://127.0.0.1:{port}"),
+                Some("K7PM-4XWE".into()),
+                "Hexline".into(),
+            )
+            .await;
+        assert!(matches!(ended, Err(CoreError::Connect { .. })), "{ended:?}");
+        assert!(phone.may_have_asked() && !phone.posted());
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -543,16 +543,13 @@ class ChatViewModel internal constructor(
                             at - it.renewTried >= DAY
                     }
                 }
-            for (kept in due) renewQuietly(kept, at)
+            for (kept in due) renewQuietly(kept)
         } finally {
             renewing = false
         }
     }
 
-    private suspend fun renewQuietly(
-        kept: StoredIdentity,
-        at: Long,
-    ) {
+    private suspend fun renewQuietly(kept: StoredIdentity) {
         var seed: ByteArray? = null
         // One record for the device, its certificate and its mailbox: the one
         // chosen, unless another has taken its place since.
@@ -592,9 +589,9 @@ class ChatViewModel internal constructor(
             done = true
         } catch (e: CoreException) {
             // Offline before a holder could be asked: asked again when the app is next in front.
-            if (e is CoreException.Connect && !mine.posted()) return
+            if (e is CoreException.Connect && !mine.mayHaveAsked()) return
             val noHolder = e is CoreException.Refused && e.code == "no_holder"
-            tried(renewing, at, noHolder)
+            tried(renewing, noHolder)
             done = true
         } catch (_: SecretUnavailable) {
             return
@@ -603,19 +600,21 @@ class ChatViewModel internal constructor(
         } finally {
             // Let go of while it waited (the screen gone): the wait ends too,
             // and a holder already asked is not asked again on the next return.
-            if (!done && mine.posted()) tried(renewing, at, false)
+            if (!done && mine.mayHaveAsked()) tried(renewing, false)
             mine.cancel()
             mine.close()
         }
     }
 
+    /** Notes [renewing]'s renewal asked for now: when it ended, not when the scan that found it began. */
     private fun tried(
         renewing: StoredIdentity,
-        at: Long,
         noHolder: Boolean,
-    ) = later {
-        identities.renewTried(renewing.fingerprint, renewing.cert, at, noHolder)
-        publishIdentities()
+    ) = now().let { at ->
+        later {
+            identities.renewTried(renewing.fingerprint, renewing.cert, at, noHolder)
+            publishIdentities()
+        }
     }
 
     fun restoreSeen() {

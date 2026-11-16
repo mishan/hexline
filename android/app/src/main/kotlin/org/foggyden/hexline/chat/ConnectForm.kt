@@ -56,6 +56,9 @@ data class ConnectForm(
     fun chose(fingerprint: String): ConnectForm =
         if (fingerprint == chosen) this else copy(chosen = fingerprint, linking = false, linkLogin = "", linkPassword = "")
 
+    /** [fingerprint]'s identity, just restored or enrolled, picked to sign in with. */
+    fun restored(fingerprint: String): ConnectForm = copy(byIdentity = true).chose(fingerprint)
+
     /** The identity picked is no longer on this phone. */
     fun missing(identities: List<StoredIdentity>): Boolean = chosen != null && identities.none { it.fingerprint == chosen }
 

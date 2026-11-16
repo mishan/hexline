@@ -42,6 +42,15 @@ class ConnectFormTest {
         val other = linking.chose("fp-y")
         assertFalse("another picked", other.linking)
         assertNull(other.request(identities, NOW, none)?.link)
+        assertFalse("another just restored or enrolled", linking.restored("fp-y").linking)
+        assertEquals(
+            "pw-a",
+            linking
+                .restored("fp-x")
+                .request(identities, NOW, none)
+                ?.link
+                ?.password,
+        )
         val web = linking.copy(chosen = "fp-web").request(identities, NOW, none)
         assertNull("a device that may not manage asks no link", web?.link)
         assertEquals("but still signs in", "fp-web", (web?.server?.signIn as? SignIn.Identity)?.fingerprint)

@@ -175,7 +175,7 @@ private fun ConnectScreen(
     }
     LaunchedEffect(restored) {
         if (restored != null) {
-            form = form.copy(byIdentity = true, chosen = restored)
+            form = form.restored(restored)
             onRestored()
         }
     }
