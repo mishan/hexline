@@ -56,6 +56,7 @@ import org.foggyden.hexline.servers.StoreQueue
 import org.foggyden.hexline.servers.stored
 import java.io.IOException
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * One server's connection and what its screen shows. The session outlives
@@ -190,6 +191,9 @@ class ChatViewModel internal constructor(
     /** The connection has been live: what it saves from now on is its own. */
     private var established = false
     private var foreground = true
+
+    /** Per server, the session write waiting its turn on the store queue, and when it was asked for. */
+    private val sessionWrites = ConcurrentHashMap<Server, Pair<ByteArray, Long>>()
 
     /**
      * One sink per connection, so a late batch from one no longer current
@@ -844,7 +848,11 @@ class ChatViewModel internal constructor(
         val saved = conn.saved() ?: return
         // Asked for now: a clear that comes first wins, even if this write lands after it.
         val since = servers.generation()
-        later { servers.keepSession(to, saved, since) }
+        // The core tells a busy link's session after every batch: one write
+        // waits at a time, taking the newest asked for when its turn comes.
+        if (sessionWrites.put(to, saved to since) == null) {
+            later { sessionWrites.remove(to)?.let { (bytes, at) -> servers.keepSession(to, bytes, at) } }
+        }
     }
 
     fun disconnect() {

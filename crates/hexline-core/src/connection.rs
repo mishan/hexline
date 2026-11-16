@@ -259,7 +259,9 @@ pub enum CoreUpdate {
     },
     /// What `saved` gives is this link's session now, and is to be kept:
     /// told once the link's first batch is handed over, so it comes though
-    /// the link says nothing more.
+    /// the link says nothing more; again as the app goes to the background;
+    /// and there after each batch that moves its cursor, so the session the
+    /// app keeps when it may be stopped covers what it has been given.
     SessionKept,
     /// The connection is over for good, and the core will not reconnect:
     /// hung up, kicked, refused, or taken by another device (`replaced`).
@@ -1311,6 +1313,24 @@ async fn hold(
     }
 }
 
+/// Whether a batch that moved the cursor is told as kept. The cursor moves
+/// only once the app has returned from the batch, so a session read while
+/// it was still in hand is a batch short, and a resume from there is synced
+/// rather than replayed. In front the app's next read is when it goes,
+/// which is told then, so only a link away from the front is told after
+/// each batch: one write a batch, while the app is out of sight. Not after
+/// a kick or a hang-up, whose session nothing resumes, nor a loss the core
+/// will not take back (`lost` is whether the loss is resumable).
+fn tells_kept(
+    advanced: bool,
+    kicked: bool,
+    closing: bool,
+    foreground: bool,
+    lost: Option<bool>,
+) -> bool {
+    advanced && !kicked && !closing && !foreground && lost.unwrap_or(true)
+}
+
 /// Hand the app a link's updates until it ends, the app hangs up, or the
 /// app has been in the background past the linger. What resumes the
 /// session is kept as of the last update the app was handed.
@@ -1381,8 +1401,23 @@ async fn pump(
                     link.client.close();
                     return Ended::Over(Vec::new());
                 }
-                if let (Some(seq), Some(k)) = (last_seq, shared.kept.lock().unwrap().as_mut()) {
-                    k.resumable.last_seq = seq;
+                let advanced = match (last_seq, shared.kept.lock().unwrap().as_mut()) {
+                    (Some(seq), Some(k)) => {
+                        k.resumable.last_seq = seq;
+                        true
+                    }
+                    _ => false,
+                };
+                let tell = tells_kept(
+                    advanced,
+                    kicked,
+                    closing.is_some(),
+                    *foreground,
+                    lost.as_ref().map(|l| l.resumable.is_some() && !l.replaced),
+                );
+                if tell && !shared.deliver(vec![CoreUpdate::SessionKept]) {
+                    link.client.close();
+                    return Ended::Over(Vec::new());
                 }
                 if let Some(l) = lost {
                     if l.resumable.is_none() && closing.is_some() {
@@ -1424,10 +1459,23 @@ async fn pump(
                     link.client.close();
                 }
                 Some(Control::Foreground(f)) => {
+                    let away = !f && *foreground;
                     if f != *foreground {
                         lingering = (!f).then(|| shared.linger());
                     }
                     *foreground = f;
+                    // Told as the app goes, once the cursor covers every
+                    // batch handed over, so what it keeps then resumes them.
+                    let keeping = shared.kept.lock().unwrap().is_some();
+                    if away
+                        && keeping
+                        && !kicked
+                        && closing.is_none()
+                        && !shared.deliver(vec![CoreUpdate::SessionKept])
+                    {
+                        link.client.close();
+                        return Ended::Over(Vec::new());
+                    }
                 }
                 Some(Control::Nudge) => {}
             },
@@ -1498,6 +1546,43 @@ fn event(ev: String, data: Value) -> CoreUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_batch_is_told_kept_only_away_from_the_front_and_while_the_session_lives_on() {
+        // (advanced, kicked, closing, foreground, lost) -> told
+        for (case, args, told) in [
+            ("behind, a line", (true, false, false, false, None), true),
+            ("in front, a line", (true, false, false, true, None), false),
+            (
+                "behind, nothing moved",
+                (false, false, false, false, None),
+                false,
+            ),
+            (
+                "kicked, closed in a later batch",
+                (true, true, false, false, None),
+                false,
+            ),
+            ("hung up", (true, false, true, false, None), false),
+            (
+                "lost, to be resumed",
+                (true, false, false, false, Some(true)),
+                true,
+            ),
+            (
+                "lost for good",
+                (true, false, false, false, Some(false)),
+                false,
+            ),
+        ] {
+            let (advanced, kicked, closing, foreground, lost) = args;
+            assert_eq!(
+                tells_kept(advanced, kicked, closing, foreground, lost),
+                told,
+                "{case}"
+            );
+        }
+    }
 
     #[test]
     fn a_kept_session_reads_back_as_itself_and_nothing_else_reads() {

@@ -327,6 +327,9 @@ abstract class ViewModelHarness {
         /** What keeping any secret throws, if anything. */
         var putFails: (() -> Exception)? = null
 
+        /** The names of the secrets kept, in order, each time one is. */
+        val puts = mutableListOf<String>()
+
         private fun onQueue() = check(!armed || exempt || onDisk) { "a store touched off its queue" }
 
         override fun put(
@@ -335,6 +338,7 @@ abstract class ViewModelHarness {
         ) {
             onQueue()
             putFails?.let { throw it() }
+            puts += name
             kept[name] = secret.copyOf()
         }
 

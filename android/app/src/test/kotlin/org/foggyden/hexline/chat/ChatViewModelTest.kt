@@ -478,6 +478,29 @@ class ChatViewModelTest : ViewModelHarness() {
     }
 
     @Test
+    fun aBusyLinksSessionIsWrittenOnceForTheBatchesItWaitedOn() {
+        val server = passwordServer("busy")
+        val vm = model()
+        settle()
+        vm.connect(server, "pw", false)
+        settle()
+        val conn = opened.single()
+        land(conn, LOGGED_IN)
+        live(conn)
+        settle()
+        val before = secrets.puts.count { it.startsWith("session-") }
+        // The core tells the session after every batch; the queue is busy meanwhile.
+        for (n in 1..5) {
+            conn.session = "session $n".toByteArray()
+            core { conn.sink.deliver(listOf(CoreUpdate.SessionKept)) }
+            onMain()
+        }
+        settle()
+        assertEquals("session 5", outside { servers.session(server) }?.let(::String))
+        assertEquals(1, secrets.puts.count { it.startsWith("session-") } - before)
+    }
+
+    @Test
     fun deletingTheIdentityInUseLogsOutAndForgetsWhatEveryServerKeptForIt() {
         val server = identityServer("in use")
         val other = identityServer("other")

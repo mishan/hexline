@@ -3,6 +3,7 @@ package org.foggyden.hexline.chat
 import android.app.Application
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModelStore
+import org.foggyden.hexline.core.ChatLine
 import org.foggyden.hexline.core.ClassicLogin
 import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.CoreUpdate
@@ -135,6 +136,9 @@ class ChatViewModelInterleavingTest : ViewModelHarness() {
             var over = false
             var noResume = false
             var seen = false
+
+            /** Where a batch handed over has moved the core's cursor, not yet in what `saved` gives. */
+            var moved: ByteArray? = null
         }
 
         /** Told as its holder is asked: set once the enrollment exists. */
@@ -305,9 +309,17 @@ class ChatViewModelInterleavingTest : ViewModelHarness() {
                     "roster"
                 } else {
                     when (rnd.nextInt(7)) {
-                        in 0 until 3 -> {
+                        0 -> {
                             if (c.noResume) return null
-                            c.session = session(c.server, "kept at $step")
+                            // The core hands a batch over first, and moves its cursor once that returns.
+                            deliver(c, CoreUpdate.Chat(ChatLine(step.toULong(), null, "bob", "line $step", 0u, false, null, false)))
+                            c.moved = session(c.server, "kept at $step")
+                            "a line"
+                        }
+                        in 1 until 3 -> {
+                            if (c.noResume) return null
+                            c.session = c.moved ?: session(c.server, "kept at $step")
+                            c.moved = null
                             keptAt[url] = step
                             deliver(c, CoreUpdate.SessionKept)
                             "session kept"
@@ -325,6 +337,8 @@ class ChatViewModelInterleavingTest : ViewModelHarness() {
                         else -> {
                             val canResume = rnd.nextBoolean()
                             val identity = (c.server.signIn as? SignIn.Identity)?.fingerprint
+                            // A new link's cursor is its own; the old one's move goes with it.
+                            c.moved = null
                             if (!canResume) {
                                 c.noResume = true
                                 listOfNotNull(c.session, c.resumedWith).forEach { dead += hexOf(it) }
@@ -352,6 +366,7 @@ class ChatViewModelInterleavingTest : ViewModelHarness() {
             c.over = true
             listOfNotNull(c.session, c.resumedWith).forEach { dead += hexOf(it) }
             c.session = null
+            c.moved = null
             ended[c.server.url] = step
             deliver(c, *updates)
         }
