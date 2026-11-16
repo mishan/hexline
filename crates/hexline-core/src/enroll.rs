@@ -319,14 +319,14 @@ impl Enrollee {
             if left.is_zero() {
                 return Err(ended(lost, busy));
             }
-            let polled = mailbox.poll(&url, LONG_POLL.min(left)).await;
-            busy = None;
-            let again = match polled {
+            let again = match mailbox.poll(&url, LONG_POLL.min(left)).await {
                 Polled::Reply {
                     status,
                     body,
                     retry_after,
                 } => {
+                    // The mailbox's last word, until it says another.
+                    busy = None;
                     let reply: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                     match status {
                         200 => break bytes(&reply, "bundle")?,
@@ -335,7 +335,10 @@ impl Enrollee {
                         202 => {
                             backoff = POLL_FLOOR;
                             if let Some(s) = reply.get("expires_in").and_then(Value::as_u64) {
-                                expires = tokio::time::Instant::now() + Duration::from_secs(s);
+                                // No longer than any request lives, so the
+                                // sum is one an Instant holds.
+                                expires = tokio::time::Instant::now()
+                                    + Duration::from_secs(s.min(REQUEST_LIFE));
                             }
                             tokio::time::sleep_until((asked + POLL_FLOOR).min(deadline)).await;
                             continue;
@@ -1401,6 +1404,19 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_mailbox_asking_for_room_then_unheard_from_ends_rate_limited() {
+        let phone = Enrollee::new();
+        let mut steps = vec![(Duration::ZERO, Step::Busy(Some(2)))];
+        steps.extend(vec![(Duration::ZERO, Step::Dropped); 10]);
+        let script = Script::new(&phone, 5, &steps);
+        let (ended, took) = asked(&phone, &script).await;
+        assert_eq!(
+            (ended.as_str(), took),
+            ("RateLimited { retry_after: Some(2) }", S(10))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn an_answer_lost_on_its_way_is_told_apart_from_no_answer() {
         let z = Duration::ZERO;
         for (steps, ends) in [
@@ -1418,6 +1434,15 @@ mod tests {
             (
                 vec![
                     (z, Step::NotYetFor(10)),
+                    (z, Step::Dropped),
+                    (z, Step::Gone),
+                ],
+                "answer_lost",
+            ),
+            // A life no request has is held to the one it may have.
+            (
+                vec![
+                    (z, Step::NotYetFor(u64::MAX)),
                     (z, Step::Dropped),
                     (z, Step::Gone),
                 ],
@@ -1468,11 +1493,11 @@ mod tests {
         fn step() -> impl Strategy<Value = Step> {
             prop_oneof![
                 Just(Step::NotYet),
-                (0u64..60).prop_map(Step::NotYetFor),
+                prop_oneof![0u64..60, Just(u64::MAX)].prop_map(Step::NotYetFor),
                 Just(Step::Answer),
                 Just(Step::Denied),
                 Just(Step::Gone),
-                proptest::option::of(0u64..40).prop_map(Step::Busy),
+                proptest::option::of(prop_oneof![0u64..40, Just(u64::MAX)]).prop_map(Step::Busy),
                 prop_oneof![Just(500u16), Just(502), Just(503), Just(504), Just(522)]
                     .prop_map(Step::Front),
                 Just(Step::Dropped),
@@ -1562,7 +1587,12 @@ mod tests {
                     // Never early: gone, or the request's whole life waited.
                     "expired" => prop_assert!(!lost && (gone || to_its_end)),
                     other => prop_assert!(
-                        other.starts_with("RateLimited") && matches!(last, Some(Step::Busy(_))) && to_its_end,
+                        other.starts_with("RateLimited")
+                            && matches!(
+                                heard.iter().rev().find(|s| !matches!(s, Step::Dropped)),
+                                Some(Step::Busy(_))
+                            )
+                            && to_its_end,
                         "ended {}", other
                     ),
                 }
