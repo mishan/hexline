@@ -701,6 +701,7 @@ private fun describe(failed: Enrolling.Failed): String =
         EnrollProblem.Denied ->
             failed.reason?.let { stringResource(R.string.enroll_denied_because, it) } ?: stringResource(R.string.enroll_denied)
         EnrollProblem.Expired -> stringResource(R.string.enroll_expired)
+        EnrollProblem.AnswerLost -> stringResource(R.string.enroll_answer_lost)
         EnrollProblem.NotForThisPhone -> stringResource(R.string.enroll_not_for_this_phone)
         EnrollProblem.RateLimited -> stringResource(R.string.enroll_rate_limited)
         EnrollProblem.Unreachable -> stringResource(R.string.enroll_unreachable)

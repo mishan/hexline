@@ -43,6 +43,14 @@ const MAX_CERT: usize = 512;
 /// The longest wait between two polls a dropped link makes.
 const MOST_BACKOFF: Duration = Duration::from_secs(8);
 
+/// The slack past a request's life the phone waits for its answer: the
+/// post's reply took a while to come, and the mailbox rounds the life it
+/// tells down to the second.
+const SLACK: Duration = Duration::from_secs(5);
+
+/// The longest reply a mailbox gives (an answer is a certificate and a card).
+const MOST_REPLY: usize = 64 * 1024;
+
 /// A holder's reason for saying no, as words it may have chosen: short,
 /// and nothing but letters, digits, `_`, `-` and spaces, or none. The app
 /// shows them as the holder's.
@@ -157,7 +165,9 @@ impl Enrollee {
     /// (§8). Waits for the answer, and refuses one that is not for this
     /// device, or for a renewal not of the identity it renews. Refused
     /// `unknown_code`, `no_holder`, `denied` (with the holder's reason),
-    /// `expired`, `canceled`, or as the mailbox refused.
+    /// `expired`, `answer_lost` (the holder may have answered, and the
+    /// answer did not arrive), `canceled`, or as the mailbox refused; or
+    /// rate limited, where the mailbox's last word was to wait.
     ///
     /// One at a time: a second while one is under way is refused `busy`.
     pub async fn enroll(
@@ -235,24 +245,40 @@ impl Enrollee {
         }
         check_name(name)?;
         let base = mailbox_base(mailbox)?;
-        let http = auth::http_client(base.as_str(), None)?;
-        let enroll = discovered(&http, &base).await?;
+        let http = Http {
+            http: auth::http_client(base.as_str(), None)?,
+            base,
+        };
+        self.ask(&http, code.as_deref(), prev.as_ref(), name).await
+    }
+
+    /// The request posted to `mailbox` and its answer waited for: every
+    /// step the link takes, behind [`Mailbox`], so the wait can be run
+    /// against a script on a clock a test moves.
+    async fn ask<M: Mailbox>(
+        &self,
+        mailbox: &M,
+        code: Option<&str>,
+        prev: Option<&DeviceCert>,
+        name: &str,
+    ) -> Result<Enrolled, CoreError> {
+        let enroll = mailbox.discover().await?;
 
         let mut request = EnrollRequest::new(&self.device, now());
         request.name = Some(name.to_owned());
         // A renewal asks for no more than it has (§8); a holder refuses one
         // that does.
-        request.caps = match &prev {
+        request.caps = match prev {
             Some(p) => p.caps,
             None => Some(ASKED),
         };
         request.prev = self.prev.clone();
         let mut body = json!({ "request": b64(&request.sign(&self.device)) });
-        if let Some(code) = &code {
+        if let Some(code) = code {
             body["code"] = json!(code);
         }
         self.sent.store(true, Ordering::SeqCst);
-        let posted = auth::post(&http, &format!("{enroll}/requests"), Some(body)).await?;
+        let posted = mailbox.post(&format!("{enroll}/requests"), body).await?;
         let secret = posted
             .get("request")
             .and_then(Value::as_str)
@@ -263,60 +289,108 @@ impl Enrollee {
             .and_then(Value::as_u64)
             .unwrap_or(REQUEST_LIFE)
             .min(REQUEST_LIFE);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(life + 5);
+        let posted_at = tokio::time::Instant::now();
+        let deadline = posted_at + Duration::from_secs(life) + SLACK;
+        // When the mailbox last said the request would be gone.
+        let mut expires = posted_at + Duration::from_secs(life);
         let url = format!("{enroll}/requests/{secret}");
         // Asked for, the request is waited on whatever the link does: a
-        // dropped poll is asked again under the same secret until the
+        // dropped poll, a front that is briefly down and a mailbox asking
+        // for room are all asked again under the same secret until the
         // request's life is out.
         let mut backoff = POLL_FLOOR;
+        // The mailbox hands an answer, or a denial, over once and forgets
+        // it. One cut short on its way, or taken by a poll this phone gave
+        // up on (the mailbox's side of it waits on), is gone, and "expired"
+        // would tell the person the holder never said.
+        let mut lost = false;
+        let mut abandoned = false;
+        // A mailbox whose last word was to wait: the wait it asked for.
+        let mut busy: Option<Option<u64>> = None;
+        let ended = |lost: bool, busy: Option<Option<u64>>| match busy {
+            _ if lost => refused("answer_lost"),
+            Some(retry_after) => CoreError::RateLimited { retry_after },
+            None => refused("expired"),
+        };
         let bundle = loop {
             let asked = tokio::time::Instant::now();
             // Never past the request's life, however long a poll may wait.
             let left = deadline.saturating_duration_since(asked);
             if left.is_zero() {
-                return Err(refused("expired"));
+                return Err(ended(lost, busy));
             }
-            let (status, body) = match auth::get_waiting(&http, &url, LONG_POLL.min(left)).await {
-                Ok(got) => got,
-                Err(hxng_client::driver::Error::Connect(_)) => {
-                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if left.is_zero() {
-                        return Err(refused("expired"));
+            let polled = mailbox.poll(&url, LONG_POLL.min(left)).await;
+            busy = None;
+            let again = match polled {
+                Polled::Reply {
+                    status,
+                    body,
+                    retry_after,
+                } => {
+                    let reply: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    match status {
+                        200 => break bytes(&reply, "bundle")?,
+                        // Not yet: asked again a floor later, and its deadline
+                        // ends it at the top of the loop.
+                        202 => {
+                            backoff = POLL_FLOOR;
+                            if let Some(s) = reply.get("expires_in").and_then(Value::as_u64) {
+                                expires = tokio::time::Instant::now() + Duration::from_secs(s);
+                            }
+                            tokio::time::sleep_until((asked + POLL_FLOOR).min(deadline)).await;
+                            continue;
+                        }
+                        // Gone while it still had life: a poll given up on
+                        // may have taken its answer.
+                        404 | 410 => {
+                            let early = tokio::time::Instant::now() < expires;
+                            return Err(ended(lost || (abandoned && early), None));
+                        }
+                        403 => {
+                            return Err(CoreError::Refused {
+                                code: "denied".into(),
+                                detail: denial(
+                                    reply
+                                        .get("denied")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default(),
+                                ),
+                            })
+                        }
+                        // As long as the mailbox asks, never less than the floor.
+                        429 => {
+                            let asked = crate::restore::retry_after(&body).or(retry_after);
+                            busy = Some(asked);
+                            asked.map(|s| Duration::from_secs(s).max(POLL_FLOOR))
+                        }
+                        // A front between here and the mailbox, down or giving
+                        // up on a long poll (a CDN's 52x among them): the
+                        // request is still there. Not what no server does.
+                        501 | 505 => {
+                            return Err(protocol(&format!("the mailbox answered {status}")))
+                        }
+                        500..=599 => None,
+                        _ => return Err(protocol(&format!("the mailbox answered {status}"))),
                     }
-                    tokio::time::sleep(backoff.min(left)).await;
-                    backoff = (backoff * 2).min(MOST_BACKOFF);
-                    continue;
                 }
-                Err(e) => return Err(e.into()),
+                Polled::Dropped => {
+                    abandoned = true;
+                    None
+                }
+                Polled::Cut => None,
+                Polled::Lost => {
+                    lost = true;
+                    None
+                }
+                Polled::Failed(e) => return Err(e),
             };
-            backoff = POLL_FLOOR;
-            let reply: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-            match status {
-                200 => break bytes(&reply, "bundle")?,
-                // Not yet: asked again, and its deadline ends it at the top of the loop.
-                202 => {
-                    tokio::time::sleep_until((asked + POLL_FLOOR).min(deadline)).await;
-                    continue;
-                }
-                404 | 410 => return Err(refused("expired")),
-                403 => {
-                    return Err(CoreError::Refused {
-                        code: "denied".into(),
-                        detail: denial(
-                            reply
-                                .get("denied")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default(),
-                        ),
-                    })
-                }
-                429 => {
-                    return Err(CoreError::RateLimited {
-                        retry_after: reply.get("retry_after").and_then(Value::as_u64),
-                    })
-                }
-                _ => return Err(protocol(&format!("the mailbox answered {status}"))),
-            }
+            let wait = again.unwrap_or_else(|| {
+                let wait = backoff;
+                backoff = (backoff * 2).min(MOST_BACKOFF);
+                wait
+            });
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(wait.min(left)).await;
         };
         self.checked(&bundle)
     }
@@ -447,6 +521,92 @@ pub fn newer_card(kept: Vec<u8>, offered: Vec<u8>) -> Vec<u8> {
 pub fn renewal_due(issued: u64, expires: u64, now: u64) -> bool {
     let life = expires.saturating_sub(issued);
     expires.saturating_sub(now).saturating_mul(3) <= life
+}
+
+/// What one poll for an answer came to.
+pub(crate) enum Polled {
+    /// The mailbox answered: a status, the whole body, and the seconds a
+    /// `Retry-After` header asks for.
+    Reply {
+        status: u16,
+        body: Vec<u8>,
+        retry_after: Option<u64>,
+    },
+    /// The link dropped, or the poll outwaited its time, before a reply:
+    /// worth asking again under the same secret.
+    Dropped,
+    /// An answer (200) or a denial (403) whose body was cut short: handed
+    /// over, and a mailbox that hands it over once has forgotten it.
+    Lost,
+    /// Any other reply cut short: answered, so nothing was left waiting at
+    /// the mailbox, and worth asking again.
+    Cut,
+    /// A fault asking again would not mend: a scheme the client refuses,
+    /// a reply longer than any answer.
+    Failed(CoreError),
+}
+
+/// A mailbox as the enrollment reaches it: over HTTP for real, or a script
+/// for the tests of the wait, which a real socket would hold to real time.
+pub(crate) trait Mailbox {
+    /// The mailbox's prefix, from its server's discovery.
+    async fn discover(&self) -> Result<String, CoreError>;
+    async fn post(&self, url: &str, body: Value) -> Result<Value, CoreError>;
+    /// A long poll of `url`, given up on after `wait`.
+    async fn poll(&self, url: &str, wait: Duration) -> Polled;
+}
+
+struct Http {
+    http: hxng_client::reqwest::Client,
+    base: Url,
+}
+
+impl Mailbox for Http {
+    async fn discover(&self) -> Result<String, CoreError> {
+        discovered(&self.http, &self.base).await
+    }
+
+    async fn post(&self, url: &str, body: Value) -> Result<Value, CoreError> {
+        Ok(auth::post(&self.http, url, Some(body)).await?)
+    }
+
+    async fn poll(&self, url: &str, wait: Duration) -> Polled {
+        let mut resp = match self.http.get(url).timeout(wait).send().await {
+            Ok(r) => r,
+            // An https-only client refusing a plain URL; a TLS failure mid-wait
+            // is a network change more often than not, and asked again.
+            Err(e) if e.is_builder() => {
+                return Polled::Failed(CoreError::Connect {
+                    detail: e.to_string(),
+                })
+            }
+            Err(_) => return Polled::Dropped,
+        };
+        let status = resp.status().as_u16();
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse().ok());
+        let mut body = Vec::new();
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) if body.len() + chunk.len() > MOST_REPLY => {
+                    return Polled::Failed(protocol("a reply longer than any answer"))
+                }
+                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                Ok(None) => {
+                    return Polled::Reply {
+                        status,
+                        body,
+                        retry_after,
+                    }
+                }
+                Err(_) if matches!(status, 200 | 403) => return Polled::Lost,
+                Err(_) => return Polled::Cut,
+            }
+        }
+    }
 }
 
 /// Where a mailbox is reached: `https://host` for a host, or the origin of
@@ -1018,6 +1178,558 @@ mod tests {
         match discovered(&http, &base).await {
             Err(CoreError::RateLimited { retry_after }) => assert_eq!(retry_after, Some(7)),
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// A certificate for `phone` from a holder who approved it, as the
+    /// mailbox's 200 carries it.
+    fn approved(phone: &Enrollee) -> Vec<u8> {
+        use hl_identity::IdentityKey;
+        let alice = IdentityKey::generate();
+        let mut cert = DeviceCert::for_keys(
+            &alice,
+            phone.device.public(),
+            phone.device.public_enc(),
+            now(),
+            86_400,
+        )
+        .unwrap();
+        cert.caps = Some(caps::LOGIN | caps::MESSAGE);
+        let bundle = Bundle {
+            cert: cert.sign(&alice),
+            card: Card::new(&alice, "Alice", now())
+                .sign(&alice, Vec::new())
+                .unwrap(),
+        }
+        .encode();
+        format!(r#"{{"bundle":"{}"}}"#, b64(&bundle)).into_bytes()
+    }
+
+    /// What a scripted mailbox does with one poll.
+    #[derive(Clone, Debug)]
+    enum Step {
+        NotYet,
+        /// Not yet, and the request gone in so many seconds.
+        NotYetFor(u64),
+        Answer,
+        Denied,
+        Gone,
+        Busy(Option<u64>),
+        /// Asking for room by its `Retry-After` header alone, nested
+        /// under `error` as the ng port puts it, or both.
+        BusyHeader(u64),
+        BusyNested(u64),
+        Front(u16),
+        Dropped,
+        Lost,
+        Broken,
+    }
+
+    /// A mailbox that answers its polls as `steps` say, each after its
+    /// delay (one past the poll's wait is the poll timing out), and "not
+    /// yet" once they run out. Run on paused time, its delays cost nothing.
+    struct Script {
+        found: bool,
+        life: u64,
+        answer: Vec<u8>,
+        steps: Mutex<std::collections::VecDeque<(Duration, Step)>>,
+        posts: std::sync::atomic::AtomicUsize,
+        polls: Mutex<Vec<tokio::time::Instant>>,
+        /// What each poll was answered, a timed-out one as dropped.
+        heard: Mutex<Vec<Step>>,
+    }
+
+    impl Script {
+        fn new(phone: &Enrollee, life: u64, steps: &[(Duration, Step)]) -> Script {
+            Script {
+                found: true,
+                life,
+                answer: approved(phone),
+                steps: Mutex::new(steps.iter().cloned().collect()),
+                posts: Default::default(),
+                polls: Default::default(),
+                heard: Default::default(),
+            }
+        }
+
+        fn polls(&self) -> Vec<tokio::time::Instant> {
+            self.polls.lock().unwrap().clone()
+        }
+    }
+
+    impl Mailbox for Script {
+        async fn discover(&self) -> Result<String, CoreError> {
+            if self.found {
+                Ok("https://hl.example/identity/enroll".into())
+            } else {
+                Err(refused("no_mailbox"))
+            }
+        }
+
+        async fn post(&self, _: &str, _: Value) -> Result<Value, CoreError> {
+            self.posts.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({ "request": "r1", "expires_in": self.life }))
+        }
+
+        async fn poll(&self, _: &str, wait: Duration) -> Polled {
+            self.polls.lock().unwrap().push(tokio::time::Instant::now());
+            let (delay, step) = self
+                .steps
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or((Duration::ZERO, Step::NotYet));
+            let step = if delay > wait {
+                tokio::time::sleep(wait).await;
+                Step::Dropped
+            } else {
+                tokio::time::sleep(delay).await;
+                step
+            };
+            self.heard.lock().unwrap().push(step.clone());
+            let reply = |status, body: &[u8]| Polled::Reply {
+                status,
+                body: body.to_vec(),
+                retry_after: None,
+            };
+            match step {
+                Step::NotYet => reply(202, b"{}"),
+                Step::NotYetFor(s) => reply(202, json!({ "expires_in": s }).to_string().as_bytes()),
+                Step::Answer => reply(200, &self.answer),
+                Step::Denied => reply(403, br#"{"denied":"not_mine"}"#),
+                Step::Gone => reply(410, b""),
+                Step::Busy(after) => reply(
+                    429,
+                    json!({ "error": "rate_limited", "retry_after": after })
+                        .to_string()
+                        .as_bytes(),
+                ),
+                Step::BusyHeader(after) => Polled::Reply {
+                    status: 429,
+                    body: Vec::new(),
+                    retry_after: Some(after),
+                },
+                Step::BusyNested(after) => reply(
+                    429,
+                    json!({ "error": { "code": "rate_limited", "retry_after": after } })
+                        .to_string()
+                        .as_bytes(),
+                ),
+                Step::Front(status) => reply(status, b""),
+                Step::Dropped => Polled::Dropped,
+                Step::Lost => Polled::Lost,
+                Step::Broken => Polled::Failed(protocol("a reply longer than any answer")),
+            }
+        }
+    }
+
+    fn outcome(r: &Result<Enrolled, CoreError>) -> String {
+        match r {
+            Ok(_) => "kept".to_owned(),
+            Err(CoreError::Refused { code, .. }) => code.clone(),
+            Err(e) => format!("{e:?}"),
+        }
+    }
+
+    const S: fn(u64) -> Duration = Duration::from_secs;
+
+    async fn asked(phone: &Enrollee, script: &Script) -> (String, Duration) {
+        let started = tokio::time::Instant::now();
+        let r = phone.ask(script, Some("K7PM-4XWE"), None, "Hexline").await;
+        (outcome(&r), started.elapsed())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_lasts_its_requests_life_and_the_slack_after_it() {
+        let phone = Enrollee::new();
+        let script = Script::new(&phone, 10, &[]);
+        assert_eq!(asked(&phone, &script).await, ("expired".into(), S(15)));
+        let polls = script.polls();
+        assert_eq!(polls.len(), 15, "a second apart, from the start to the end");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_link_is_asked_again_later_each_time_up_to_a_ceiling() {
+        let phone = Enrollee::new();
+        let mut steps = vec![(Duration::ZERO, Step::Dropped); 7];
+        steps.push((Duration::ZERO, Step::Answer));
+        let script = Script::new(&phone, 300, &steps);
+        assert_eq!(asked(&phone, &script).await.0, "kept");
+        let polls = script.polls();
+        let gaps: Vec<Duration> = polls.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(gaps, [1, 2, 4, 8, 8, 8, 8].map(S));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_front_down_or_a_mailbox_asking_for_room_does_not_end_the_wait() {
+        for (step, gap) in [
+            (Step::Front(500), S(1)),
+            (Step::Front(502), S(1)),
+            (Step::Front(503), S(1)),
+            (Step::Front(504), S(1)),
+            (Step::Front(522), S(1)),
+            (Step::Busy(Some(7)), S(7)),
+            (Step::Busy(Some(0)), S(1)),
+            (Step::Busy(None), S(1)),
+            (Step::BusyHeader(7), S(7)),
+            (Step::BusyNested(5), S(5)),
+        ] {
+            let phone = Enrollee::new();
+            let script = Script::new(
+                &phone,
+                300,
+                &[
+                    (Duration::ZERO, step.clone()),
+                    (Duration::ZERO, Step::Answer),
+                ],
+            );
+            assert_eq!(asked(&phone, &script).await.0, "kept", "{step:?}");
+            let polls = script.polls();
+            assert_eq!(polls[1] - polls[0], gap, "{step:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_mailbox_asking_for_more_room_than_the_request_has_left_is_waited_on_to_its_end() {
+        let phone = Enrollee::new();
+        let script = Script::new(&phone, 3, &[(Duration::ZERO, Step::Busy(Some(100)))]);
+        let (ended, took) = asked(&phone, &script).await;
+        assert_eq!(
+            (ended.as_str(), took),
+            ("RateLimited { retry_after: Some(100) }", S(8))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_lost_on_its_way_is_told_apart_from_no_answer() {
+        let z = Duration::ZERO;
+        for (steps, ends) in [
+            (vec![(z, Step::Lost), (z, Step::Gone)], "answer_lost"),
+            (vec![(z, Step::Lost)], "answer_lost"),
+            // A poll given up on, its mailbox side taking the answer.
+            (vec![(z, Step::Dropped), (z, Step::Gone)], "answer_lost"),
+            // Gone early with nothing given up on: the holder's session ended.
+            (vec![(z, Step::NotYet), (z, Step::Gone)], "expired"),
+            // Gone when the mailbox last said it would be, or before.
+            (
+                vec![(z, Step::NotYetFor(0)), (z, Step::Dropped), (z, Step::Gone)],
+                "expired",
+            ),
+            (
+                vec![
+                    (z, Step::NotYetFor(10)),
+                    (z, Step::Dropped),
+                    (z, Step::Gone),
+                ],
+                "answer_lost",
+            ),
+            (vec![(z, Step::Gone)], "expired"),
+        ] {
+            let phone = Enrollee::new();
+            let script = Script::new(&phone, 30, &steps);
+            assert_eq!(asked(&phone, &script).await.0, ends, "{steps:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fault_asking_again_would_meet_ends_the_wait_at_once() {
+        for step in [
+            Step::Broken,
+            Step::Front(501),
+            Step::Front(505),
+            Step::Front(400),
+        ] {
+            let phone = Enrollee::new();
+            let script = Script::new(&phone, 300, &[(Duration::ZERO, step.clone())]);
+            let (ended, took) = asked(&phone, &script).await;
+            assert_ne!(ended, "kept");
+            assert_eq!(
+                (script.polls().len(), took),
+                (1, Duration::ZERO),
+                "{step:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_mailbox_that_is_not_found_is_never_asked() {
+        let phone = Enrollee::new();
+        let mut script = Script::new(&phone, 300, &[]);
+        script.found = false;
+        assert_eq!(asked(&phone, &script).await.0, "no_mailbox");
+        assert_eq!(script.posts.load(Ordering::SeqCst), 0);
+        assert!(!phone.may_have_asked());
+    }
+
+    mod waits {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn step() -> impl Strategy<Value = Step> {
+            prop_oneof![
+                Just(Step::NotYet),
+                (0u64..60).prop_map(Step::NotYetFor),
+                Just(Step::Answer),
+                Just(Step::Denied),
+                Just(Step::Gone),
+                proptest::option::of(0u64..40).prop_map(Step::Busy),
+                prop_oneof![Just(500u16), Just(502), Just(503), Just(504), Just(522)]
+                    .prop_map(Step::Front),
+                Just(Step::Dropped),
+                Just(Step::Lost),
+            ]
+        }
+
+        fn transient() -> impl Strategy<Value = Step> {
+            prop_oneof![
+                Just(Step::NotYet),
+                proptest::option::of(0u64..10).prop_map(Step::Busy),
+                prop_oneof![Just(500u16), Just(502), Just(503), Just(504), Just(522)]
+                    .prop_map(Step::Front),
+                Just(Step::Dropped),
+            ]
+        }
+
+        /// The script run on a paused clock: what it ended as, how long it
+        /// took, when it polled, what each poll heard, how often it posted,
+        /// and whether it says a holder may have been asked.
+        #[allow(clippy::type_complexity)]
+        fn run(
+            life: u64,
+            steps: &[(Duration, Step)],
+        ) -> (
+            String,
+            Duration,
+            Vec<tokio::time::Instant>,
+            Vec<Step>,
+            usize,
+            bool,
+        ) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let phone = Enrollee::new();
+                    let script = Script::new(&phone, life, steps);
+                    let (ended, took) = asked(&phone, &script).await;
+                    let posts = script.posts.load(Ordering::SeqCst);
+                    let heard = script.heard.lock().unwrap().clone();
+                    (
+                        ended,
+                        took,
+                        script.polls(),
+                        heard,
+                        posts,
+                        phone.may_have_asked(),
+                    )
+                })
+        }
+
+        proptest! {
+            // A fixed seed and count, and nothing written to the tree: a
+            // run is the same run wherever it runs, and a failure prints
+            // its case to be pinned as a test of its own.
+            #![proptest_config(ProptestConfig {
+                cases: 256,
+                rng_seed: proptest::test_runner::RngSeed::Fixed(0x0068_6578_6c69_6e65),
+                failure_persistence: None,
+                ..ProptestConfig::default()
+            })]
+
+            #[test]
+            fn a_wait_keeps_its_bounds_and_ends_as_its_mailbox_said(
+                life in 1u64..300,
+                steps in proptest::collection::vec(((0u64..60).prop_map(Duration::from_secs), step()), 0..12),
+            ) {
+                let (ended, took, polls, heard, posts, may) = run(life, &steps);
+                prop_assert!(took <= Duration::from_secs(life) + SLACK, "{took:?}");
+                for w in polls.windows(2) {
+                    prop_assert!(w[1] - w[0] >= POLL_FLOOR, "polled again too soon");
+                }
+                prop_assert_eq!(posts, 1);
+                prop_assert!(may);
+                let last = heard.last();
+                let lost = heard.iter().any(|s| matches!(s, Step::Lost));
+                let gone = matches!(last, Some(Step::Gone));
+                let given_up = heard.iter().any(|s| matches!(s, Step::Dropped));
+                let to_its_end = took == Duration::from_secs(life) + SLACK;
+                match ended.as_str() {
+                    "kept" => prop_assert!(matches!(last, Some(Step::Answer))),
+                    "denied" => prop_assert!(matches!(last, Some(Step::Denied))),
+                    "answer_lost" => prop_assert!(lost || (gone && given_up)),
+                    // Never early: gone, or the request's whole life waited.
+                    "expired" => prop_assert!(!lost && (gone || to_its_end)),
+                    other => prop_assert!(
+                        other.starts_with("RateLimited") && matches!(last, Some(Step::Busy(_))) && to_its_end,
+                        "ended {}", other
+                    ),
+                }
+            }
+
+            #[test]
+            fn an_approved_request_is_answered_whatever_passing_faults_came_first(
+                faults in proptest::collection::vec(((0u64..10).prop_map(Duration::from_secs), transient()), 0..10),
+                delay in 0u64..10,
+            ) {
+                let mut steps = faults;
+                steps.push((Duration::from_secs(delay), Step::Answer));
+                let (ended, ..) = run(300, &steps);
+                prop_assert_eq!(ended, "kept");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_cut_short_and_then_gone_was_lost_on_its_way() {
+        // A "not yet" cut short hands nothing over, and its poll was
+        // answered, so none was left at the mailbox to take the answer.
+        for (first, ends) in [
+            ("200 OK", "answer_lost"),
+            // A denial is handed over once too.
+            ("403 Forbidden", "answer_lost"),
+            ("202 Accepted", "expired"),
+        ] {
+            assert_eq!(cut_short_then_gone(first).await, ends, "{first}");
+        }
+    }
+
+    async fn cut_short_then_gone(first: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut polls = 0;
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let reply = if head.starts_with("GET /.well-known/hotline") {
+                    let body = r#"{"identity":{"endpoints":{"enroll":"/identity/enroll"}}}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else if head.starts_with("POST") {
+                    let body = r#"{"request":"r1","expires_in":60}"#;
+                    format!("HTTP/1.1 201 Created\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len())
+                } else {
+                    polls += 1;
+                    if polls == 1 {
+                        // The head, and the link gone before the rest of it.
+                        format!("HTTP/1.1 {first}\r\ncontent-length: 500\r\nconnection: close\r\n\r\n{{\"bundle\":\"AAAA")
+                    } else {
+                        "HTTP/1.1 410 Gone\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            .to_owned()
+                    }
+                };
+                let _ = s.write_all(reply.as_bytes()).await;
+            }
+        });
+        let ended = tokio::time::timeout(
+            Duration::from_secs(20),
+            Enrollee::new().enroll(
+                format!("http://127.0.0.1:{port}"),
+                Some("K7PM-4XWE".into()),
+                "Hexline".into(),
+            ),
+        )
+        .await
+        .expect("ended in time");
+        outcome(&ended)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reply_longer_than_any_answer_is_not_asked_for_again() {
+        // Not yet, as long as a reply may be (64 KiB) and a byte longer.
+        for (size, polls) in [(64 * 1024, 2), (64 * 1024 + 1, 1)] {
+            let phone = Enrollee::new();
+            let answer = String::from_utf8(approved(&phone)).unwrap();
+            let (port, asked) = mailbox(60, vec![(202, "x".repeat(size)), (200, answer)]).await;
+            let ended = tokio::time::timeout(
+                Duration::from_secs(20),
+                phone.enroll(
+                    format!("http://127.0.0.1:{port}"),
+                    Some("K7PM-4XWE".into()),
+                    "Hexline".into(),
+                ),
+            )
+            .await
+            .expect("ended in time");
+            assert_eq!(ended.is_ok(), polls == 2, "{size}: {ended:?}");
+            assert_eq!(asked.lock().unwrap().len(), polls, "{size}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mailbox_asking_for_room_by_its_header_alone_is_heard() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 1024];
+            let _ = s.read(&mut buf).await;
+            let _ = s
+                .write_all(b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 3\r\ncontent-length: 0\r\n\r\n")
+                .await;
+        });
+        let base = format!("http://127.0.0.1:{port}/");
+        let http = Http {
+            http: auth::http_client(&base, None).unwrap(),
+            base: Url::parse(&base).unwrap(),
+        };
+        let polled = http.poll(&format!("{base}x"), Duration::from_secs(5)).await;
+        assert!(
+            matches!(
+                polled,
+                Polled::Reply {
+                    status: 429,
+                    retry_after: Some(3),
+                    ..
+                }
+            ),
+            "the header read"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_a_client_refusing_the_url_is_not_asked_again() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Plain HTTP where TLS was asked for: the link's TLS fails.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tls_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 1024];
+                let _ = s.read(&mut buf).await;
+                let _ = s
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        let refused_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let https = Http {
+            http: auth::http_client("https://127.0.0.1/", None).unwrap(),
+            base: Url::parse("https://127.0.0.1/").unwrap(),
+        };
+        for (url, lasting) in [
+            // TLS failing mid-wait, most often a network change: asked again.
+            (format!("https://127.0.0.1:{tls_port}/x"), false),
+            // A client held to https refusing a plain URL.
+            (format!("http://127.0.0.1:{tls_port}/x"), true),
+            (format!("https://127.0.0.1:{refused_port}/x"), false),
+        ] {
+            let polled = https.poll(&url, Duration::from_secs(5)).await;
+            let failed = matches!(polled, Polled::Failed(_));
+            let dropped = matches!(polled, Polled::Dropped);
+            assert_eq!((failed, dropped), (lasting, !lasting), "{url}");
         }
     }
 

@@ -736,6 +736,7 @@ dependencies = [
  "hl-identity",
  "hxng-client",
  "jni",
+ "proptest",
  "rustls-platform-verifier",
  "serde_json",
  "sha2",
