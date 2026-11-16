@@ -13,6 +13,7 @@ import org.foggyden.hexline.identity.standing
 import org.foggyden.hexline.identity.usable
 import org.foggyden.hexline.secrets.SecretUnavailable
 import org.foggyden.hexline.servers.StoreQueue
+import org.foggyden.hexline.servers.stored
 import java.io.IOException
 
 /**
@@ -72,10 +73,10 @@ class QuietRenewal(
             } finally {
                 seed?.fill(0)
             }
-        // Noted before the holder is asked: a process killed or frozen while
-        // it waits has asked, and is not to ask again today.
-        note(renewing, now(), false)
         try {
+            // Noted, and written, before the holder is asked: a process killed
+            // or frozen while it waits has asked, and is not to ask again today.
+            note(renewing, now(), false).join()
             val answer = mine.enroll(renewing.mailbox!!, null, renewing.info.name ?: DEVICE_NAME)
             val renewed = mine.seed()
             queue.scope
@@ -115,8 +116,10 @@ class QuietRenewal(
         at: Long,
         noHolder: Boolean,
     ) = queue.scope.launch {
-        identities.renewTried(renewing.fingerprint, renewing.cert, at, noHolder)
-        published()
+        stored {
+            identities.renewTried(renewing.fingerprint, renewing.cert, at, noHolder)
+            published()
+        }
     }
 
     private companion object {

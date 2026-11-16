@@ -51,6 +51,7 @@ import org.foggyden.hexline.servers.SavedServers
 import org.foggyden.hexline.servers.Server
 import org.foggyden.hexline.servers.SignIn
 import org.foggyden.hexline.servers.StoreQueue
+import org.foggyden.hexline.servers.stored
 import java.io.IOException
 import java.util.Locale
 
@@ -97,7 +98,12 @@ class ChatViewModel internal constructor(
 
     private val store = queue.dispatcher
 
-    private fun later(work: () -> Unit) = queue.scope.launch { work() }
+    /**
+     * [work] on the store queue, kept to however the person leaves. A store
+     * that cannot be written now (a full disk, the Keystore locked) loses
+     * that write and nothing more: it is no reason for the app to fall over.
+     */
+    private fun later(work: () -> Unit) = queue.scope.launch { stored(work) }
 
     private val state = MutableStateFlow(ChatState())
     val chat: StateFlow<ChatState> = state

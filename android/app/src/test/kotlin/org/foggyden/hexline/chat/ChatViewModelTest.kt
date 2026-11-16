@@ -91,6 +91,9 @@ class ChatViewModelTest {
 
     private val opened = mutableListOf<FakeConnection>()
     private val enrollments = mutableListOf<FakeEnrollment>()
+
+    /** What the store held of the identity's last try when the holder was asked. */
+    private var triedWhenAsked: Long? = null
     private var now = ISSUED + DAY
     private val owner = ViewModelStore()
     private val uncaught = mutableListOf<Throwable>()
@@ -136,7 +139,10 @@ class ChatViewModelTest {
                 ): T =
                     ChatViewModel(app, servers, identities, StoreQueue(disk), { url, sink ->
                         FakeConnection(url, sink).also { opened += it }
-                    }, { renewing, expecting -> FakeEnrollment(renewing, expecting).also { enrollments += it } }, { now }) as T
+                    }, { renewing, expecting ->
+                        FakeEnrollment(renewing, expecting) { triedWhenAsked = outside { identities.list().singleOrNull()?.renewTried } }
+                            .also { enrollments += it }
+                    }, { now }) as T
             }
         armed = true
         return ViewModelProvider.create(owner, factory)[ChatViewModel::class.java]
@@ -921,7 +927,7 @@ class ChatViewModelTest {
                 continue
             }
             val e = enrollments.single()
-            assertEquals("$answer: noted before the holder is asked", due, stored()!!.renewTried)
+            assertEquals("$answer: written before the holder is asked", due, triedWhenAsked)
             assertArrayEquals("$answer: the device it has", SEED, e.renewing!!.first)
             assertEquals(answer, Triple("hl.example", null, "Hexline"), e.asked)
             // The holder takes its time: what is noted is when it ended.
@@ -1073,6 +1079,25 @@ class ChatViewModelTest {
     }
 
     @Test
+    fun aRenewalsTryTheStoreCannotWriteIsLostAndNothingElse() {
+        keepIdentity("hl.example")
+        now = ISSUED + (EXPIRES - ISSUED) * 2 / 3 + DAY
+        val dir = File(app.filesDir, "identities-$cases")
+        try {
+            // Nothing can be written there now.
+            dir.setWritable(false)
+            model()
+            settle()
+            val e = enrollments.single()
+            core { e.answer.completeExceptionally(CoreException.Refused("no_holder", "")) }
+            settle()
+            assertTrue("the holder was still asked", e.asked != null)
+        } finally {
+            dir.setWritable(true)
+        }
+    }
+
+    @Test
     fun aRenewalAnsweredAfterItsIdentityIsDeletedKeepsNothing() {
         keepIdentity("hl.example")
         now = ISSUED + (EXPIRES - ISSUED) * 2 / 3 + DAY
@@ -1092,6 +1117,8 @@ class ChatViewModelTest {
         given: Pair<ByteArray, ByteArray>?,
         /** The identity alone an answer may be from, held to it as the core holds it. */
         val expecting: String?,
+        /** Told as the holder is asked. */
+        val onAsk: () -> Unit = {},
     ) : Enrollment {
         /** Copied as the core copies it: the caller wipes its own. */
         val renewing = given?.let { it.first.copyOf() to it.second.copyOf() }
@@ -1114,6 +1141,7 @@ class ChatViewModelTest {
             check(!closed) { "a closed enrollment called" }
             if (inFlight) throw CoreException.Refused("busy", "")
             inFlight = true
+            onAsk()
             asked = Triple(mailbox, code, name)
             posted = true
             try {

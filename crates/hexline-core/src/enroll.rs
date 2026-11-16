@@ -169,10 +169,11 @@ impl Enrollee {
         if self.in_flight.swap(true, Ordering::SeqCst) {
             return Err(refused("busy"));
         }
+        // Made at once, so a task aborted before it ever runs still clears it.
+        let flight = Flight(self.clone());
         // Dropped (the app's call canceled), the task goes with it.
         let task = Aborting(crate::connection::RUNTIME.spawn(async move {
-            // Aborted or done, the next may begin.
-            let _flight = Flight(&self.in_flight);
+            let _flight = flight;
             self.run(&mailbox, code.as_deref(), &name).await
         }));
         task.wait().await
@@ -293,7 +294,7 @@ impl Enrollee {
             match status {
                 200 => break bytes(&reply, "bundle")?,
                 202 if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep_until(asked + POLL_FLOOR).await;
+                    tokio::time::sleep_until((asked + POLL_FLOOR).min(deadline)).await;
                     continue;
                 }
                 202 | 404 | 410 => return Err(refused("expired")),
@@ -371,12 +372,13 @@ impl Enrollee {
     }
 }
 
-/// Clears an enrollment's in-flight mark however it ends.
-struct Flight<'a>(&'a AtomicBool);
+/// Clears an enrollment's in-flight mark however it ends, aborted before
+/// it began included.
+struct Flight(Arc<Enrollee>);
 
-impl Drop for Flight<'_> {
+impl Drop for Flight {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.0.in_flight.store(false, Ordering::SeqCst);
     }
 }
 
@@ -807,6 +809,30 @@ mod tests {
             !phone.in_flight.load(Ordering::SeqCst),
             "the aborted one's mark cleared"
         );
+    }
+
+    #[test]
+    fn an_enrollment_let_go_of_before_its_task_ran_leaves_the_device_free() {
+        use std::future::Future;
+        let phone = Enrollee::new();
+        for _ in 0..50 {
+            let mut call = Box::pin(phone.clone().enroll(
+                "http://127.0.0.1:9".into(),
+                Some("K7PM-4XWE".into()),
+                "Hexline".into(),
+            ));
+            // Polled once, so it is in flight, then let go of at once.
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(call.as_mut().poll(&mut cx).is_pending());
+            drop(call);
+            for _ in 0..100 {
+                if !phone.in_flight.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!phone.in_flight.load(Ordering::SeqCst), "still in flight");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
