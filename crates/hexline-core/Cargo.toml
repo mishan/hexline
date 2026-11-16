@@ -32,4 +32,5 @@ jni = { version = "0.22", default-features = false }
 rustls-platform-verifier = "0.7"
 
 [dev-dependencies]
-tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
+tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "time", "net", "io-util", "test-util"] }
+proptest = "=1.11.0"

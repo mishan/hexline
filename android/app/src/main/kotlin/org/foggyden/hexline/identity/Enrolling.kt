@@ -20,6 +20,9 @@ enum class EnrollProblem {
     Denied,
     Expired,
 
+    /** The holder may have answered: the answer was lost on its way, and a mailbox hands it over once. */
+    AnswerLost,
+
     /** The answer certifies another device, or is from another identity than expected. */
     NotForThisPhone,
 
@@ -61,6 +64,7 @@ fun enrollProblem(e: CoreException): EnrollProblem =
                 "denied" if e.detail == "bad_renewal" -> EnrollProblem.Clock
                 "denied" -> EnrollProblem.Denied
                 "expired" -> EnrollProblem.Expired
+                "answer_lost" -> EnrollProblem.AnswerLost
                 "wrong_device", "wrong_identity" -> EnrollProblem.NotForThisPhone
                 "cert_unusable" -> EnrollProblem.Unusable
                 "cert_vouches" -> EnrollProblem.Vouches

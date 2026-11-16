@@ -134,6 +134,7 @@
     <string name="enroll_bad_device_name">That device name cannot be used.</string>
     <string name="enroll_denied">The holder said no.</string>
     <string name="enroll_denied_because">The holder said no (%1$s).</string>
+    <string name="enroll_answer_lost">The holder may have answered, but the answer was lost on its way here. Ask for a new code.</string>
     <string name="enroll_expired">The holder did not answer in time. Ask for a new code.</string>
     <string name="enroll_not_for_this_phone">The answer was not for this phone, and was not kept.</string>
     <string name="enroll_rate_limited">The server asked to wait. Try again later.</string>
