@@ -124,6 +124,7 @@ abstract class ViewModelHarness {
         settle()
         armed = false
         stores = Stores(++cases)
+        process = Process()
         opened.clear()
         enrollments.clear()
     }

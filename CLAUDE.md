@@ -27,9 +27,10 @@ make build       # assembleFdroidDebug, assemblePlayDebug
 make connected   # instrumented tests
 ```
 
-The view model's interleaving test runs 500 seeds; `HEXLINE_SEEDS`,
-`HEXLINE_SEED` and `HEXLINE_STEPS` widen it or replay one, with
-`--rerun` so Gradle runs it again.
+The view model's interleaving test runs 500 seeds from 1;
+`HEXLINE_SEED` starts them elsewhere, `HEXLINE_SEEDS` says how many (1
+replays the one `HEXLINE_SEED` names) and `HEXLINE_STEPS` how long
+each runs, with `--rerun` so Gradle runs it again.
 
 ## Rules
 

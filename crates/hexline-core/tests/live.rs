@@ -485,8 +485,13 @@ async fn a_saved_session_resumes_after_a_restart_with_a_roster() {
     let (bob, bob_sink) = logged_in(&server.url, "bob").await;
     bob.chat("before".into()).await.unwrap();
     sink.heard("before", said("before")).await;
-    let saved = saved_soon(&alice).await;
     alice.hang_up(false);
+    // The cursor moves just after each batch is delivered, and a resume
+    // from short of the last is synced rather than replayed: it is final
+    // once the link is.
+    sink.heard("hung up", |u| matches!(u, CoreUpdate::Closed { .. }))
+        .await;
+    let saved = saved_soon(&alice).await;
     bob_sink
         .heard("alice detached", status_of("alice", Status::Detached))
         .await;

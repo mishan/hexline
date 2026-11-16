@@ -730,7 +730,9 @@ class ChatViewModelTest : ViewModelHarness() {
         now = due
         model()
         // The try written, and the holder not yet asked: the process frozen there for a month.
-        while (stored()!!.renewTried != due) {
+        var rounds = 0
+        while (stored()?.renewTried != due) {
+            assertTrue("the try never noted as of $due", ++rounds <= SETTLE)
             onMain()
             disk.step()
         }
