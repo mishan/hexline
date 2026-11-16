@@ -12,6 +12,7 @@ import org.foggyden.hexline.secrets.SecretUnreadable
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -475,6 +476,55 @@ class ChatViewModelTest : ViewModelHarness() {
             mapOf("logged in" to "session of ws://logged-in.example/ng", "logged in again" to String(ROTATED)),
             found,
         )
+    }
+
+    @Test
+    fun aSecondConnectionsSessionIsKeptThoughTheFirstsWriteWaitedThroughAForget() {
+        val server = passwordServer("again")
+        val vm = model()
+        settle()
+        vm.connect(server, "pw", false)
+        settle()
+        val first = opened.single()
+        land(first, LOGGED_IN)
+        live(first, "first".toByteArray())
+        // Its write waits on the queue while the person forgets the server and connects again.
+        onMain()
+        vm.forget(server)
+        onMain()
+        vm.connect(server, "pw", false)
+        onMain()
+        val second = opened.last()
+        assertNotSame(first, second)
+        land(second, LOGGED_IN)
+        onMain()
+        live(second, "second".toByteArray())
+        onMain()
+        settle()
+        assertEquals("second", outside { servers.session(server) }?.let(::String))
+    }
+
+    @Test
+    fun aBusyLinksSessionIsWrittenOnceForTheBatchesItWaitedOn() {
+        val server = passwordServer("busy")
+        val vm = model()
+        settle()
+        vm.connect(server, "pw", false)
+        settle()
+        val conn = opened.single()
+        land(conn, LOGGED_IN)
+        live(conn)
+        settle()
+        val before = secrets.puts.count { it.startsWith("session-") }
+        // The core tells the session after every batch; the queue is busy meanwhile.
+        for (n in 1..5) {
+            conn.session = "session $n".toByteArray()
+            core { conn.sink.deliver(listOf(CoreUpdate.SessionKept)) }
+            onMain()
+        }
+        settle()
+        assertEquals("session 5", outside { servers.session(server) }?.let(::String))
+        assertEquals(1, secrets.puts.count { it.startsWith("session-") } - before)
     }
 
     @Test

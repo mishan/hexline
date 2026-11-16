@@ -362,6 +362,74 @@ async fn a_links_session_is_told_kept_once_there_is_one_to_save_on_a_quiet_link(
     assert!(again.saved().is_some());
 }
 
+/// Waits until `sink` has been told its session is kept after `after`.
+async fn kept_after(sink: &Sink, after: usize) {
+    for _ in 0..300 {
+        if sink.positions(session_kept).iter().any(|&k| k > after) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "never told the session kept after {after}: {:?}",
+        sink.all()
+    );
+}
+
+#[tokio::test]
+async fn a_session_is_told_kept_as_the_app_goes_and_after_each_line_behind() {
+    let server = Server::start(&["alice", "bob"]).await;
+    let (alice, sink) = logged_in(&server.url, "alice").await;
+    let (bob, bob_sink) = logged_in(&server.url, "bob").await;
+    kept_times(&sink, 1).await;
+
+    // In front, lines move the cursor but ask for no write each.
+    for n in 0..3 {
+        bob.chat(format!("in front {n}")).await.unwrap();
+    }
+    sink.heard("the last in front", said("in front 2")).await;
+    alice.set_background_linger(60_000);
+    alice.set_foreground(false);
+    // Told as it goes, once the cursor covers what it was handed in front.
+    kept_after(&sink, sink.at(said("in front 2")).unwrap()).await;
+    assert_eq!(sink.count(session_kept), 2, "{:?}", sink.all());
+
+    // Behind, each line is told, so what is kept covers it however soon
+    // the process is stopped.
+    bob.chat("behind".into()).await.unwrap();
+    sink.heard("behind", said("behind")).await;
+    kept_after(&sink, sink.at(said("behind")).unwrap()).await;
+    let saved = alice.saved().unwrap();
+    alice.hang_up(false);
+    bob_sink
+        .heard("alice detached", status_of("alice", Status::Detached))
+        .await;
+    bob.chat("while gone".into()).await.unwrap();
+
+    // Replayed, before the roster a new connection is given: a cursor short
+    // of "behind" is synced instead, and nothing is replayed.
+    let again_sink = Arc::new(Sink::default());
+    let again = ServerConnection::new(server.url.clone(), again_sink.clone());
+    let info = again
+        .login(Some("alice".into()), pw("alice"), Some(saved))
+        .await
+        .unwrap();
+    assert!(info.resumed, "{info:?}");
+    again_sink.heard("the replay", said("while gone")).await;
+    let roster_at = again_sink.at(roster).unwrap();
+    assert!(
+        roster_at > again_sink.at(said("while gone")).unwrap(),
+        "{:?}",
+        again_sink.all()
+    );
+    assert_eq!(
+        again_sink.at(said("behind")),
+        None,
+        "{:?}",
+        again_sink.all()
+    );
+}
+
 #[tokio::test]
 async fn a_session_that_expired_while_the_link_was_down_is_logged_in_again() {
     let server = Server::with_grace(&["alice", "bob"], 1).await;

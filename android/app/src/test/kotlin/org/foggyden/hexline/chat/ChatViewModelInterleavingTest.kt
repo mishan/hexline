@@ -3,6 +3,7 @@ package org.foggyden.hexline.chat
 import android.app.Application
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModelStore
+import org.foggyden.hexline.core.ChatLine
 import org.foggyden.hexline.core.ClassicLogin
 import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.CoreUpdate
@@ -135,6 +136,9 @@ class ChatViewModelInterleavingTest : ViewModelHarness() {
             var over = false
             var noResume = false
             var seen = false
+
+            /** Where a batch handed over has moved the core's cursor, not yet in what `saved` gives. */
+            var moved: ByteArray? = null
         }
 
         /** Told as its holder is asked: set once the enrollment exists. */
@@ -305,9 +309,17 @@ class ChatViewModelInterleavingTest : ViewModelHarness() {
                     "roster"
                 } else {
                     when (rnd.nextInt(7)) {
-                        in 0 until 3 -> {
+                        0 -> {
                             if (c.noResume) return null
-                            c.session = session(c.server, "kept at $step")
+                            // The core hands a batch over first, and moves its cursor once that returns.
+                            deliver(c, CoreUpdate.Chat(ChatLine(step.toULong(), null, "bob", "line $step", 0u, false, null, false)))
+                            c.moved = session(c.server, "kept at $step")
+                            "a line"
+                        }
+                        in 1 until 3 -> {
+                            if (c.noResume) return null
+                            c.session = c.moved ?: session(c.server, "kept at $step")
+                            c.moved = null
                             keptAt[url] = step
                             deliver(c, CoreUpdate.SessionKept)
                             "session kept"
@@ -325,6 +337,8 @@ class ChatViewModelInterleavingTest : ViewModelHarness() {
                         else -> {
                             val canResume = rnd.nextBoolean()
                             val identity = (c.server.signIn as? SignIn.Identity)?.fingerprint
+                            // A new link's cursor is its own; the old one's move goes with it.
+                            c.moved = null
                             if (!canResume) {
                                 c.noResume = true
                                 listOfNotNull(c.session, c.resumedWith).forEach { dead += hexOf(it) }
@@ -352,6 +366,7 @@ class ChatViewModelInterleavingTest : ViewModelHarness() {
             c.over = true
             listOfNotNull(c.session, c.resumedWith).forEach { dead += hexOf(it) }
             c.session = null
+            c.moved = null
             ended[c.server.url] = step
             deliver(c, *updates)
         }
@@ -431,12 +446,20 @@ class ChatViewModelInterleavingTest : ViewModelHarness() {
                 9 -> confirmTap()
                 10 -> vm.discardEnroll().let { "discard" }
                 11 -> {
-                    val s = all.random(rnd)
+                    // Now and then the one just connected to, connected to again at once, before the
+                    // forget, or what the connection it let go of had queued, reaches the store.
+                    val again = conns.lastOrNull()?.server?.takeIf { it.signIn == SignIn.Password && rnd.nextInt(3) == 0 }
+                    val s = again ?: all.random(rnd)
                     forgotAt[s.url] = step
                     ended[s.url] = step
                     events += Ev(step, "forget", s.url)
                     vm.forget(s)
-                    "forget ${s.url}"
+                    if (again != null) {
+                        vm.connect(s, password(s), false)
+                        "forget ${s.url}, and connect to it again"
+                    } else {
+                        "forget ${s.url}"
+                    }
                 }
                 12 -> {
                     val fp = listOf(FINGERPRINT, FP3).random(rnd)
@@ -623,7 +646,8 @@ class ChatViewModelInterleavingTest : ViewModelHarness() {
                 val url = s.url
                 // Forgotten, and not landed since: nothing of it is kept.
                 val forgot = events.lastOrNull { it.kind == "forget" && it.url == url }
-                val landedSince = events.any { it.kind == "landed" && it.url == url && it.created > forgot?.step ?: 0 }
+                // A connect in the step of a forget is asked for after it: no act does the two the other way about.
+                val landedSince = events.any { it.kind == "landed" && it.url == url && it.created >= (forgot?.step ?: 0) }
                 if (forgot != null && sure(forgot.step) && !landedSince) {
                     val left = outside { listOfNotNull(s.takeIf { s in remembered }, servers.password(s), servers.session(s)) }
                     if (left.isNotEmpty()) fail("$url forgotten, and still kept: $left")
