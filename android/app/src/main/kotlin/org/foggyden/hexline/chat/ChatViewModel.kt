@@ -40,21 +40,33 @@ import org.foggyden.hexline.core.coreEnrollment
 import org.foggyden.hexline.core.newerCard
 import org.foggyden.hexline.core.refusalLasts
 import org.foggyden.hexline.core.restoreIdentity
+import org.foggyden.hexline.identity.CoreHolderSetups
 import org.foggyden.hexline.identity.EnrollProblem
 import org.foggyden.hexline.identity.Enrolling
 import org.foggyden.hexline.identity.HeldSeeds
+import org.foggyden.hexline.identity.HolderRefusal
+import org.foggyden.hexline.identity.HolderSetups
 import org.foggyden.hexline.identity.Identities
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
+import org.foggyden.hexline.identity.SettingUp
+import org.foggyden.hexline.identity.Setup
+import org.foggyden.hexline.identity.SetupProblem
 import org.foggyden.hexline.identity.Standing
 import org.foggyden.hexline.identity.StoredIdentity
 import org.foggyden.hexline.identity.enrollProblem
 import org.foggyden.hexline.identity.restoreProblem
+import org.foggyden.hexline.identity.setupProblem
 import org.foggyden.hexline.identity.standing
 import org.foggyden.hexline.identity.usable
+import org.foggyden.hexline.secrets.Authorizer
+import org.foggyden.hexline.secrets.HeldKeyLost
+import org.foggyden.hexline.secrets.HolderUnsupported
 import org.foggyden.hexline.secrets.KeystoreHolderKeys
 import org.foggyden.hexline.secrets.NoHolderKeys
+import org.foggyden.hexline.secrets.NoScreenLock
 import org.foggyden.hexline.secrets.SecretUnavailable
+import org.foggyden.hexline.secrets.SoftwareKeysOnly
 import org.foggyden.hexline.servers.SavedServers
 import org.foggyden.hexline.servers.Server
 import org.foggyden.hexline.servers.SignIn
@@ -62,6 +74,8 @@ import org.foggyden.hexline.servers.StoreQueue
 import org.foggyden.hexline.servers.stored
 import java.io.File
 import java.io.IOException
+import java.security.GeneralSecurityException
+import java.security.ProviderException
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
@@ -94,6 +108,8 @@ class ChatViewModel internal constructor(
      * renew; with an identity's fingerprint, one kept only from that identity.
      */
     private val enroll: (renewing: Pair<ByteArray, ByteArray>?, expecting: String?) -> Enrollment,
+    /** Holders' setups, and restores that hold what they restore. */
+    private val setups: HolderSetups,
     /** Seconds since the epoch, that a certificate's time is judged by. */
     private val now: () -> Long,
     /**
@@ -117,6 +133,7 @@ class ChatViewModel internal constructor(
         StoreQueue.process,
         ::coreConnection,
         ::coreEnrollment,
+        CoreHolderSetups,
         { System.currentTimeMillis() / 1000 },
         ProcessLifecycleOwner.get().lifecycle,
     )
@@ -382,13 +399,17 @@ class ChatViewModel internal constructor(
         }
     }
 
-    /** Makes this phone a device of the identity a registrar keeps for [handle]. */
+    /**
+     * Makes this phone a device of the identity a registrar keeps for
+     * [handle]; with [holdWith], holding its key too, behind that prompt.
+     */
     fun restore(
         registrar: String,
         handle: String,
         kind: SecretKind,
         secret: String,
         deviceName: String,
+        holdWith: Authorizer? = null,
     ) {
         if (restoring.value == Restoring.Working) return
         restoring.value = Restoring.Working
@@ -396,9 +417,19 @@ class ChatViewModel internal constructor(
             var made: Restored? = null
             // Once the store's task has the seed, it is that task's to wipe.
             var handed = false
+            var identitySeed: ByteArray? = null
             restoring.value =
                 try {
-                    val device = restoreIdentity(registrar, handle, kind, secret, deviceName).also { made = it }
+                    val device =
+                        if (holdWith == null) {
+                            restoreIdentity(registrar, handle, kind, secret, deviceName)
+                        } else {
+                            withContext(store) { held.probe() }
+                            setups.restoreToHold(registrar, handle, kind, secret, deviceName).let {
+                                identitySeed = it.identitySeed
+                                it.device
+                            }
+                        }.also { made = it }
                     val at = servers.generation()
                     handed = true
                     queue.scope
@@ -421,15 +452,32 @@ class ChatViewModel internal constructor(
                                 device.seed.fill(0)
                             }
                         }.await()
-                    Restoring.Done(device.fingerprint)
+                    val seed = identitySeed
+                    // Kept as a device first: a prompt refused leaves it one, and says so.
+                    if (seed != null && holdWith != null && !held.hold(device.fingerprint, seed, holdWith)) {
+                        Restoring.NotHeld(device.fingerprint)
+                    } else {
+                        Restoring.Done(device.fingerprint)
+                    }
                 } catch (e: CoreException) {
                     Restoring.Failed(restoreProblem(e))
                 } catch (_: SecretUnavailable) {
                     Restoring.Failed(RestoreProblem.NotKept)
                 } catch (_: IOException) {
                     Restoring.Failed(RestoreProblem.NotKept)
+                } catch (_: NoScreenLock) {
+                    Restoring.Failed(RestoreProblem.NoScreenLock)
+                } catch (_: SoftwareKeysOnly) {
+                    Restoring.Failed(RestoreProblem.SoftwareOnly)
+                } catch (_: HolderUnsupported) {
+                    Restoring.Failed(RestoreProblem.TooOld)
+                } catch (_: GeneralSecurityException) {
+                    Restoring.Failed(RestoreProblem.NotKept)
+                } catch (_: ProviderException) {
+                    Restoring.Failed(RestoreProblem.NotKept)
                 } finally {
                     if (!handed) made?.seed?.fill(0)
+                    identitySeed?.fill(0)
                 }
         }
     }
@@ -567,6 +615,328 @@ class ChatViewModel internal constructor(
         if (restoring.value != Restoring.Working) restoring.value = Restoring.Idle
     }
 
+    private val settingUp = MutableStateFlow<SettingUp>(SettingUp.Idle)
+
+    /** A holder's identity being set up on this phone. */
+    val holderSetup: StateFlow<SettingUp> = settingUp
+
+    /** The setup under way: on the main thread alone, as what it is for. */
+    private var setup: Setup? = null
+    private var setupFor: SetupFor? = null
+
+    private data class SetupFor(
+        val registrar: String,
+        val handle: String,
+        val invite: String?,
+        val deviceName: String,
+        /** Its device is kept, unfinished, and its seed held: what is left is the commit. */
+        val kept: Boolean,
+        /** Finished again after the process that began it ended. */
+        val resumed: Boolean,
+        /** The card a commit the core made gave back, if keeping it here has yet to be done. */
+        val committed: ByteArray? = null,
+    )
+
+    /**
+     * Starts setting up an identity this phone holds, as [handle] at
+     * [registrar]: once the phone and the registrar are found able to,
+     * the successor's code is shown.
+     */
+    fun startHolderSetup(
+        registrar: String,
+        handle: String,
+        invite: String?,
+        deviceName: String,
+    ) {
+        if (settingUp.value == SettingUp.Checking || settingUp.value == SettingUp.Working) return
+        closeSetup()
+        settingUp.value = SettingUp.Checking
+        viewModelScope.launch {
+            settingUp.value =
+                holderStep(handle, fixed = false) {
+                    setups.checkDeviceName(deviceName)
+                    withContext(store) { held.probe() }
+                    setups.check(registrar)
+                    val made = setups.new(handle)
+                    setup = made
+                    setupFor = SetupFor(registrar, handle, invite?.ifBlank { null }, deviceName, kept = false, resumed = false)
+                    SettingUp.Successor(shown(made.successorCode()))
+                } ?: SettingUp.Idle
+        }
+    }
+
+    fun successorWritten() {
+        if (settingUp.value is SettingUp.Successor) settingUp.value = SettingUp.ConfirmSuccessor(false)
+    }
+
+    fun showSuccessorAgain() {
+        if (settingUp.value !is SettingUp.ConfirmSuccessor) return
+        val code = setup?.successorCode() ?: return
+        settingUp.value = SettingUp.Successor(shown(code))
+    }
+
+    /** The successor's code as typed back; [typed] is wiped. */
+    fun confirmSuccessor(typed: ByteArray) {
+        val made = setup
+        val right =
+            try {
+                settingUp.value is SettingUp.ConfirmSuccessor && made != null && made.confirmSuccessor(typed)
+            } finally {
+                typed.fill(0)
+            }
+        if (settingUp.value !is SettingUp.ConfirmSuccessor) return
+        settingUp.value =
+            if (right) SettingUp.Recovery(shown(checkNotNull(made).recoveryCode()), replaces = false) else SettingUp.ConfirmSuccessor(true)
+    }
+
+    fun recoveryWritten() {
+        (settingUp.value as? SettingUp.Recovery)?.let { settingUp.value = SettingUp.ConfirmRecovery(false, it.replaces) }
+    }
+
+    fun showRecoveryAgain() {
+        val shown = settingUp.value as? SettingUp.ConfirmRecovery ?: return
+        val code = setup?.recoveryCode() ?: return
+        settingUp.value = SettingUp.Recovery(shown(code), shown.replaces)
+    }
+
+    /** The recovery code as typed back; [typed] is wiped. */
+    fun confirmRecovery(typed: ByteArray) {
+        val asked = settingUp.value as? SettingUp.ConfirmRecovery
+        val made = setup
+        val right =
+            try {
+                asked != null && made != null && made.confirmRecovery(typed)
+            } finally {
+                typed.fill(0)
+            }
+        if (asked == null) return
+        when {
+            !right -> settingUp.value = asked.copy(wrong = true)
+            setupFor?.kept == true -> commitSetup()
+            else -> settingUp.value = SettingUp.ReadyToHold
+        }
+    }
+
+    /**
+     * Holds the setup's seed behind [authorizer]'s prompt, keeps this
+     * phone's device for it, unfinished, and commits it. A prompt refused
+     * leaves it ready to hold.
+     */
+    fun holdSetup(authorizer: Authorizer) {
+        val made = setup ?: return
+        val target = setupFor ?: return
+        if (settingUp.value != SettingUp.ReadyToHold) return
+        settingUp.value = SettingUp.Working
+        viewModelScope.launch {
+            val step =
+                holderStep(target.handle, fixed = false) {
+                    val fingerprint = made.fingerprint()
+                    // Minted first: what would refuse it is found before the person is asked.
+                    val minted = made.mint(target.deviceName)
+                    try {
+                        val seed = made.identitySeed()
+                        val holds =
+                            try {
+                                held.hold(fingerprint, seed, authorizer)
+                            } finally {
+                                seed.fill(0)
+                            }
+                        if (!holds) return@holderStep SettingUp.ReadyToHold
+                        withContext(store) {
+                            identities.save(minted.deviceSeed, minted.cert, made.card(), target.handle, target.registrar, unfinished = true)
+                            publishIdentities()
+                        }
+                    } finally {
+                        minted.deviceSeed.fill(0)
+                    }
+                    made.held()
+                    setupFor = target.copy(kept = true)
+                    null
+                }
+            if (step != null) settingUp.value = step else commitSetup()
+        }
+    }
+
+    /**
+     * After a failed step: the setup asked again, as [handle] with [invite]
+     * where the handle may still change, as it was where it may not.
+     */
+    fun retrySetup(
+        handle: String,
+        invite: String?,
+    ) {
+        val failed = settingUp.value as? SettingUp.Failed ?: return
+        val target = setupFor
+        // Failed before any code was made: back to the form, as it was filled in.
+        if (setup == null || target == null) {
+            settingUp.value = SettingUp.Idle
+            return
+        }
+        if (!target.kept) {
+            settingUp.value = SettingUp.ReadyToHold
+            return
+        }
+        // A commit the registrar made is of its handle: only keeping it here is asked again.
+        val next = if (failed.fixed || target.committed != null) target.handle else handle.trim()
+        setupFor = target.copy(handle = next, invite = invite?.ifBlank { null } ?: target.invite)
+        if (next != target.handle) {
+            val fingerprint = checkNotNull(setup).fingerprint()
+            later { identities.intends(fingerprint, next) }
+        }
+        commitSetup()
+    }
+
+    /**
+     * Finishes [fingerprint]'s setup, kept unfinished by a process that
+     * ended: its seed opened behind [authorizer]'s prompt, and committed
+     * again under a new recovery code, shown first, which replaces any
+     * written down before.
+     */
+    fun finishSetup(
+        fingerprint: String,
+        authorizer: Authorizer,
+    ) {
+        if (settingUp.value == SettingUp.Checking || settingUp.value == SettingUp.Working) return
+        closeSetup()
+        settingUp.value = SettingUp.Working
+        viewModelScope.launch {
+            var handle = ""
+            settingUp.value =
+                holderStep({ handle }, fixed = true) {
+                    val (kept, deviceSeed) = withContext(store) { identities.device(fingerprint) } ?: return@holderStep SettingUp.Idle
+                    if (!kept.unfinished) {
+                        deviceSeed.fill(0)
+                        return@holderStep SettingUp.Idle
+                    }
+                    handle = kept.handle.orEmpty()
+                    val registrar = kept.registrar.orEmpty()
+                    val made =
+                        try {
+                            held.use(fingerprint, authorizer) { seed ->
+                                setups.resume(seed, kept.card, registrar, handle, deviceSeed, kept.cert)
+                            }
+                        } finally {
+                            deviceSeed.fill(0)
+                        }
+                    when {
+                        made != null -> {
+                            setup = made
+                            setupFor = SetupFor(registrar, handle, null, "", kept = true, resumed = true)
+                            SettingUp.Recovery(shown(made.recoveryCode()), replaces = true)
+                        }
+                        // Not held now: its key went while the app was away.
+                        !held.isHeld(fingerprint) -> {
+                            withContext(store) {
+                                demoteHeld()
+                                identities.unrecoverable(fingerprint)
+                                publishIdentities()
+                            }
+                            SettingUp.Failed(SetupProblem.KeyLost, handle, fixed = true)
+                        }
+                        else -> SettingUp.Idle
+                    }
+                } ?: SettingUp.Idle
+        }
+    }
+
+    /** Lets go of the setup under way: what it kept goes, and a device kept for it stays, unfinished. */
+    fun cancelHolderSetup() {
+        if (settingUp.value == SettingUp.Working) return
+        // A seed held for a device that was never kept would be held unseen.
+        if (setupFor?.kept == false) setup?.fingerprint()?.let { fingerprint -> later { held.forget(fingerprint) } }
+        closeSetup()
+        settingUp.value = SettingUp.Idle
+    }
+
+    fun holderSetupSeen() {
+        when (settingUp.value) {
+            is SettingUp.Done, is SettingUp.Refused -> settingUp.value = SettingUp.Idle
+            else -> Unit
+        }
+    }
+
+    private fun commitSetup() {
+        val made = setup ?: return
+        val target = setupFor ?: return
+        settingUp.value = SettingUp.Working
+        viewModelScope.launch {
+            val fingerprint = made.fingerprint()
+            settingUp.value =
+                holderStep(target.handle, fixed = target.resumed) {
+                    // Committed at the registrar already, only keeping it here is asked again.
+                    val card = target.committed ?: made.commit(target.registrar, target.handle, target.invite).card
+                    setupFor = target.copy(committed = card)
+                    withContext(store) {
+                        // As the registrar took it, whatever the write of what was intended made of it.
+                        identities.committed(fingerprint, card, target.handle)
+                        publishIdentities()
+                    }
+                    closeSetup()
+                    SettingUp.Done(fingerprint)
+                } ?: SettingUp.Idle
+        }
+    }
+
+    /**
+     * [step]'s state, or what a step refused for says: a refusal of the
+     * phone, or a problem asking [handle] again, which may no longer
+     * change once [fixed] or once it is the identity's.
+     */
+    private suspend fun holderStep(
+        handle: () -> String,
+        fixed: Boolean,
+        step: suspend () -> SettingUp?,
+    ): SettingUp? =
+        try {
+            step()
+        } catch (_: NoScreenLock) {
+            SettingUp.Refused(HolderRefusal.NoScreenLock)
+        } catch (_: SoftwareKeysOnly) {
+            SettingUp.Refused(HolderRefusal.SoftwareOnly)
+        } catch (_: HolderUnsupported) {
+            SettingUp.Refused(HolderRefusal.TooOld)
+        } catch (_: HeldKeyLost) {
+            withContext(store) { demoteHeld() }
+            SettingUp.Failed(SetupProblem.KeyLost, handle(), fixed = true)
+        } catch (e: CoreException) {
+            val problem = setupProblem(e)
+            // A resumed setup refused its handle may take another; the core says so.
+            val stuck =
+                problem == SetupProblem.NotBackedUp ||
+                    (fixed && problem != SetupProblem.HandleTaken && problem != SetupProblem.HandleInvalid)
+            SettingUp.Failed(problem, handle(), stuck)
+        } catch (_: SecretUnavailable) {
+            SettingUp.Failed(SetupProblem.NotKept, handle(), fixed)
+        } catch (_: IOException) {
+            SettingUp.Failed(SetupProblem.NotKept, handle(), fixed)
+        } catch (_: GeneralSecurityException) {
+            SettingUp.Failed(SetupProblem.NotKept, handle(), fixed)
+        } catch (_: ProviderException) {
+            SettingUp.Failed(SetupProblem.NotKept, handle(), fixed)
+        }
+
+    private suspend fun holderStep(
+        handle: String,
+        fixed: Boolean,
+        step: suspend () -> SettingUp?,
+    ) = holderStep({ handle }, fixed, step)
+
+    private fun closeSetup() {
+        setup?.close()
+        setup = null
+        setupFor = null
+    }
+
+    /** A code as shown: the bytes it came in wiped. */
+    private fun shown(code: ByteArray?): String {
+        val bytes = checkNotNull(code) { "no code to show" }
+        return try {
+            String(bytes, Charsets.UTF_8)
+        } finally {
+            bytes.fill(0)
+        }
+    }
+
     /** Logs out of the current connection and lets go of it. */
     private fun leave() {
         current?.let(::letGo)
@@ -635,7 +1005,11 @@ class ChatViewModel internal constructor(
 
     /** Lets go of each held identity whose key went with the screen lock; on the store queue. */
     private fun demoteHeld() {
-        held.demoteLost(identities.list().map { it.fingerprint })
+        val kept = identities.list()
+        val lost = held.demoteLost(kept.map { it.fingerprint })
+        // Its key gone before it was committed, a setup has nothing left to finish or recover.
+        for (identity in kept) if (identity.unfinished && identity.fingerprint in lost) identities.unrecoverable(identity.fingerprint)
+        if (lost.isNotEmpty()) publishIdentities()
         heldLost.value = held.notices()
     }
 
@@ -925,6 +1299,7 @@ class ChatViewModel internal constructor(
     // on the store queue, which outlives this, hang up leaving it to be
     // resumed, and let the core finish on its own threads.
     override fun onCleared() {
+        closeSetup()
         connectivity.unregisterNetworkCallback(network)
         process.removeObserver(lifecycle)
         send(EnrollEvent.Closed)

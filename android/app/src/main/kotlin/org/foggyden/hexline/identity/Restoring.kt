@@ -15,6 +15,11 @@ enum class RestoreProblem {
 
     /** The Keystore cannot take the device now: try again. */
     NotKept,
+
+    /** Asked to hold the key: this phone cannot (design §2.2). */
+    TooOld,
+    NoScreenLock,
+    SoftwareOnly,
     Other,
 }
 
@@ -47,6 +52,11 @@ sealed interface Restoring {
 
     /** Kept on the phone as [fingerprint]. */
     data class Done(
+        val fingerprint: String,
+    ) : Restoring
+
+    /** Kept on the phone as [fingerprint], as its device alone: the prompt to hold its key was not answered. */
+    data class NotHeld(
         val fingerprint: String,
     ) : Restoring
 }

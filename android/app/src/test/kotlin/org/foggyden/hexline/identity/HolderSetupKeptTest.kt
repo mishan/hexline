@@ -59,7 +59,7 @@ class HolderSetupKeptTest {
         assertTrue("read back so", unfinished.unfinished)
         assertEquals("the handle to resume it as", "carol", unfinished.handle)
         assertEquals("reg.example", unfinished.registrar)
-        val done = checkNotNull(identities().committed(setup.fingerprint, setup.card))
+        val done = checkNotNull(identities().committed(setup.fingerprint, setup.card, "carol"))
         assertFalse(done.unfinished)
         val read = identities().list().single()
         assertFalse(read.unfinished)
@@ -76,10 +76,27 @@ class HolderSetupKeptTest {
     }
 
     @Test
+    fun aSetupIsKeptAsTheHandleItWasCommittedAsWhateverItIntendedBefore() {
+        val (setup, _) = keptUnfinished()
+        identities().committed(setup.fingerprint, setup.card, "carol2")
+        assertEquals("carol2", identities().list().single().handle)
+    }
+
+    @Test
+    fun aHandleChangedKeepsWhatElseWasKept() {
+        val (_, kept) = keptUnfinished()
+        identities().renewTried(kept.fingerprint, kept.cert, 1_000, noHolder = true)
+        identities().intends(kept.fingerprint, "carol2")
+        val read = identities().list().single()
+        assertEquals(1_000L, read.renewTried)
+        assertTrue(read.noHolder)
+    }
+
+    @Test
     fun anotherIdentitysCardIsNoCommitOfThisOne() {
         val (setup, _) = keptUnfinished()
         try {
-            identities().committed(setup.fingerprint, newIdentity("Dave").card)
+            identities().committed(setup.fingerprint, newIdentity("Dave").card, "carol")
             fail("committed with another's card")
         } catch (_: CoreException) {
         }
