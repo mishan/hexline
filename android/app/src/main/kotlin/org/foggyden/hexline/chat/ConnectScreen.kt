@@ -90,6 +90,8 @@ fun ConnectFlow(
     onConfirmEnroll: (gen: Int, shown: String) -> Unit,
     onDiscardEnroll: () -> Unit,
     onEnrollSeen: () -> Unit,
+    heldLost: List<String> = emptyList(),
+    onHeldLostSeen: (fingerprint: String) -> Unit = {},
 ) {
     val form = rememberSaveable(stateSaver = FormSaver) { mutableStateOf(ConnectForm()) }
     // The registrar and handle the restore screen opens with: blank for a
@@ -139,6 +141,8 @@ fun ConnectFlow(
             },
             onDelete = onDelete,
             onTryAgain = onTryAgain,
+            heldLost = heldLost,
+            onHeldLostSeen = onHeldLostSeen,
         )
     }
 }
@@ -159,6 +163,8 @@ private fun ConnectScreen(
     onRestored: () -> Unit,
     onDelete: (fingerprint: String) -> Unit,
     onTryAgain: (server: Server, fingerprint: String) -> Unit,
+    heldLost: List<String>,
+    onHeldLostSeen: (fingerprint: String) -> Unit,
 ) {
     var form by form
     val now = certificateClock(identities)
@@ -185,6 +191,13 @@ private fun ConnectScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineMedium)
+        for (lost in heldLost) {
+            val name = identities.find { it.fingerprint == lost }?.let(::named) ?: lost.take(16)
+            Column {
+                Text(stringResource(R.string.held_key_lost, name), color = MaterialTheme.colorScheme.error)
+                TextButton({ onHeldLostSeen(lost) }) { Text(stringResource(R.string.dismiss)) }
+            }
+        }
         for (kept in identities) {
             val banner =
                 when (val s = standing(kept, now)) {

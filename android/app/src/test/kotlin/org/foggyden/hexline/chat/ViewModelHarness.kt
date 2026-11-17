@@ -35,7 +35,9 @@ import org.foggyden.hexline.core.LoginInfo
 import org.foggyden.hexline.core.UpdateSink
 import org.foggyden.hexline.core.certForDevice
 import org.foggyden.hexline.identity.Enrolling
+import org.foggyden.hexline.identity.HeldSeeds
 import org.foggyden.hexline.identity.Identities
+import org.foggyden.hexline.secrets.FakeHolderKeys
 import org.foggyden.hexline.secrets.Secrets
 import org.foggyden.hexline.servers.SavedServers
 import org.foggyden.hexline.servers.Server
@@ -48,6 +50,7 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.shadows.ShadowConnectivityManager
 import java.io.File
 import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.EmptyCoroutineContext
 
 /**
  * The view model's connections and stores, driven step by step. The main
@@ -121,6 +124,8 @@ abstract class ViewModelHarness {
     ) {
         val servers = SavedServers(app, secrets, QueuedPrefs(app.getSharedPreferences("servers-$n", 0)))
         val identities = Identities(app, secrets, File(app.filesDir, "identities-$n"))
+        val keys = FakeHolderKeys()
+        val held = HeldSeeds(File(app.filesDir, "held-$n"), keys, EmptyCoroutineContext)
     }
 
     /** A case's own stores and connections, the model before it cleared. */
@@ -160,7 +165,7 @@ abstract class ViewModelHarness {
                     modelClass: Class<T>,
                     extras: CreationExtras,
                 ): T =
-                    ChatViewModel(app, servers, identities, StoreQueue(disk), { url, sink ->
+                    ChatViewModel(app, servers, identities, stores.held, StoreQueue(disk), { url, sink ->
                         connection(url, sink).also { opened += it }
                     }, { renewing, expecting ->
                         enrollment(renewing, expecting).also { enrollments += it }

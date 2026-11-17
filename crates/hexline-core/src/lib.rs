@@ -4,6 +4,7 @@
 
 mod connection;
 mod enroll;
+mod holder;
 mod identity;
 mod model;
 mod names;
@@ -15,6 +16,7 @@ pub use connection::{
     ClassicLogin, CoreError, CoreUpdate, DeviceIdentity, LoginInfo, ServerConnection, UpdateSink,
 };
 pub use enroll::{card_name, enrollment_code, newer_card, renewal_due, Enrolled, Enrollee};
+pub use holder::{holder_mint, new_identity, HolderMinted, NewIdentity};
 pub use identity::{
     cert_for_device, cert_info, cert_time, new_device, CertInfo, CertTime, NewDevice,
 };

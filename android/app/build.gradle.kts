@@ -54,7 +54,10 @@ android {
         create("play") { dimension = "distribution" }
     }
 
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
 
     // Static paths, made before any variant compiles by `preBuild`'s
     // dependency on buildCore.
@@ -110,6 +113,8 @@ dependencies {
     implementation(libs.compose.ui)
     implementation(libs.compose.material3)
     implementation(libs.activity.compose)
+    implementation(libs.biometric)
+    implementation(libs.fragment)
     implementation("${libs.jna.get()}@aar")
     implementation(libs.coroutines)
     implementation(libs.lifecycle.viewmodel.compose)
