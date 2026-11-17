@@ -8,11 +8,10 @@ use std::sync::{Arc, Mutex};
 use hl_identity::envelope::Secret;
 use hl_identity::{
     Card, DeviceKey, EnvelopePut, Fingerprint, IdentityKey, KeyEnvelope, RecoveryCode,
-    RegisterRequest,
+    RegisterRequest, SuccessorCode,
 };
 use hxng_client::auth;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::restore::{
@@ -115,7 +114,7 @@ struct Setup {
     seed: Zeroizing<[u8; 32]>,
     card: Vec<u8>,
     /// Until it is typed back: then only its hash, in the card, is kept.
-    successor: Option<Zeroizing<[u8; 32]>>,
+    successor: Option<SuccessorCode>,
     recovery: Option<RecoveryCode>,
     recovery_confirmed: bool,
     /// This phone's device, minted here: what the card is put by.
@@ -144,9 +143,9 @@ impl HolderSetup {
     #[uniffi::constructor]
     pub fn new(name: String) -> Result<Arc<HolderSetup>, CoreError> {
         let id = IdentityKey::generate();
-        let successor = IdentityKey::generate();
+        let successor = SuccessorCode::generate();
         let mut card = Card::new(&id, name, issued());
-        card.successor = Some(commitment(&successor));
+        card.successor = Some(successor.commitment());
         let card = card
             .sign(&id, Vec::new())
             .map_err(|_| refused("bad_name"))?;
@@ -154,7 +153,7 @@ impl HolderSetup {
             fingerprint: id.fingerprint().to_string(),
             seed: id.seed(),
             card,
-            successor: Some(successor.seed()),
+            successor: Some(successor),
             recovery: Some(RecoveryCode::generate()),
             recovery_confirmed: false,
             device: None,
@@ -220,16 +219,18 @@ impl HolderSetup {
         let s = self.lock();
         s.successor
             .as_ref()
-            .map(|k| successor_code(k).as_bytes().to_vec())
+            .map(|code| code.display().as_bytes().to_vec())
     }
 
     /// Whether `typed` is the successor's code; if so it is let go of.
     pub fn confirm_successor(&self, typed: Vec<u8>) -> bool {
         let typed = Zeroizing::new(typed);
         let mut s = self.lock();
-        let typed = std::str::from_utf8(&typed).ok().and_then(parse_successor);
+        let typed = std::str::from_utf8(&typed)
+            .ok()
+            .and_then(SuccessorCode::parse);
         let right = match (&s.successor, typed) {
-            (Some(kept), Some(typed)) => *kept == typed,
+            (Some(kept), Some(typed)) => *kept.key().seed() == *typed.key().seed(),
             _ => false,
         };
         if right {
@@ -626,70 +627,6 @@ fn seed32(seed: Vec<u8>) -> Result<Zeroizing<[u8; 32]>, CoreError> {
     Ok(Zeroizing::new(fixed))
 }
 
-/// What a card commits to of a successor: the hash of its public key.
-fn commitment(successor: &IdentityKey) -> [u8; 32] {
-    Sha256::digest(successor.public()).into()
-}
-
-const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-
-/// A successor's seed as it is written down: Crockford base32, its 256
-/// bits in 52 characters, in groups of five.
-fn successor_code(seed: &[u8; 32]) -> Zeroizing<String> {
-    let mut out = Zeroizing::new(String::with_capacity(62));
-    let mut push = |v: u32| {
-        if !out.is_empty() && out.len() % 6 == 5 {
-            out.push('-');
-        }
-        out.push(CROCKFORD[(v & 31) as usize] as char);
-    };
-    let (mut acc, mut bits) = (0u32, 0u32);
-    for &b in seed {
-        acc = (acc << 8) | u32::from(b);
-        bits += 8;
-        while bits >= 5 {
-            bits -= 5;
-            push(acc >> bits);
-        }
-        acc &= (1 << bits) - 1;
-    }
-    push(acc << (5 - bits));
-    out
-}
-
-/// A successor's code as typed back: case, spaces, hyphens and the
-/// Crockford confusables forgiven, as for a recovery code.
-fn parse_successor(typed: &str) -> Option<Zeroizing<[u8; 32]>> {
-    let mut seed = Zeroizing::new([0u8; 32]);
-    let (mut acc, mut bits, mut n, mut chars) = (0u32, 0u32, 0usize, 0usize);
-    for c in typed.chars().filter(|c| !matches!(c, ' ' | '-')) {
-        let c = match c.to_ascii_uppercase() {
-            'O' => '0',
-            'I' | 'L' => '1',
-            c => c,
-        };
-        let v = CROCKFORD
-            .iter()
-            .position(|&x| c.is_ascii() && x == c as u8)? as u32;
-        chars += 1;
-        if chars > 52 {
-            return None;
-        }
-        acc = (acc << 5) | v;
-        bits += 5;
-        if bits >= 8 {
-            bits -= 8;
-            if n < 32 {
-                seed[n] = (acc >> bits) as u8;
-            }
-            n += 1;
-            acc &= (1 << bits) - 1;
-        }
-    }
-    // 52 characters carry 260 bits: the last four are none of the seed's.
-    (chars == 52 && n == 32 && acc == 0).then_some(seed)
-}
-
 fn protocol(detail: &str) -> CoreError {
     CoreError::Protocol {
         detail: detail.into(),
@@ -737,43 +674,13 @@ mod tests {
     fn a_setups_card_commits_to_the_successor_its_code_writes_down() {
         let setup = HolderSetup::new("Alice".into()).unwrap();
         let code = text(setup.successor_code());
-        let successor = IdentityKey::from_seed(&parse_successor(&code).unwrap());
+        let successor = SuccessorCode::parse(&code).unwrap();
         let card = Card::parse(&setup.card()).unwrap();
-        assert_eq!(card.successor, Some(commitment(&successor)));
+        assert_eq!(card.successor, Some(successor.commitment()));
         assert_eq!(
             Fingerprint::of(&card.identity).to_string(),
             setup.fingerprint()
         );
-    }
-
-    #[test]
-    fn a_successor_code_reads_back_as_written_and_as_paper_garbles_it() {
-        for seed in [[0u8; 32], [0xff; 32], *IdentityKey::generate().seed()] {
-            let code = successor_code(&seed);
-            assert_eq!(code.len(), 52 + 10, "{}", *code);
-            assert_eq!(*parse_successor(&code).unwrap(), seed);
-            let paper = code
-                .to_lowercase()
-                .replace('-', " ")
-                .replace('0', "o")
-                .replace('1', "l");
-            assert_eq!(*parse_successor(&paper).unwrap(), seed, "{paper}");
-        }
-        let code = successor_code(&[0x5a; 32]).replace('-', "");
-        let last = code.chars().last().unwrap();
-        let padded = format!(
-            "{}{}",
-            &code[..51],
-            CROCKFORD[CROCKFORD.iter().position(|&c| c == last as u8).unwrap() | 1] as char
-        );
-        for bad in [
-            &code[..51],
-            &format!("{code}0"),
-            &format!("U{}", &code[1..]),
-            &padded,
-        ] {
-            assert!(parse_successor(bad).is_none(), "{bad}");
-        }
     }
 
     #[test]
@@ -783,7 +690,12 @@ mod tests {
         let successor = text(setup.successor_code());
         let recovery = text(setup.recovery_code());
         assert!(!setup.confirm_successor(recovery.clone().into_bytes()));
-        assert!(!setup.confirm_successor(successor_code(&[1; 32]).as_bytes().to_vec()));
+        assert!(!setup.confirm_successor(
+            SuccessorCode::of(&IdentityKey::from_seed(&[1; 32]))
+                .display()
+                .as_bytes()
+                .to_vec()
+        ));
         assert!(!setup.confirm_recovery(successor.clone().into_bytes()));
         assert!(!setup.confirm_recovery(RecoveryCode::generate().display().as_bytes().to_vec()));
         assert!(setup.confirm_successor(successor.clone().into_bytes()));
