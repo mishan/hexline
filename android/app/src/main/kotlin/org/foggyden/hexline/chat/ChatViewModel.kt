@@ -779,7 +779,8 @@ class ChatViewModel internal constructor(
         val next = if (failed.fixed) target.handle else handle.trim()
         setupFor = target.copy(handle = next, invite = invite?.ifBlank { null } ?: target.invite)
         if (next != target.handle) {
-            later { identities.intends(checkNotNull(setup).fingerprint(), next) }
+            val fingerprint = checkNotNull(setup).fingerprint()
+            later { identities.intends(fingerprint, next) }
         }
         commitSetup()
     }
@@ -865,7 +866,8 @@ class ChatViewModel internal constructor(
                     val card = target.committed ?: made.commit(target.registrar, target.handle, target.invite).card
                     setupFor = target.copy(committed = card)
                     withContext(store) {
-                        identities.committed(fingerprint, card)
+                        // As the registrar took it, whatever the write of what was intended made of it.
+                        identities.committed(fingerprint, card, target.handle)
                         publishIdentities()
                     }
                     closeSetup()

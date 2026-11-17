@@ -275,8 +275,7 @@ impl HolderSetup {
     /// the setup keeps it, to put the card by. `busy` while a commit is
     /// under way.
     pub fn mint(&self, device_name: String) -> Result<HolderMinted, CoreError> {
-        self.not_committing()?;
-        let mut s = self.confirmed()?;
+        let mut s = self.confirmed_idle()?;
         let id = IdentityKey::from_seed(&s.seed);
         let device = DeviceKey::generate();
         let cert = certify(&id, &device, &device_name)?;
@@ -293,8 +292,7 @@ impl HolderSetup {
     /// be asked for. `unminted` before [`HolderSetup::mint`], `busy` while a
     /// commit is under way.
     pub fn held(&self) -> Result<(), CoreError> {
-        self.not_committing()?;
-        let mut s = self.confirmed()?;
+        let mut s = self.confirmed_idle()?;
         if s.device.is_none() {
             return Err(refused("unminted"));
         }
@@ -376,13 +374,18 @@ impl HolderSetup {
         (registered, release)
     }
 
-    /// `busy` while a commit is under way: its cleanup lets go of the
-    /// device, so a device minted or said held meanwhile would go with it.
-    fn not_committing(&self) -> Result<(), CoreError> {
+    /// [`HolderSetup::confirmed`], and `busy` while a commit is under way:
+    /// its cleanup lets go of the device, so a device minted or said held
+    /// meanwhile would go with it. The flag is read under the state's lock,
+    /// which a commit takes after setting it and before taking its device,
+    /// so a change made here either comes before that and is what it takes,
+    /// or is refused.
+    fn confirmed_idle(&self) -> Result<std::sync::MutexGuard<'_, Setup>, CoreError> {
+        let s = self.confirmed()?;
         if self.committing.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(refused("busy"));
         }
-        Ok(())
+        Ok(s)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Setup> {

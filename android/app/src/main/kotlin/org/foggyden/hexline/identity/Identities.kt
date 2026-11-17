@@ -194,6 +194,8 @@ class Identities(
                     stored.info,
                     stored.registrar,
                     stored.mailbox,
+                    stored.renewTried,
+                    stored.noHolder,
                     unfinished = true,
                 ),
             )
@@ -221,20 +223,21 @@ class Identities(
         }
 
     /**
-     * [fingerprint]'s setup committed: [card], the card its registrar
-     * attested, in place of the one kept. Throws the core's refusal if it
-     * is not that identity's card for the device; null if the identity is
-     * no longer kept.
+     * [fingerprint]'s setup committed as [handle]: [card], the card its
+     * registrar attested, in place of the one kept. Throws the core's
+     * refusal if it is not that identity's card for the device; null if the
+     * identity is no longer kept.
      */
     fun committed(
         fingerprint: String,
         card: ByteArray,
+        handle: String,
     ): StoredIdentity? =
         synchronized(LOCK) {
             val file = file(fingerprint)
             val stored = load(file) ?: return null
             val info = certInfo(stored.cert, card, stored.info.device, stored.info.deviceEnc)
-            StoredIdentity(stored.handle, stored.cert, card, info, stored.registrar, stored.mailbox).also { write(file, it) }
+            StoredIdentity(handle, stored.cert, card, info, stored.registrar, stored.mailbox).also { write(file, it) }
         }
 
     fun delete(fingerprint: String): Unit =

@@ -1,5 +1,6 @@
 package org.foggyden.hexline.chat
 
+import android.content.Context
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.view.WindowManager
@@ -14,6 +15,10 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
 import androidx.fragment.app.testing.EmptyFragmentActivity
 import androidx.lifecycle.ProcessLifecycleOwner
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.viewmodel.CreationExtras
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import kotlinx.coroutines.Dispatchers
@@ -44,6 +49,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.security.KeyStore
 
 /**
  * The holder setup screen on a real Android, with the real Keystore and
@@ -59,7 +65,13 @@ class HolderSetupScreenTest {
     private val context = instrumentation.targetContext
     private val identityDir = File(context.filesDir, "identities-setup-test")
     private val heldDir = File(context.filesDir, "held-setup-test")
-    private val identities = Identities(context, SecretStore(context), identityDir)
+
+    // Stores of the test's own: nothing the app or an earlier run saved reaches the model.
+    private val secretDir = File(context.filesDir, "secrets-setup-test")
+    private val secrets = SecretStore(context, STORE, secretDir)
+    private val identities = Identities(context, secrets, identityDir)
+    private val servers = SavedServers(context, secrets, context.getSharedPreferences(STORE, Context.MODE_PRIVATE))
+    private val owner = ViewModelStore()
     private var held: HeldSeeds? = null
     private var made: String? = null
 
@@ -72,12 +84,17 @@ class HolderSetupScreenTest {
 
     @After
     fun unlock() {
+        // Cleared as an activity's would be, letting go of what it registered.
+        rule.runOnUiThread { owner.clear() }
         made?.let { fp ->
             runCatching { held?.forget(fp) }
             identities.delete(fp)
         }
         identityDir.deleteRecursively()
         heldDir.deleteRecursively()
+        secretDir.deleteRecursively()
+        context.deleteSharedPreferences(STORE)
+        KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(STORE)
         shell("locksettings clear --old $PIN")
     }
 
@@ -86,22 +103,28 @@ class HolderSetupScreenTest {
     /** The model the app makes, over stores of the test's own and its registrar. */
     private fun model(softwareKeys: Boolean): ChatViewModel {
         val seeds = HeldSeeds(heldDir, KeystoreHolderKeys(context), Dispatchers.IO, softwareKeys).also { held = it }
+        val factory =
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(
+                    modelClass: Class<T>,
+                    extras: CreationExtras,
+                ): T =
+                    ChatViewModel(
+                        rule.activity.application,
+                        servers,
+                        identities,
+                        seeds,
+                        StoreQueue(Dispatchers.IO.limitedParallelism(1)),
+                        { _, _ -> error("no server here") },
+                        { _, _ -> error("no mailbox here") },
+                        OfflineSetups,
+                        { System.currentTimeMillis() / 1000 },
+                        ProcessLifecycleOwner.get().lifecycle,
+                    ) as T
+            }
         var vm: ChatViewModel? = null
-        rule.runOnUiThread {
-            vm =
-                ChatViewModel(
-                    rule.activity.application,
-                    SavedServers(context),
-                    identities,
-                    seeds,
-                    StoreQueue(Dispatchers.IO.limitedParallelism(1)),
-                    { _, _ -> error("no server here") },
-                    { _, _ -> error("no mailbox here") },
-                    OfflineSetups,
-                    { System.currentTimeMillis() / 1000 },
-                    ProcessLifecycleOwner.get().lifecycle,
-                )
-        }
+        rule.runOnUiThread { vm = ViewModelProvider.create(owner, factory)[ChatViewModel::class.java] }
         val model = checkNotNull(vm)
         // The activity has a view of its own: the screen goes in one of the test's.
         rule.runOnUiThread {
@@ -146,8 +169,9 @@ class HolderSetupScreenTest {
     @Test
     fun anIdentityIsSetUpOnTheScreenHeldBehindThePromptAndGoesWithTheScreenLock() {
         val vm = model(softwareKeys = true)
-        begin()
+        rule.waitForIdle()
         assertFalse("nothing secret on screen yet", secure())
+        begin()
         val successor = reached(vm, SettingUp.Successor::class.java).code
         rule.waitForIdle()
         assertTrue("a code kept off screenshots", secure())
@@ -239,5 +263,6 @@ class HolderSetupScreenTest {
 
     private companion object {
         const val PIN = "1234"
+        const val STORE = "hexline-setup-test"
     }
 }
