@@ -97,8 +97,17 @@ pub fn holder_mint(
 #[derive(uniffi::Object)]
 pub struct HolderSetup {
     state: Mutex<Setup>,
+    /// A commit is under way: from its start through its cleanup.
+    committing: std::sync::atomic::AtomicBool,
     #[cfg(feature = "live-tests")]
     fault: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "live-tests")]
+    pause: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 struct Setup {
@@ -270,6 +279,8 @@ impl HolderSetup {
         let device = DeviceKey::generate();
         let cert = certify(&id, &device, &device_name)?;
         s.device = Some((device.seed(), cert.clone()));
+        // Not the device the app said it keeps, until it says so of this one.
+        s.held = false;
         Ok(HolderMinted {
             device_seed: device.seed().to_vec(),
             cert,
@@ -296,7 +307,8 @@ impl HolderSetup {
     /// taken, an invite wanted), which leaves the codes to commit again,
     /// with another handle; `no_envelopes` where it keeps none;
     /// `unconfirmed` before both codes are typed back and `unheld` before
-    /// [`HolderSetup::held`]. Once the registrar has registered the
+    /// [`HolderSetup::held`], and `busy` while another commit is under
+    /// way. Once the registrar has registered the
     /// handle, anything that fails is `registered_not_backed_up`, to ask
     /// again with the same handle, and a commit at another registrar or
     /// as another handle is `registered_as`, the handle in its detail.
@@ -307,8 +319,20 @@ impl HolderSetup {
         handle: String,
         invite: Option<String>,
     ) -> Result<HolderCommitted, CoreError> {
+        if self
+            .committing
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(refused("busy"));
+        }
+        // Let go of when the commit ends, however it ends, the app's wait
+        // for it canceled or not.
+        let under_way = Committing(self);
         crate::connection::RUNTIME
-            .spawn(async move { self.committing(&registrar, &handle, invite).await })
+            .spawn(async move {
+                let setup = &under_way.0;
+                setup.committing(&registrar, &handle, invite).await
+            })
             .await
             .unwrap_or_else(|_| Err(protocol("the commit stopped")))
     }
@@ -318,8 +342,11 @@ impl HolderSetup {
     fn with(setup: Setup) -> Arc<HolderSetup> {
         Arc::new(HolderSetup {
             state: Mutex::new(setup),
+            committing: Default::default(),
             #[cfg(feature = "live-tests")]
             fault: Default::default(),
+            #[cfg(feature = "live-tests")]
+            pause: Default::default(),
         })
     }
 
@@ -328,6 +355,21 @@ impl HolderSetup {
     #[cfg(feature = "live-tests")]
     pub fn fail_after_registering(&self) {
         self.fault.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The next commit waits once the registrar has registered it, saying
+    /// so on the first, until the second is sent.
+    #[cfg(feature = "live-tests")]
+    pub fn hold_after_registering(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (said, registered) = tokio::sync::oneshot::channel();
+        let (release, waited) = tokio::sync::oneshot::channel();
+        *self.pause.lock().unwrap() = Some((said, waited));
+        (registered, release)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Setup> {
@@ -351,6 +393,10 @@ impl HolderSetup {
         handle: &str,
         invite: Option<String>,
     ) -> Result<HolderCommitted, CoreError> {
+        // Taken at once, so a commit that ends before registering lets its
+        // test know.
+        #[cfg(feature = "live-tests")]
+        let pause = self.pause.lock().unwrap().take();
         let base = registrar_base(registrar)?;
         // Sealed before anything is asked: Argon2id over 64 MiB, the code
         // never leaving this object.
@@ -422,6 +468,11 @@ impl HolderSetup {
         };
         // The handle is the identity's from here: whatever fails is told
         // apart, for the same handle to be asked for again.
+        #[cfg(feature = "live-tests")]
+        if let Some((said, waited)) = pause {
+            let _ = said.send(());
+            let _ = waited.await;
+        }
         let backed_up = async {
             #[cfg(feature = "live-tests")]
             if self.fault.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -449,6 +500,17 @@ impl HolderSetup {
         s.successor = None;
         zeroize::Zeroize::zeroize(&mut *s.seed);
         Ok(HolderCommitted { card })
+    }
+}
+
+/// A commit under way, its setup's to let go of as it ends.
+struct Committing(Arc<HolderSetup>);
+
+impl Drop for Committing {
+    fn drop(&mut self) {
+        self.0
+            .committing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

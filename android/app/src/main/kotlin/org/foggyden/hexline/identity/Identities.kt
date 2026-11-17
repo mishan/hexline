@@ -165,6 +165,7 @@ class Identities(
                     stored.mailbox,
                     at,
                     noHolder,
+                    stored.unfinished,
                 ),
             )
         }

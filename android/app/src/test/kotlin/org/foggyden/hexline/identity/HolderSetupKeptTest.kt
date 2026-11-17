@@ -69,6 +69,13 @@ class HolderSetupKeptTest {
     }
 
     @Test
+    fun aRenewalAskedForLeavesASetupUnfinished() {
+        val (_, kept) = keptUnfinished()
+        identities().renewTried(kept.fingerprint, kept.cert, 1_000, noHolder = false)
+        assertTrue(identities().list().single().unfinished)
+    }
+
+    @Test
     fun anotherIdentitysCardIsNoCommitOfThisOne() {
         val (setup, _) = keptUnfinished()
         try {

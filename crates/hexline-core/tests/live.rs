@@ -1948,8 +1948,48 @@ async fn a_commit_asks_nothing_before_both_codes_are_typed_back_and_the_seed_is_
     assert!(setup.confirm_recovery(setup.recovery_code().unwrap()));
     setup.mint("Pixel".into()).unwrap();
     let e = setup
+        .clone()
         .commit(nowhere(), "carol".into(), None)
         .await
         .unwrap_err();
     assert_eq!(refused_as(&e), "unheld");
+    // A device minted again is not the one the app kept, until it says so.
+    setup.held().unwrap();
+    setup.mint("Pixel".into()).unwrap();
+    let e = setup
+        .commit(nowhere(), "carol".into(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused_as(&e),
+        "unheld",
+        "a device minted after it was held"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_while_another_is_under_way_is_refused_and_the_first_goes_through() {
+    let server = Server::with_registrar(&[]).await;
+    let (setup, recovery, _) = confirmed_setup();
+    let (registered, release) = setup.hold_after_registering();
+    let first = tokio::spawn(
+        setup
+            .clone()
+            .commit(server.http.clone(), "joan".into(), None),
+    );
+    registered.await.unwrap();
+    for handle in ["joan", "joan2"] {
+        let e = setup
+            .clone()
+            .commit(server.http.clone(), handle.into(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(refused_as(&e), "busy", "{handle}");
+    }
+    release.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    assert_eq!(
+        restored_by(&server, "joan", &recovery).await.unwrap(),
+        setup.fingerprint()
+    );
 }
