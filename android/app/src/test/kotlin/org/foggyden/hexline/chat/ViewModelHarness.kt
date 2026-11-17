@@ -123,7 +123,8 @@ abstract class ViewModelHarness {
         val secrets: MemorySecrets = MemorySecrets(),
     ) {
         val servers = SavedServers(app, secrets, QueuedPrefs(app.getSharedPreferences("servers-$n", 0)))
-        val identities = Identities(app, secrets, File(app.filesDir, "identities-$n"))
+        val identityDir = File(app.filesDir, "identities-$n")
+        val identities = Identities(app, secrets, identityDir)
         val keys = FakeHolderKeys()
         val held = HeldSeeds(File(app.filesDir, "held-$n"), keys, EmptyCoroutineContext)
     }

@@ -313,7 +313,7 @@ class ChatViewModel internal constructor(
             val found =
                 withContext(store) {
                     publishIdentities()
-                    held.sweep(identities.list().map { it.fingerprint })
+                    held.sweep(identities.names())
                     demoteHeld()
                     publishRefusals()
                     publishServers()

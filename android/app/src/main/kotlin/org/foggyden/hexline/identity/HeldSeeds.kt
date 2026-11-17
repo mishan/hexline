@@ -143,13 +143,14 @@ class HeldSeeds(
     }
 
     /**
-     * Lets go of every held seed and key of an identity not among
-     * [fingerprints], and of every key no sealed file names: what a
-     * delete or a hold cut short by the process's end left behind.
+     * Lets go of every held seed and key of an identity none of [names]
+     * (the short hashes of [Identities.names]) is, and of every key no
+     * sealed file names: what a delete or a hold cut short by the process's
+     * end left behind.
      */
-    fun sweep(fingerprints: List<String>) =
+    fun sweep(names: Set<String>) =
         synchronized(LOCK) {
-            val kept = fingerprints.map(::held).toSet()
+            val kept = names.map { "held-$it" }.toSet()
             val named = HashSet<String>()
             // A kept file not read now may name any key, so none is let go of.
             var sure = true

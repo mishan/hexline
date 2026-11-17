@@ -226,7 +226,7 @@ class HeldSeedsTest {
         assertTrue(hold())
         assertTrue(hold(OTHER))
         keys.create("hexline-held-stray")
-        held.sweep(listOf(FP))
+        held.sweep(setOf(shortHash(FP.toByteArray())))
         assertTrue(held.isHeld(FP))
         assertFalse(held.isHeld(OTHER))
         assertEquals("the one key named", 1, keys.aliases.size)
@@ -239,7 +239,7 @@ class HeldSeedsTest {
         val file = dir.listFiles()!!.single { it.name.startsWith("held-") }
         val bytes = file.readBytes()
         file.writeBytes(byteArrayOf(2, 0))
-        held.sweep(listOf(FP))
+        held.sweep(setOf(shortHash(FP.toByteArray())))
         file.writeBytes(bytes)
         assertArrayEquals(seed, open())
     }
@@ -248,7 +248,7 @@ class HeldSeedsTest {
     fun aSweepTheKeystoreCannotAnswerNowLetsGoOfNothing() {
         assertTrue(hold())
         keys.trouble = { KeyStoreException("busy") }
-        held.sweep(listOf(FP))
+        held.sweep(setOf(shortHash(FP.toByteArray())))
         keys.trouble = null
         assertArrayEquals(seed, open())
     }

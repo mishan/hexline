@@ -1011,6 +1011,20 @@ class ChatViewModelTest : ViewModelHarness() {
         assertEquals("the kept identity's key alone", 1, stores.keys.aliases.size)
     }
 
+    @Test
+    fun aHeldIdentityWhoseFileDoesNotReadAtStartKeepsItsSeed() {
+        keepIdentity()
+        hold()
+        val file = stores.identityDir.listFiles()!!.single { it.name.startsWith("identity-") }
+        val bytes = file.readBytes()
+        file.writeBytes("{".toByteArray())
+        model()
+        settle()
+        file.writeBytes(bytes)
+        val opened = runBlocking { stores.held.use(FINGERPRINT, stores.keys.authorizer()) { it.copyOf() } }
+        assertArrayEquals(ByteArray(32) { 1 }, opened)
+    }
+
     private fun hold(fingerprint: String = FINGERPRINT) =
         assertTrue(
             runBlocking {
