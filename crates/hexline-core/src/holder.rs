@@ -3,10 +3,21 @@
 //! person each time, and comes here only for the one operation it was
 //! unwrapped for.
 
-use hl_identity::{Card, DeviceKey, Fingerprint, IdentityKey};
+use std::sync::{Arc, Mutex};
+
+use hl_identity::envelope::Secret;
+use hl_identity::{
+    Card, DeviceKey, EnvelopePut, Fingerprint, IdentityKey, KeyEnvelope, RecoveryCode,
+    RegisterRequest,
+};
+use hxng_client::auth;
+use serde_json::json;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::restore::{certify, now};
+use crate::restore::{
+    b64, bytes, certify, discovered, endpoint, issued, now, ours, registrar_base, with_attestation,
+};
 use crate::CoreError;
 
 /// An identity key just made, with the card it signed for itself: its
@@ -69,6 +80,504 @@ pub fn holder_mint(
     })
 }
 
+/// A holder's identity being made (design §2.1): its key, the successor
+/// its card commits to and its recovery code, all kept here alone until
+/// the person has typed both codes back. Then the app holds the seed
+/// ([`HolderSetup::identity_seed`]), keeps the device minted for this
+/// phone ([`HolderSetup::mint`]) and says so ([`HolderSetup::held`]),
+/// and only then is anything sent ([`HolderSetup::commit`]): the
+/// registration that commits the successor, the attested card put where
+/// the registrar serves it, and the recovery code's envelope. Until the
+/// registration answers, nothing is lost by starting again; after it the
+/// seed is held, and the setup is for that handle alone. Once committed,
+/// or dropped, it wipes what it kept.
+///
+/// The codes cross as bytes, for the app to wipe its copies; what it
+/// shows the person is a string the runtime may keep (design §2.2).
+#[derive(uniffi::Object)]
+pub struct HolderSetup {
+    state: Mutex<Setup>,
+    #[cfg(feature = "live-tests")]
+    fault: std::sync::atomic::AtomicBool,
+}
+
+struct Setup {
+    fingerprint: String,
+    seed: Zeroizing<[u8; 32]>,
+    card: Vec<u8>,
+    /// Until it is typed back: then only its hash, in the card, is kept.
+    successor: Option<Zeroizing<[u8; 32]>>,
+    recovery: Option<RecoveryCode>,
+    recovery_confirmed: bool,
+    /// This phone's device, minted here: what the card is put by.
+    device: Option<(Zeroizing<[u8; 32]>, Vec<u8>)>,
+    held: bool,
+    /// The registrar and handle, once fixed: by a resume, or by a
+    /// registration the registrar answered.
+    target: Option<(String, String)>,
+    /// The card carries the registrar's attestation for the target.
+    registered: bool,
+    /// The time the last commit signed for: the next signs a later one, as
+    /// the registrar refuses a request it has seen.
+    signed: u64,
+}
+
+/// What a commit made of the card: the same, carrying the registrar's
+/// attestation for the handle.
+#[derive(Debug, uniffi::Record)]
+pub struct HolderCommitted {
+    pub card: Vec<u8>,
+}
+
+#[uniffi::export]
+impl HolderSetup {
+    /// A new identity named `name`, whose card commits to a successor.
+    #[uniffi::constructor]
+    pub fn new(name: String) -> Result<Arc<HolderSetup>, CoreError> {
+        let id = IdentityKey::generate();
+        let successor = IdentityKey::generate();
+        let mut card = Card::new(&id, name, issued());
+        card.successor = Some(commitment(&successor));
+        let card = card
+            .sign(&id, Vec::new())
+            .map_err(|_| refused("bad_name"))?;
+        Ok(HolderSetup::with(Setup {
+            fingerprint: id.fingerprint().to_string(),
+            seed: id.seed(),
+            card,
+            successor: Some(successor.seed()),
+            recovery: Some(RecoveryCode::generate()),
+            recovery_confirmed: false,
+            device: None,
+            held: false,
+            target: None,
+            registered: false,
+            signed: 0,
+        }))
+    }
+
+    /// A setup this phone holds, kept unfinished: its commit may never
+    /// have answered (the process ended), so it is committed again, at
+    /// `registrar` as `handle` alone, by the device kept for it. Its
+    /// card's successor stands, as the registrar may hold it already, so
+    /// there is none to type back. The recovery code is new, and once
+    /// this commits, it replaces any the identity was sealed under
+    /// before: one written down for an earlier commit opens nothing.
+    #[uniffi::constructor]
+    pub fn resume(
+        identity_seed: Vec<u8>,
+        card: Vec<u8>,
+        registrar: String,
+        handle: String,
+        device_seed: Vec<u8>,
+        device_cert: Vec<u8>,
+    ) -> Result<Arc<HolderSetup>, CoreError> {
+        let seed = seed32(identity_seed)?;
+        let device = seed32(device_seed)?;
+        let id = IdentityKey::from_seed(&seed);
+        let parsed = Card::parse(&card).map_err(|_| refused("bad_card"))?;
+        if Fingerprint::of(&parsed.identity) != id.fingerprint() {
+            return Err(refused("wrong_identity"));
+        }
+        crate::identity::cert_for_device(device_cert.clone(), card.clone(), device.to_vec())
+            .map_err(|_| refused("bad_device"))?;
+        Ok(HolderSetup::with(Setup {
+            fingerprint: id.fingerprint().to_string(),
+            seed,
+            card,
+            successor: None,
+            recovery: Some(RecoveryCode::generate()),
+            recovery_confirmed: false,
+            device: Some((device, device_cert)),
+            held: true,
+            target: Some((registrar, handle)),
+            registered: false,
+            // The process before may have signed in this second.
+            signed: now(),
+        }))
+    }
+
+    pub fn fingerprint(&self) -> String {
+        self.lock().fingerprint.clone()
+    }
+
+    pub fn card(&self) -> Vec<u8> {
+        self.lock().card.clone()
+    }
+
+    /// The successor's code, to show once: none once it has been typed
+    /// back, or for a resumed setup.
+    pub fn successor_code(&self) -> Option<Vec<u8>> {
+        let s = self.lock();
+        s.successor
+            .as_ref()
+            .map(|k| successor_code(k).as_bytes().to_vec())
+    }
+
+    /// Whether `typed` is the successor's code; if so it is let go of.
+    pub fn confirm_successor(&self, typed: Vec<u8>) -> bool {
+        let typed = Zeroizing::new(typed);
+        let mut s = self.lock();
+        let typed = std::str::from_utf8(&typed).ok().and_then(parse_successor);
+        let right = match (&s.successor, typed) {
+            (Some(kept), Some(typed)) => *kept == typed,
+            _ => false,
+        };
+        if right {
+            s.successor = None;
+        }
+        right
+    }
+
+    /// The recovery code, to show once: none once it has been typed back.
+    pub fn recovery_code(&self) -> Option<Vec<u8>> {
+        let s = self.lock();
+        s.recovery
+            .as_ref()
+            .filter(|_| !s.recovery_confirmed)
+            .map(|c| c.display().as_bytes().to_vec())
+    }
+
+    /// Whether `typed` is the recovery code, as read off paper.
+    pub fn confirm_recovery(&self, typed: Vec<u8>) -> bool {
+        let typed = Zeroizing::new(typed);
+        let mut s = self.lock();
+        let right = match (
+            &s.recovery,
+            std::str::from_utf8(&typed)
+                .ok()
+                .and_then(RecoveryCode::parse),
+        ) {
+            (Some(kept), Some(typed)) => typed.display() == kept.display(),
+            _ => false,
+        };
+        s.recovery_confirmed |= right;
+        right
+    }
+
+    /// The identity's seed, for the app to hold and then wipe, once both
+    /// codes are typed back: `unconfirmed` before.
+    pub fn identity_seed(&self) -> Result<Vec<u8>, CoreError> {
+        let s = self.confirmed()?;
+        Ok(s.seed.to_vec())
+    }
+
+    /// This phone's device, certified by the identity as a holder's own;
+    /// the setup keeps it, to put the card by.
+    pub fn mint(&self, device_name: String) -> Result<HolderMinted, CoreError> {
+        let mut s = self.confirmed()?;
+        let id = IdentityKey::from_seed(&s.seed);
+        let device = DeviceKey::generate();
+        let cert = certify(&id, &device, &device_name)?;
+        s.device = Some((device.seed(), cert.clone()));
+        Ok(HolderMinted {
+            device_seed: device.seed().to_vec(),
+            cert,
+        })
+    }
+
+    /// The app holds the seed and keeps the device minted: the commit may
+    /// be asked for. `unminted` before [`HolderSetup::mint`].
+    pub fn held(&self) -> Result<(), CoreError> {
+        let mut s = self.confirmed()?;
+        if s.device.is_none() {
+            return Err(refused("unminted"));
+        }
+        s.held = true;
+        Ok(())
+    }
+
+    /// Registers `handle` at `registrar` (with `invite` where it asks for
+    /// one), committing the successor, puts the attested card where the
+    /// registrar serves it, and puts the identity there sealed by the
+    /// recovery code.
+    ///
+    /// Refused as the registrar refuses before it registers (a handle
+    /// taken, an invite wanted), which leaves the codes to commit again,
+    /// with another handle; `no_envelopes` where it keeps none;
+    /// `unconfirmed` before both codes are typed back and `unheld` before
+    /// [`HolderSetup::held`]. Once the registrar has registered the
+    /// handle, anything that fails is `registered_not_backed_up`, to ask
+    /// again with the same handle, and a commit at another registrar or
+    /// as another handle is `registered_as`, the handle in its detail.
+    #[uniffi::method(async_runtime = "tokio")]
+    pub async fn commit(
+        self: Arc<Self>,
+        registrar: String,
+        handle: String,
+        invite: Option<String>,
+    ) -> Result<HolderCommitted, CoreError> {
+        crate::connection::RUNTIME
+            .spawn(async move { self.committing(&registrar, &handle, invite).await })
+            .await
+            .unwrap_or_else(|_| Err(protocol("the commit stopped")))
+    }
+}
+
+impl HolderSetup {
+    fn with(setup: Setup) -> Arc<HolderSetup> {
+        Arc::new(HolderSetup {
+            state: Mutex::new(setup),
+            #[cfg(feature = "live-tests")]
+            fault: Default::default(),
+        })
+    }
+
+    /// The next commit fails once the registrar has registered it, as a
+    /// link lost after that would.
+    #[cfg(feature = "live-tests")]
+    pub fn fail_after_registering(&self) {
+        self.fault.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Setup> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn confirmed(&self) -> Result<std::sync::MutexGuard<'_, Setup>, CoreError> {
+        let s = self.lock();
+        if s.recovery.is_none() {
+            return Err(refused("committed"));
+        }
+        if s.successor.is_some() || !s.recovery_confirmed {
+            return Err(refused("unconfirmed"));
+        }
+        Ok(s)
+    }
+
+    async fn committing(
+        &self,
+        registrar: &str,
+        handle: &str,
+        invite: Option<String>,
+    ) -> Result<HolderCommitted, CoreError> {
+        let base = registrar_base(registrar)?;
+        // Sealed before anything is asked: Argon2id over 64 MiB, the code
+        // never leaving this object.
+        let (seed, card, envelope, keys, time, device, registered) = {
+            let mut s = self.confirmed()?;
+            if !s.held {
+                return Err(refused("unheld"));
+            }
+            if let Some((r, h)) = &s.target {
+                if r != registrar || h != handle {
+                    return Err(CoreError::Refused {
+                        code: "registered_as".into(),
+                        detail: h.clone(),
+                    });
+                }
+            }
+            s.signed = later(s.signed, now());
+            let id = IdentityKey::from_seed(&s.seed);
+            let recovery = s.recovery.as_ref().expect("confirmed");
+            let (envelope, keys) = tokio::task::block_in_place(|| {
+                KeyEnvelope::seal(&id, &Secret::RecoveryCode(recovery))
+            })
+            .map_err(|e| protocol(&format!("sealing: {e}")))?;
+            let (device, cert) = s.device.as_ref().expect("held");
+            (
+                s.seed.clone(),
+                s.card.clone(),
+                envelope,
+                keys,
+                s.signed,
+                (device.clone(), cert.clone()),
+                s.registered,
+            )
+        };
+        let id = IdentityKey::from_seed(&seed);
+        let http = auth::http_client(base.as_str(), None)?;
+        let reg = discovered(&http, &base).await?;
+        let envelopes = endpoint(&base, &reg.envelopes)?;
+        let card = if registered {
+            card
+        } else {
+            let register = endpoint(&base, &reg.register)?;
+            let request = RegisterRequest {
+                identity: id.public(),
+                registrar: reg.host.clone(),
+                handle: handle.to_owned(),
+                time,
+                successor: Card::parse(&card).ok().and_then(|c| c.successor),
+                proof: invite
+                    .map(|i| i.trim().to_owned())
+                    .filter(|i| !i.is_empty()),
+            }
+            .sign(&id)
+            .map_err(|e| protocol(&e.to_string()))?;
+            let reply =
+                auth::post(&http, &register, Some(json!({ "request": b64(&request) }))).await?;
+            let attestation = bytes(&reply, "attestation")?;
+            if !ours(&attestation, &reg, &id, handle) {
+                return Err(protocol(
+                    "the attestation is not the registrar's for this handle",
+                ));
+            }
+            let card = with_attestation(&id, &card, &attestation)?;
+            let mut s = self.lock();
+            s.card = card.clone();
+            s.registered = true;
+            s.target = Some((registrar.to_owned(), handle.to_owned()));
+            card
+        };
+        // The handle is the identity's from here: whatever fails is told
+        // apart, for the same handle to be asked for again.
+        let backed_up = async {
+            #[cfg(feature = "live-tests")]
+            if self.fault.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(protocol("a link lost after registering"));
+            }
+            put_card(&http, &base, &device, &card).await?;
+            let put = EnvelopePut::store(&id, &reg.host, time, &envelope, &keys)
+                .map_err(|e| protocol(&e.to_string()))?;
+            let reply = auth::put(&http, &envelopes, json!({ "request": b64(&put) })).await?;
+            if reply.get("stored").and_then(serde_json::Value::as_bool) != Some(true) {
+                return Err(protocol("the registrar did not say it stored the envelope"));
+            }
+            Ok::<_, CoreError>(())
+        };
+        if let Err(e) = backed_up.await {
+            return Err(CoreError::Refused {
+                code: "registered_not_backed_up".into(),
+                detail: e.to_string(),
+            });
+        }
+        // Committed: nothing more is asked of it, and what it kept goes.
+        let mut s = self.lock();
+        s.recovery = None;
+        s.device = None;
+        s.successor = None;
+        zeroize::Zeroize::zeroize(&mut *s.seed);
+        Ok(HolderCommitted { card })
+    }
+}
+
+/// The time a commit signs: later than the last, as the registrar refuses
+/// a request it has seen, and never behind the clock.
+fn later(signed: u64, now: u64) -> u64 {
+    now.max(signed + 1)
+}
+
+/// The card put at the registrar's `/identity/card`, by `device` signed in
+/// there: where a server that has only the handle reads it (§6.4), and
+/// what records the successor it commits to.
+async fn put_card(
+    http: &hxng_client::reqwest::Client,
+    base: &hxng_client::reqwest::Url,
+    device: &(Zeroizing<[u8; 32]>, Vec<u8>),
+    card: &[u8],
+) -> Result<(), CoreError> {
+    let ws = format!("ws{}", base.as_str().trim_start_matches("http"));
+    let device = auth::Device {
+        key: DeviceKey::from_seed(&device.0),
+        cert: device.1.clone(),
+        card: card.to_vec(),
+    };
+    let admitted = auth::identity_token(&ws, &device, false, None, None).await?;
+    let resp = http
+        .put(base.join("/identity/card").expect("a path"))
+        .bearer_auth(admitted.token.expose())
+        .header("Content-Type", "application/cbor")
+        .body(card.to_vec())
+        .send()
+        .await
+        .map_err(|e| CoreError::Connect {
+            detail: e.to_string(),
+        })?;
+    let status = resp.status();
+    let reply: serde_json::Value = resp.json().await.unwrap_or_default();
+    if status.is_success() {
+        return Ok(());
+    }
+    Err(CoreError::Refused {
+        code: reply
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("card_refused")
+            .into(),
+        detail: status.to_string(),
+    })
+}
+
+fn seed32(seed: Vec<u8>) -> Result<Zeroizing<[u8; 32]>, CoreError> {
+    let seed = Zeroizing::new(seed);
+    let fixed: [u8; 32] = seed
+        .as_slice()
+        .try_into()
+        .map_err(|_| refused("bad_seed"))?;
+    Ok(Zeroizing::new(fixed))
+}
+
+/// What a card commits to of a successor: the hash of its public key.
+fn commitment(successor: &IdentityKey) -> [u8; 32] {
+    Sha256::digest(successor.public()).into()
+}
+
+const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// A successor's seed as it is written down: Crockford base32, its 256
+/// bits in 52 characters, in groups of five.
+fn successor_code(seed: &[u8; 32]) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(62));
+    let mut push = |v: u32| {
+        if !out.is_empty() && out.len() % 6 == 5 {
+            out.push('-');
+        }
+        out.push(CROCKFORD[(v & 31) as usize] as char);
+    };
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &b in seed {
+        acc = (acc << 8) | u32::from(b);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            push(acc >> bits);
+        }
+        acc &= (1 << bits) - 1;
+    }
+    push(acc << (5 - bits));
+    out
+}
+
+/// A successor's code as typed back: case, spaces, hyphens and the
+/// Crockford confusables forgiven, as for a recovery code.
+fn parse_successor(typed: &str) -> Option<Zeroizing<[u8; 32]>> {
+    let mut seed = Zeroizing::new([0u8; 32]);
+    let (mut acc, mut bits, mut n, mut chars) = (0u32, 0u32, 0usize, 0usize);
+    for c in typed.chars().filter(|c| !matches!(c, ' ' | '-')) {
+        let c = match c.to_ascii_uppercase() {
+            'O' => '0',
+            'I' | 'L' => '1',
+            c => c,
+        };
+        let v = CROCKFORD
+            .iter()
+            .position(|&x| c.is_ascii() && x == c as u8)? as u32;
+        chars += 1;
+        if chars > 52 {
+            return None;
+        }
+        acc = (acc << 5) | v;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            if n < 32 {
+                seed[n] = (acc >> bits) as u8;
+            }
+            n += 1;
+            acc &= (1 << bits) - 1;
+        }
+    }
+    // 52 characters carry 260 bits: the last four are none of the seed's.
+    (chars == 52 && n == 32 && acc == 0).then_some(seed)
+}
+
+fn protocol(detail: &str) -> CoreError {
+    CoreError::Protocol {
+        detail: detail.into(),
+    }
+}
+
 fn refused(code: &str) -> CoreError {
     CoreError::Refused {
         code: code.into(),
@@ -92,6 +601,166 @@ mod tests {
         let cert = DeviceCert::parse(&minted.cert).unwrap();
         assert_eq!(cert.caps, Some(caps::LOGIN | caps::MESSAGE | caps::MANAGE));
         assert_eq!(cert.name.as_deref(), Some("Hexline"));
+    }
+
+    fn refused_as<T>(r: Result<T, CoreError>) -> String {
+        match r {
+            Err(CoreError::Refused { code, .. }) => code,
+            Err(e) => panic!("not a refusal: {e:?}"),
+            Ok(_) => panic!("not refused"),
+        }
+    }
+
+    fn text(code: Option<Vec<u8>>) -> String {
+        String::from_utf8(code.expect("a code to show")).unwrap()
+    }
+
+    #[test]
+    fn a_setups_card_commits_to_the_successor_its_code_writes_down() {
+        let setup = HolderSetup::new("Alice".into()).unwrap();
+        let code = text(setup.successor_code());
+        let successor = IdentityKey::from_seed(&parse_successor(&code).unwrap());
+        let card = Card::parse(&setup.card()).unwrap();
+        assert_eq!(card.successor, Some(commitment(&successor)));
+        assert_eq!(
+            Fingerprint::of(&card.identity).to_string(),
+            setup.fingerprint()
+        );
+    }
+
+    #[test]
+    fn a_successor_code_reads_back_as_written_and_as_paper_garbles_it() {
+        for seed in [[0u8; 32], [0xff; 32], *IdentityKey::generate().seed()] {
+            let code = successor_code(&seed);
+            assert_eq!(code.len(), 52 + 10, "{}", *code);
+            assert_eq!(*parse_successor(&code).unwrap(), seed);
+            let paper = code
+                .to_lowercase()
+                .replace('-', " ")
+                .replace('0', "o")
+                .replace('1', "l");
+            assert_eq!(*parse_successor(&paper).unwrap(), seed, "{paper}");
+        }
+        let code = successor_code(&[0x5a; 32]).replace('-', "");
+        let last = code.chars().last().unwrap();
+        let padded = format!(
+            "{}{}",
+            &code[..51],
+            CROCKFORD[CROCKFORD.iter().position(|&c| c == last as u8).unwrap() | 1] as char
+        );
+        for bad in [
+            &code[..51],
+            &format!("{code}0"),
+            &format!("U{}", &code[1..]),
+            &padded,
+        ] {
+            assert!(parse_successor(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn nothing_is_handed_out_until_both_codes_are_typed_back() {
+        let setup = HolderSetup::new("Alice".into()).unwrap();
+        assert_eq!(refused_as(setup.identity_seed()), "unconfirmed");
+        let successor = text(setup.successor_code());
+        let recovery = text(setup.recovery_code());
+        assert!(!setup.confirm_successor(recovery.clone().into_bytes()));
+        assert!(!setup.confirm_successor(successor_code(&[1; 32]).as_bytes().to_vec()));
+        assert!(!setup.confirm_recovery(successor.clone().into_bytes()));
+        assert!(!setup.confirm_recovery(RecoveryCode::generate().display().as_bytes().to_vec()));
+        assert!(setup.confirm_successor(successor.clone().into_bytes()));
+        assert_eq!(setup.successor_code(), None, "let go of once typed back");
+        assert!(
+            !setup.confirm_successor(successor.into_bytes()),
+            "and not asked again"
+        );
+        assert_eq!(
+            refused_as(setup.mint("Hexline".into())),
+            "unconfirmed",
+            "the successor alone"
+        );
+        assert!(setup.confirm_recovery(recovery.to_lowercase().replace('-', "").into_bytes()));
+        assert_eq!(setup.recovery_code(), None, "shown no more once typed back");
+        let seed = setup.identity_seed().unwrap();
+        assert_eq!(
+            IdentityKey::from_seed(&seed.as_slice().try_into().unwrap())
+                .fingerprint()
+                .to_string(),
+            setup.fingerprint()
+        );
+        assert_eq!(refused_as(setup.held()), "unminted");
+        let minted = setup.mint("Hexline".into()).unwrap();
+        let info = crate::identity::cert_for_device(minted.cert, setup.card(), minted.device_seed)
+            .unwrap();
+        assert_eq!(info.fingerprint, setup.fingerprint());
+        assert!(info.can_manage && !info.can_vouch);
+        setup.held().unwrap();
+    }
+
+    #[test]
+    fn a_resumed_setup_keeps_its_card_and_asks_a_new_recovery_code_alone() {
+        let first = HolderSetup::new("Alice".into()).unwrap();
+        let id = IdentityKey::generate();
+        let mut card = Card::new(&id, "Bob", now());
+        card.successor = Some([7; 32]);
+        let card = card.sign(&id, Vec::new()).unwrap();
+        let device = DeviceKey::generate();
+        let cert = certify(&id, &device, "Pixel").unwrap();
+        let resume = |seed: Vec<u8>, card: Vec<u8>, device: Vec<u8>, cert: Vec<u8>| {
+            HolderSetup::resume(seed, card, "reg.example".into(), "bob".into(), device, cert)
+        };
+        let ds = device.seed().to_vec();
+        let resumed = resume(id.seed().to_vec(), card.clone(), ds.clone(), cert.clone()).unwrap();
+        assert_eq!(resumed.card(), card);
+        assert_eq!(resumed.successor_code(), None);
+        assert_ne!(resumed.recovery_code(), first.recovery_code());
+        assert!(resumed.confirm_recovery(resumed.recovery_code().unwrap()));
+        assert_eq!(resumed.identity_seed().unwrap(), id.seed().to_vec());
+        let other = certify(&id, &DeviceKey::generate(), "Pixel").unwrap();
+        for (seed, card, device, cert, code) in [
+            (
+                id.seed().to_vec(),
+                first.card(),
+                ds.clone(),
+                cert.clone(),
+                "wrong_identity",
+            ),
+            (
+                id.seed()[..31].to_vec(),
+                card.clone(),
+                ds.clone(),
+                cert.clone(),
+                "bad_seed",
+            ),
+            (
+                id.seed().to_vec(),
+                b"not a card".to_vec(),
+                ds.clone(),
+                cert.clone(),
+                "bad_card",
+            ),
+            (
+                id.seed().to_vec(),
+                card.clone(),
+                ds.clone(),
+                other,
+                "bad_device",
+            ),
+        ] {
+            assert_eq!(refused_as(resume(seed, card, device, cert)), code);
+        }
+    }
+
+    #[test]
+    fn each_commit_signs_a_time_later_than_the_last_and_never_behind_the_clock() {
+        for (signed, now, want) in [
+            (0, 1000, 1000),
+            (1000, 1000, 1001),
+            (1001, 1000, 1002),
+            (900, 1000, 1000),
+        ] {
+            assert_eq!(later(signed, now), want, "{signed} at {now}");
+        }
     }
 
     #[test]

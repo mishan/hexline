@@ -94,32 +94,38 @@ impl Server {
 
     /// As [`Server::start`], with detached sessions kept `grace` seconds.
     pub async fn with_grace(accounts: &[&str], grace: u64) -> Server {
-        Server::launch(accounts, grace, None, false).await
+        Server::launch(accounts, grace, None, None).await
     }
 
     /// As [`Server::with_grace`], taking identity logins at the host it
     /// listens on and its proxy's: from any identity, registrar or none,
     /// made an account of its own when the client asks for one.
     pub async fn with_identity(accounts: &[&str], grace: u64) -> Server {
-        Server::launch(accounts, grace, Some(("allow", "create")), false).await
+        Server::launch(accounts, grace, Some(("allow", "create")), None).await
     }
 
     /// As [`Server::with_identity`], and a registrar at host `127.0.0.1`
     /// that anyone may register a handle at and that keeps envelopes.
     pub async fn with_registrar(accounts: &[&str]) -> Server {
-        Server::launch(accounts, 300, Some(("allow", "create")), true).await
+        Server::launch(accounts, 300, Some(("allow", "create")), Some(&[])).await
+    }
+
+    /// As [`Server::with_registrar`], its registrar taking a registration
+    /// only with one of `invites`.
+    pub async fn with_registrar_invites(invites: &[&str]) -> Server {
+        Server::launch(&[], 300, Some(("allow", "create")), Some(invites)).await
     }
 
     /// As [`Server::with_registrar`], under the default policy for an
     /// identity no registrar vouches for: a guest.
     pub async fn with_registrar_vouching(accounts: &[&str]) -> Server {
-        Server::launch(accounts, 300, Some(("guest", "create")), true).await
+        Server::launch(accounts, 300, Some(("guest", "create")), Some(&[])).await
     }
 
     /// As [`Server::with_identity`], under the default policy: an identity
     /// no registrar vouches for, or one with no account, logs in as a guest.
     pub async fn with_guest_identity(accounts: &[&str]) -> Server {
-        Server::launch(accounts, 300, Some(("guest", "guest")), false).await
+        Server::launch(accounts, 300, Some(("guest", "guest")), None).await
     }
 
     /// `identity` is the `unattested` and `new_accounts` policies.
@@ -127,7 +133,7 @@ impl Server {
         accounts: &[&str],
         grace: u64,
         identity: Option<(&str, &str)>,
-        registrar: bool,
+        registrar: Option<&[&str]>,
     ) -> Server {
         // A port found free is free only until it is bound: another test's
         // server may take it first. Each try is on fresh ports, and taken
@@ -146,14 +152,15 @@ impl Server {
     /// another test may have taken the same port: none if this one's hxd
     /// is not the one that answers there.
     pub async fn try_on(ng: u16) -> Option<Server> {
-        Server::try_launch(&[], 300, None, false, ng).await
+        Server::try_launch(&[], 300, None, None, ng).await
     }
 
     async fn try_launch(
         accounts: &[&str],
         grace: u64,
         identity: Option<(&str, &str)>,
-        registrar: bool,
+        // The invites it takes; none, and it takes anyone.
+        registrar: Option<&[&str]>,
         ng: u16,
     ) -> Option<Server> {
         let bin = std::env::var("HXD_BIN").expect(
@@ -191,7 +198,7 @@ impl Server {
                          unattested = \"{unattested}\"\nnew_accounts = \"{new_accounts}\"\n{}",
                         // Its own registrar's attestations, on the key that
                         // registrar publishes, fetched where it listens.
-                        if registrar {
+                        if registrar.is_some() {
                             format!(
                                 "trusted_registrars = [\"127.0.0.1\"]\n\
                                  registrar_urls = {{ \"127.0.0.1\" = \"http://127.0.0.1:{ng}\" }}\n"
@@ -201,12 +208,21 @@ impl Server {
                         }
                     ),
                     None => String::new(),
-                } + if registrar {
-                    "[registrar]\nhost = \"127.0.0.1\"\nkey = \"registrar.key\"\n\
-                     store = \"registrar.db\"\ninvites = \"invites\"\nsignup = \"open\"\n\
-                     envelopes = true\nenvelope_secret = \"envelope.secret\"\n"
-                } else {
-                    ""
+                } + &match registrar {
+                    Some(invites) => {
+                        std::fs::write(dir.join("invites"), invites.join("\n")).unwrap();
+                        format!(
+                            "[registrar]\nhost = \"127.0.0.1\"\nkey = \"registrar.key\"\n\
+                             store = \"registrar.db\"\ninvites = \"invites\"\n{}\
+                             envelopes = true\nenvelope_secret = \"envelope.secret\"\n",
+                            if invites.is_empty() {
+                                "signup = \"open\"\n"
+                            } else {
+                                "signup = \"proof\"\nproof = \"invite\"\n"
+                            }
+                        )
+                    }
+                    None => String::new(),
                 }
             ),
         )

@@ -1674,3 +1674,282 @@ async fn a_poll_the_link_drops_is_asked_again_under_the_same_request() {
     );
     assert!(enrolled.info.can_login && !enrolled.info.can_vouch);
 }
+
+/// A holder set up with both codes typed back, its device minted and held.
+fn confirmed_setup() -> (
+    Arc<hexline_core::HolderSetup>,
+    String,
+    hexline_core::HolderMinted,
+) {
+    let setup = hexline_core::HolderSetup::new("Carol".into()).unwrap();
+    assert!(setup.confirm_successor(setup.successor_code().unwrap()));
+    let recovery = String::from_utf8(setup.recovery_code().unwrap()).unwrap();
+    assert!(setup.confirm_recovery(recovery.clone().into_bytes()));
+    let minted = setup.mint("Pixel".into()).unwrap();
+    setup.held().unwrap();
+    (setup, recovery, minted)
+}
+
+/// The fingerprint `code` restores `handle` to, on a device whose card
+/// the registrar keeps, attested for it: as a phone with nothing but the
+/// code finds it.
+async fn restored_by(server: &Server, handle: &str, code: &str) -> Result<String, CoreError> {
+    use hexline_core::{restore_identity, SecretKind};
+    let restored = restore_identity(
+        server.http.clone(),
+        handle.into(),
+        SecretKind::RecoveryCode,
+        code.into(),
+        "Tablet".into(),
+    )
+    .await?;
+    assert!(!restored.new_card, "the registrar keeps the card");
+    assert!(restored.attested, "and attests it again");
+    Ok(restored.fingerprint)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_holder_made_on_the_phone_logs_in_attested_and_is_restored_by_its_recovery_code() {
+    use hexline_core::{holder_mint, restore_identity_to_hold, SecretKind};
+    let server = Server::with_registrar_vouching(&[]).await;
+    let (setup, recovery, minted) = confirmed_setup();
+    let (fingerprint, seed) = (setup.fingerprint(), setup.identity_seed().unwrap());
+    let committed = setup
+        .clone()
+        .commit(server.http.clone(), "carol".into(), None)
+        .await
+        .unwrap();
+    let card = hl_identity::Card::parse(&committed.card).unwrap();
+    assert_eq!(
+        card.successor,
+        hl_identity::Card::parse(&setup.card()).unwrap().successor
+    );
+    assert!(
+        card.successor.is_some(),
+        "the commitment kept on the attested card"
+    );
+    assert_eq!(
+        refused_as(&setup.identity_seed().unwrap_err()),
+        "committed",
+        "nothing kept once committed"
+    );
+
+    // Restored by a phone that has seen nothing but the code.
+    let paper = recovery.to_lowercase().replace('-', " ");
+    assert_eq!(
+        restored_by(&server, "carol", &paper).await.unwrap(),
+        fingerprint
+    );
+    let held = restore_identity_to_hold(
+        server.http.clone(),
+        "carol".into(),
+        SecretKind::RecoveryCode,
+        recovery,
+        "Tablet".into(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(held.identity_seed, seed);
+    holder_mint(held.identity_seed, held.device.card, "Tablet".into()).unwrap();
+
+    let conn = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
+    let device = DeviceIdentity {
+        device_seed: minted.device_seed,
+        cert: minted.cert,
+        card: committed.card,
+    };
+    let login = conn.login_identity(device, true, None, None).await.unwrap();
+    assert_eq!(login.fingerprint, Some(fingerprint));
+    assert_eq!(
+        login.outcome.as_deref(),
+        Some("created"),
+        "attested: {login:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_registrar_holds_the_successor_a_setup_commits_to() {
+    use hl_identity::{IdentityKey, RegisterRequest};
+    let server = Server::with_registrar(&[]).await;
+    let (setup, ..) = confirmed_setup();
+    let seed: [u8; 32] = setup.identity_seed().unwrap().try_into().unwrap();
+    setup
+        .commit(server.http.clone(), "gina".into(), None)
+        .await
+        .unwrap();
+    let id = IdentityKey::from_seed(&seed);
+    let request = RegisterRequest {
+        identity: id.public(),
+        registrar: "127.0.0.1".into(),
+        handle: "gina".into(),
+        time: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 2,
+        successor: Some([9; 32]),
+        proof: None,
+    }
+    .sign(&id)
+    .unwrap();
+    use base64::Engine;
+    let http = hxng_client::auth::http_client(&server.http, None).unwrap();
+    let e = hxng_client::auth::post(
+        &http,
+        &format!("{}/registrar/register", server.http),
+        Some(serde_json::json!({
+            "request": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(request)
+        })),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused_as(&CoreError::from(e)), "successor_mismatch");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handle_taken_leaves_the_codes_to_commit_another() {
+    let server = Server::with_registrar(&[]).await;
+    let (first, ..) = confirmed_setup();
+    first
+        .commit(server.http.clone(), "dave".into(), None)
+        .await
+        .unwrap();
+    let (second, recovery, _) = confirmed_setup();
+    let taken = second
+        .clone()
+        .commit(server.http.clone(), "dave".into(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(refused_as(&taken), "handle_taken");
+    let fingerprint = second.fingerprint();
+    second
+        .commit(server.http.clone(), "dave2".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        restored_by(&server, "dave2", &recovery).await.unwrap(),
+        fingerprint
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_setup_registered_and_cut_short_is_committed_again_as_its_handle_alone() {
+    let server = Server::with_registrar_invites(&["let-me-in"]).await;
+    let (setup, recovery, _) = confirmed_setup();
+    setup.fail_after_registering();
+    let e = setup
+        .clone()
+        .commit(
+            server.http.clone(),
+            "hana".into(),
+            Some(" let-me-in ".into()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused_as(&e), "registered_not_backed_up");
+    let other = setup
+        .clone()
+        .commit(server.http.clone(), "hana2".into(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(refused_as(&other), "registered_as");
+    // The invite is spent: asked again, the handle is not registered again.
+    let fingerprint = setup.fingerprint();
+    setup
+        .commit(server.http.clone(), "hana".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        restored_by(&server, "hana", &recovery).await.unwrap(),
+        fingerprint
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_setup_the_process_ended_in_is_committed_again_and_only_its_new_recovery_code_restores() {
+    use hexline_core::HolderSetup;
+    let server = Server::with_registrar(&[]).await;
+    let (setup, first_code, minted) = confirmed_setup();
+    // What the phone kept before the commit, as a process that ended
+    // after it committed would find it.
+    let (seed, card) = (setup.identity_seed().unwrap(), setup.card());
+    setup
+        .commit(server.http.clone(), "erin".into(), None)
+        .await
+        .unwrap();
+    let resumed = HolderSetup::resume(
+        seed,
+        card,
+        server.http.clone(),
+        "erin".into(),
+        minted.device_seed,
+        minted.cert,
+    )
+    .unwrap();
+    assert_eq!(resumed.successor_code(), None);
+    let code = String::from_utf8(resumed.recovery_code().unwrap()).unwrap();
+    assert!(resumed.confirm_recovery(code.clone().into_bytes()));
+    let elsewhere = resumed
+        .clone()
+        .commit(server.http.clone(), "erin2".into(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(refused_as(&elsewhere), "registered_as");
+    // In the second the process before signed in, as a restart may be.
+    resumed
+        .clone()
+        .commit(server.http.clone(), "erin".into(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        restored_by(&server, "erin", &code).await.unwrap(),
+        resumed.fingerprint()
+    );
+    assert_eq!(
+        refused_as(&restored_by(&server, "erin", &first_code).await.unwrap_err()),
+        "not_found"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registrar_that_wants_an_invite_registers_only_with_one() {
+    let server = Server::with_registrar_invites(&["let-me-in"]).await;
+    let (setup, ..) = confirmed_setup();
+    for (invite, want) in [(None, "proof_required"), (Some("wrong"), "proof_invalid")] {
+        let e = setup
+            .clone()
+            .commit(server.http.clone(), "frank".into(), invite.map(Into::into))
+            .await
+            .unwrap_err();
+        assert_eq!(refused_as(&e), want, "{invite:?}");
+    }
+    setup
+        .commit(
+            server.http.clone(),
+            "frank".into(),
+            Some("let-me-in".into()),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_commit_asks_nothing_before_both_codes_are_typed_back_and_the_seed_is_held() {
+    let setup = hexline_core::HolderSetup::new("Carol".into()).unwrap();
+    // Nothing listens here: a commit that asked it would be a connect error.
+    let nowhere = || "http://127.0.0.1:9".to_string();
+    let e = setup
+        .clone()
+        .commit(nowhere(), "carol".into(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(refused_as(&e), "unconfirmed");
+    assert!(setup.confirm_successor(setup.successor_code().unwrap()));
+    assert!(setup.confirm_recovery(setup.recovery_code().unwrap()));
+    setup.mint("Pixel".into()).unwrap();
+    let e = setup
+        .commit(nowhere(), "carol".into(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(refused_as(&e), "unheld");
+}
