@@ -463,6 +463,8 @@ class ChatViewModel internal constructor(
                     if (seed != null && holdWith != null && !held.hold(device.fingerprint, seed, holdWith)) {
                         Restoring.NotHeld(device.fingerprint)
                     } else {
+                        // Shown as held once it is.
+                        if (seed != null) withContext(store) { publishIdentities() }
                         Restoring.Done(device.fingerprint)
                     }
                 } catch (e: CoreException) {
@@ -638,20 +640,25 @@ class ChatViewModel internal constructor(
         if (renewal.value == Renewing.Working) return
         renewal.value = Renewing.Working
         viewModelScope.launch {
+            // Kept where a cancellation before the read returns cannot lose it, and wiped however this ends.
+            var deviceSeed: ByteArray? = null
             renewal.value =
-                keeping(Renewing::Failed) {
-                    val (kept, deviceSeed) = withContext(store) { identities.device(fingerprint) } ?: return@keeping Renewing.Idle
-                    val cert =
-                        try {
-                            held.use(fingerprint, authorizer) { seed -> setups.renew(seed, kept.card, deviceSeed, kept.cert) }
-                        } finally {
-                            deviceSeed.fill(0)
-                        } ?: return@keeping Renewing.Idle
-                    withContext(store) {
-                        identities.renewed(fingerprint, cert)
-                        publishIdentities()
+                try {
+                    keeping(Renewing::Failed) {
+                        val kept =
+                            withContext(store) { identities.device(fingerprint)?.also { deviceSeed = it.second } }?.first
+                                ?: return@keeping Renewing.Idle
+                        val device = checkNotNull(deviceSeed)
+                        val cert =
+                            held.use(fingerprint, authorizer) { seed -> setups.renew(seed, kept.card, device, kept.cert) }
+                                ?: return@keeping Renewing.Idle
+                        // Only in place of the certificate it began from: one installed meanwhile stands.
+                        withContext(store) { identities.renewed(fingerprint, cert, replacing = kept.cert)?.also { publishIdentities() } }
+                            ?: return@keeping Renewing.Idle
+                        Renewing.Done(fingerprint)
                     }
-                    Renewing.Done(fingerprint)
+                } finally {
+                    deviceSeed?.fill(0)
                 }
         }
     }
@@ -678,7 +685,15 @@ class ChatViewModel internal constructor(
                     try {
                         val at = servers.generation()
                         withContext(store) {
-                            identities.save(minted.deviceSeed, minted.cert, kept.card, kept.handle, kept.registrar, kept.mailbox)
+                            identities.save(
+                                minted.deviceSeed,
+                                minted.cert,
+                                kept.card,
+                                kept.handle,
+                                kept.registrar,
+                                kept.mailbox,
+                                unfinished = kept.unfinished,
+                            )
                             servers.forgetRefusalsOf(kept.info.device, at)
                             publishRefusals()
                             publishIdentities()

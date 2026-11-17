@@ -33,23 +33,23 @@ pub async fn backup_passphrase(
     if passphrase.trim().chars().count() < MIN_PASSPHRASE {
         return Err(refused("bad_passphrase"));
     }
-    crate::connection::RUNTIME
-        .spawn(async move {
-            let id = identity(&seed)?;
-            let (envelope, keys) = tokio::task::block_in_place(|| {
-                KeyEnvelope::seal(&id, &Secret::Passphrase(&passphrase))
-            })
-            .map_err(|e| protocol(&format!("sealing: {e}")))?;
-            drop(passphrase);
-            put(
-                &registrar,
-                |host, time| EnvelopePut::store(&id, host, time, &envelope, &keys),
-                "stored",
-            )
-            .await
+    let id = identity(&seed)?;
+    let turn = Turn::begin(&id);
+    Aborting(crate::connection::RUNTIME.spawn(async move {
+        let (envelope, keys) = tokio::task::block_in_place(|| {
+            KeyEnvelope::seal(&id, &Secret::Passphrase(&passphrase))
         })
+        .map_err(|e| protocol(&format!("sealing: {e}")))?;
+        drop(passphrase);
+        put(
+            &registrar,
+            &turn,
+            |host, time| EnvelopePut::store(&id, host, time, &envelope, &keys),
+            "stored",
+        )
         .await
-        .unwrap_or_else(|_| Err(protocol("the backup stopped")))
+    }))
+    .await
 }
 
 /// Removes `identity_seed`'s backup of `kind` at `registrar`: done as well
@@ -60,23 +60,22 @@ pub async fn backup_delete(
     registrar: String,
     kind: SecretKind,
 ) -> Result<(), CoreError> {
-    let seed = Zeroizing::new(identity_seed);
-    crate::connection::RUNTIME
-        .spawn(async move {
-            let id = identity(&seed)?;
-            let kind = match kind {
-                SecretKind::Passphrase => Kind::Passphrase,
-                SecretKind::RecoveryCode => Kind::RecoveryCode,
-            };
-            put(
-                &registrar,
-                |host, time| EnvelopePut::delete(&id, host, kind, time),
-                "deleted",
-            )
-            .await
-        })
+    let id = identity(&Zeroizing::new(identity_seed))?;
+    let turn = Turn::begin(&id);
+    Aborting(crate::connection::RUNTIME.spawn(async move {
+        let kind = match kind {
+            SecretKind::Passphrase => Kind::Passphrase,
+            SecretKind::RecoveryCode => Kind::RecoveryCode,
+        };
+        put(
+            &registrar,
+            &turn,
+            |host, time| EnvelopePut::delete(&id, host, kind, time),
+            "deleted",
+        )
         .await
-        .unwrap_or_else(|_| Err(protocol("the backup stopped")))
+    }))
+    .await
 }
 
 /// The shortest passphrase a backup is sealed by, in characters: what an
@@ -150,32 +149,29 @@ impl RecoveryCodeSetup {
         identity_seed: Vec<u8>,
         registrar: String,
     ) -> Result<(), CoreError> {
-        let seed = Zeroizing::new(identity_seed);
-        crate::connection::RUNTIME
-            .spawn(async move {
-                let id = identity(&seed)?;
-                let (envelope, keys) = {
-                    let s = self.lock();
-                    let code = s.code.as_ref().ok_or_else(|| refused("committed"))?;
-                    if !s.confirmed {
-                        return Err(refused("unconfirmed"));
-                    }
-                    tokio::task::block_in_place(|| {
-                        KeyEnvelope::seal(&id, &Secret::RecoveryCode(code))
-                    })
+        let id = identity(&Zeroizing::new(identity_seed))?;
+        let turn = Turn::begin(&id);
+        Aborting(crate::connection::RUNTIME.spawn(async move {
+            let (envelope, keys) = {
+                let s = self.lock();
+                let code = s.code.as_ref().ok_or_else(|| refused("committed"))?;
+                if !s.confirmed {
+                    return Err(refused("unconfirmed"));
+                }
+                tokio::task::block_in_place(|| KeyEnvelope::seal(&id, &Secret::RecoveryCode(code)))
                     .map_err(|e| protocol(&format!("sealing: {e}")))?
-                };
-                put(
-                    &registrar,
-                    |host, time| EnvelopePut::store(&id, host, time, &envelope, &keys),
-                    "stored",
-                )
-                .await?;
-                self.lock().code = None;
-                Ok(())
-            })
-            .await
-            .unwrap_or_else(|_| Err(protocol("the backup stopped")))
+            };
+            put(
+                &registrar,
+                &turn,
+                |host, time| EnvelopePut::store(&id, host, time, &envelope, &keys),
+                "stored",
+            )
+            .await?;
+            self.lock().code = None;
+            Ok(())
+        }))
+        .await
     }
 }
 
@@ -212,6 +208,7 @@ pub(crate) fn signing_time() -> u64 {
 /// envelopes, its answer holding `answered: true`.
 async fn put(
     registrar: &str,
+    turn: &Turn,
     sign: impl FnOnce(&str, u64) -> Result<Vec<u8>, hl_identity::Error>,
     answered: &str,
 ) -> Result<(), CoreError> {
@@ -219,12 +216,71 @@ async fn put(
     let http = auth::http_client(base.as_str(), None)?;
     let reg = discovered(&http, &base).await?;
     let envelopes = endpoint(&base, &reg.envelopes)?;
+    // Asked last before signing: a put signed after a newer backup began
+    // would replace what that one saved.
+    if !turn.current() {
+        return Err(refused("superseded"));
+    }
     let request = sign(&reg.host, signing_time()).map_err(|e| protocol(&e.to_string()))?;
     let reply = auth::put(&http, &envelopes, json!({ "request": b64(&request) })).await?;
     if reply.get(answered).and_then(Value::as_bool) != Some(true) {
         return Err(protocol(&format!("the registrar did not say {answered}")));
     }
     Ok(())
+}
+
+/// Each identity's backup operations, in the order they were asked for: a
+/// later one supersedes any begun before it that has not yet signed, from
+/// whichever of the app's screens it came.
+struct Turn {
+    identity: [u8; 32],
+    number: u64,
+}
+
+static TURNS: Mutex<Option<std::collections::HashMap<[u8; 32], u64>>> = Mutex::new(None);
+
+impl Turn {
+    fn begin(id: &IdentityKey) -> Turn {
+        let mut turns = TURNS.lock().unwrap_or_else(|e| e.into_inner());
+        let number = turns
+            .get_or_insert_with(Default::default)
+            .entry(id.public())
+            .or_default();
+        *number += 1;
+        Turn {
+            identity: id.public(),
+            number: *number,
+        }
+    }
+
+    /// Whether no backup of the identity was begun after this one.
+    fn current(&self) -> bool {
+        let turns = TURNS.lock().unwrap_or_else(|e| e.into_inner());
+        turns.as_ref().and_then(|t| t.get(&self.identity)) == Some(&self.number)
+    }
+}
+
+/// A backup's work on the core's runtime, aborted if the app stops waiting
+/// for it: a put it gave up on is not sent.
+struct Aborting(tokio::task::JoinHandle<Result<(), CoreError>>);
+
+impl std::future::Future for Aborting {
+    type Output = Result<(), CoreError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0)
+            .poll(cx)
+            .map(|done| done.unwrap_or_else(|_| Err(protocol("the backup stopped"))))
+    }
+}
+
+impl Drop for Aborting {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn identity(seed: &[u8]) -> Result<IdentityKey, CoreError> {
@@ -242,5 +298,35 @@ fn refused(code: &str) -> CoreError {
 fn protocol(detail: &str) -> CoreError {
     CoreError::Protocol {
         detail: detail.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_backup_begun_later_supersedes_one_begun_before_it_and_no_other_identitys() {
+        let (alice, bob) = (IdentityKey::generate(), IdentityKey::generate());
+        let first = Turn::begin(&alice);
+        let theirs = Turn::begin(&bob);
+        assert!(first.current());
+        let second = Turn::begin(&alice);
+        assert!(!first.current(), "superseded");
+        assert!(second.current() && theirs.current());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_backup_given_up_on_does_not_go_on() {
+        let sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = sent.clone();
+        let work = Aborting(crate::connection::RUNTIME.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        }));
+        drop(work);
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(!sent.load(Ordering::SeqCst));
     }
 }

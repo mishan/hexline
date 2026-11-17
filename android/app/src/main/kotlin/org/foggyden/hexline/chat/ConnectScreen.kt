@@ -48,6 +48,7 @@ import kotlinx.coroutines.delay
 import org.foggyden.hexline.R
 import org.foggyden.hexline.core.CertInfo
 import org.foggyden.hexline.core.ClassicLogin
+import org.foggyden.hexline.core.HeldRenewal
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.coreVersion
 import org.foggyden.hexline.identity.BackingUp
@@ -154,10 +155,10 @@ fun ConnectFlow(
                 when {
                     held != null ->
                         when (heldRenewal(held, refusals)) {
-                            HeldRenewal.Renew -> setup?.renew(held.fingerprint)
-                            HeldRenewal.NewDevice -> setup?.newDevice(held.fingerprint)
+                            HeldRenewal.RENEW -> setup?.renew(held.fingerprint)
+                            HeldRenewal.NEW_DEVICE -> setup?.newDevice(held.fingerprint)
                             // Rotated away: nothing to renew, and no button offers it.
-                            HeldRenewal.None -> {}
+                            HeldRenewal.NOTHING -> {}
                         }
                     renewing?.mailbox != null -> onStartEnroll(renewing.fingerprint)
                     else -> {
@@ -260,7 +261,7 @@ private fun ConnectScreen(
                 } ?: stringResource(R.string.no_holder_banner, named(kept)).takeIf { kept.noHolder } ?: continue
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(banner, Modifier.weight(1f), color = MaterialTheme.colorScheme.error)
-                if (!kept.held || heldRenewal(kept, refusals) != HeldRenewal.None) {
+                if (!kept.held || heldRenewal(kept, refusals) != HeldRenewal.NOTHING) {
                     TextButton({ onRestore(kept) }) { Text(stringResource(R.string.renew)) }
                 }
             }
@@ -339,7 +340,7 @@ private fun ConnectScreen(
                     Row {
                         // Offered whatever a server said: a new device is the way back.
                         if ((standing != Standing.Good || refusedHere != null) &&
-                            (!kept.held || heldRenewal(kept, refusals) != HeldRenewal.None)
+                            (!kept.held || heldRenewal(kept, refusals) != HeldRenewal.NOTHING)
                         ) {
                             TextButton({ onRestore(kept) }) { Text(stringResource(R.string.renew)) }
                         }

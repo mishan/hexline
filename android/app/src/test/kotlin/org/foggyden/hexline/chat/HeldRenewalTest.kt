@@ -1,6 +1,7 @@
 package org.foggyden.hexline.chat
 
 import android.app.Application
+import org.foggyden.hexline.core.HeldRenewal
 import org.foggyden.hexline.core.certForDevice
 import org.foggyden.hexline.core.holderMint
 import org.foggyden.hexline.core.newIdentity
@@ -28,11 +29,11 @@ class HeldRenewalTest {
     fun aHeldIdentityIsRenewedAsItsDeviceOnlyWhereNoServerHasRefusedThatDevice() {
         val key = refusalKey(server, kept.info.device)
         for ((refusals, want) in listOf(
-            emptyMap<String, String>() to HeldRenewal.Renew,
-            mapOf(refusalKey(server, byteArrayOf(1, 2, 3)) to "revoked") to HeldRenewal.Renew,
-            mapOf(key to "revoked") to HeldRenewal.NewDevice,
-            mapOf(key to "rotated") to HeldRenewal.None,
-            mapOf(key to "revoked", refusalKey(other, kept.info.device) to "rotated") to HeldRenewal.None,
+            emptyMap<String, String>() to HeldRenewal.RENEW,
+            mapOf(refusalKey(server, byteArrayOf(1, 2, 3)) to "revoked") to HeldRenewal.RENEW,
+            mapOf(key to "revoked") to HeldRenewal.NEW_DEVICE,
+            mapOf(key to "rotated") to HeldRenewal.NOTHING,
+            mapOf(key to "revoked", refusalKey(other, kept.info.device) to "rotated") to HeldRenewal.NOTHING,
         )) {
             assertEquals("$refusals", want, heldRenewal(kept, refusals))
         }

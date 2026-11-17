@@ -102,6 +102,31 @@ pub fn holder_renew(
     certify(&id, &device, info.name.as_deref().unwrap_or("Hexline"))
 }
 
+/// What Renew does for an identity this phone holds, by what servers said
+/// of its device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum HeldRenewal {
+    /// Certify the same device again.
+    Renew,
+    /// A server revoked the device: a new one, by the key held here.
+    NewDevice,
+    /// The identity was rotated away: nothing this key certifies is taken.
+    Nothing,
+}
+
+/// [`HeldRenewal`] for a device the servers refused with `refused`, the
+/// codes of its refusals alone: `rotated` before any other.
+#[uniffi::export]
+pub fn held_renewal(refused: Vec<String>) -> HeldRenewal {
+    if refused.iter().any(|code| code == "rotated") {
+        HeldRenewal::Nothing
+    } else if refused.is_empty() {
+        HeldRenewal::Renew
+    } else {
+        HeldRenewal::NewDevice
+    }
+}
+
 /// A holder's identity being made (design §2.1): its key, the successor
 /// its card commits to and its recovery code, all kept here alone until
 /// the person has typed both codes back. Then the app holds the seed

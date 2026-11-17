@@ -567,4 +567,34 @@ class HolderSetupFlowTest : ViewModelHarness() {
         assertEquals("pixel", "Pixel", now.info.name)
         assertEquals("its refusal let go of", emptyMap<String, String>(), outside { servers.refusals() })
     }
+
+    @Test
+    fun anUnfinishedSetupWhoseDeviceIsReplacedIsStillToBeFinished() {
+        val vm = model()
+        settle()
+        val setup = throughTheCodes(vm)
+        setup.answers += CoreException.Connect("unreachable")
+        vm.holdSetup(stores.keys.authorizer())
+        settle()
+        vm.newDeviceHeld(setup.fingerprint(), stores.keys.authorizer())
+        settle()
+        assertEquals(Renewing.Done(setup.fingerprint()), vm.renewing.value)
+        assertTrue("still to be finished", keptIdentities().single().unfinished)
+    }
+
+    @Test
+    fun anIdentityRestoredToHoldIsShownAsHeld() {
+        val identity = newIdentity("Dana")
+        setups.restores = identity
+        val vm = model()
+        settle()
+        vm.restore("reg.example", "dana", SecretKind.RECOVERY_CODE, "code", "Pixel", stores.keys.authorizer())
+        settle()
+        assertTrue(
+            "held",
+            vm.identityList.value
+                .single()
+                .held,
+        )
+    }
 }

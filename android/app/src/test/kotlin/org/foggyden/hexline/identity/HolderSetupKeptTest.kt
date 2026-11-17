@@ -9,6 +9,8 @@ import org.foggyden.hexline.secrets.Secrets
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -90,6 +92,15 @@ class HolderSetupKeptTest {
         val read = identities().list().single()
         assertEquals(1_000L, read.renewTried)
         assertTrue(read.noHolder)
+    }
+
+    @Test
+    fun aRenewalBegunFromACertificateNoLongerKeptWritesNothing() {
+        val (made, kept) = keptUnfinished()
+        val other = holderMint(made.seed, made.card, "Pixel").cert
+        assertNull(identities().renewed(kept.fingerprint, kept.cert, replacing = other))
+        assertArrayEquals(kept.cert, identities().list().single().cert)
+        assertNotNull(identities().renewed(kept.fingerprint, kept.cert, replacing = kept.cert))
     }
 
     @Test

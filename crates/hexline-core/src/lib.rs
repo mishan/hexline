@@ -19,8 +19,8 @@ pub use connection::{
 };
 pub use enroll::{card_name, enrollment_code, newer_card, renewal_due, Enrolled, Enrollee};
 pub use holder::{
-    check_device_name, check_holder_registrar, holder_mint, holder_renew, new_identity,
-    HolderCommitted, HolderMinted, HolderSetup, NewIdentity,
+    check_device_name, check_holder_registrar, held_renewal, holder_mint, holder_renew,
+    new_identity, HeldRenewal, HolderCommitted, HolderMinted, HolderSetup, NewIdentity,
 };
 pub use identity::{
     cert_for_device, cert_info, cert_time, new_device, CertInfo, CertTime, NewDevice,

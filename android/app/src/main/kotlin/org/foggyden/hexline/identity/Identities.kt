@@ -208,19 +208,21 @@ class Identities(
         }
 
     /**
-     * [fingerprint]'s device certified again: [cert] in place of the one
-     * kept, and no renewal through a mailbox tried since; as it was in all
-     * else. Throws the core's refusal if it is
-     * not that device's under the identity's card; null if the identity is
-     * no longer kept.
+     * [fingerprint]'s device certified again: [cert] in place of
+     * [replacing], the certificate the renewal began from, and no renewal
+     * through a mailbox tried since; as it was in all else. Throws the
+     * core's refusal if it is not that device's under the identity's card;
+     * null, writing nothing, if the identity is no longer kept or another
+     * certificate has taken [replacing]'s place since.
      */
     fun renewed(
         fingerprint: String,
         cert: ByteArray,
+        replacing: ByteArray,
     ): StoredIdentity? =
         synchronized(LOCK) {
             val file = file(fingerprint)
-            val stored = load(file) ?: return null
+            val stored = load(file)?.takeIf { it.cert.contentEquals(replacing) } ?: return null
             val info = certInfo(cert, stored.card, stored.info.device, stored.info.deviceEnc)
             StoredIdentity(
                 stored.handle,
