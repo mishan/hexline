@@ -163,7 +163,11 @@ async fn restore(
 /// The phone's certificate: login, messages and managing, no vouch, since
 /// the identity key that could is not kept (design §8); as long as
 /// recommended, and read back as a server will read it.
-fn certify(id: &IdentityKey, device: &DeviceKey, name: &str) -> Result<Vec<u8>, CoreError> {
+pub(crate) fn certify(
+    id: &IdentityKey,
+    device: &DeviceKey,
+    name: &str,
+) -> Result<Vec<u8>, CoreError> {
     let mut cert =
         DeviceCert::for_keys(id, device.public(), device.public_enc(), issued(), LIFETIME)
             .map_err(|e| protocol(&e.to_string()))?;

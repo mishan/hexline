@@ -169,7 +169,7 @@ two implementations. Instead:
 | Secret | Wrapped by | Unwrapped when |
 |---|---|---|
 | Device signing + X25519 seeds, session tokens, saved passwords, push keys (RFC 8291 P-256 key and auth secret, per server), push `devid`s | **Key A**: Keystore AES-256-GCM in the TEE (StrongBox is too slow and too often busy for the push path), blobs in credential-encrypted storage, *no* `setUnlockedDeviceRequired` and no per-use auth — usable after first unlock, so a push woken on a locked phone can decrypt and a background reconnect can authenticate | When needed; device seeds held in Rust memory (`zeroize`) for the process |
-| Identity seed (holder mode) | **Key B**: per-use user auth. API 30+: `setUserAuthenticationParameters(0, BIOMETRIC_STRONG or DEVICE_CREDENTIAL)` with a `CryptoObject`. API 29, where a credential cannot authorize a per-use key: a 15-second validity window confirmed by `BiometricPrompt` with device credential allowed. `setInvalidatedByBiometricEnrollment(false)` — adding a fingerprint must not destroy the identity | Per operation — mint, card, revoke, rotate, envelope put — then zeroized |
+| Identity seed (holder mode) | **Key B**, one per held identity: per-use user auth, `setUserAuthenticationParameters(0, BIOMETRIC_STRONG or DEVICE_CREDENTIAL)` with a `CryptoObject` through `androidx.biometric`'s prompt; in StrongBox where the phone has one (used seldom, by a person who can wait), else the TEE, and never in software in a release build. `setInvalidatedByBiometricEnrollment(false)` -- adding a fingerprint must not destroy the identity. Holder mode needs API 30+: on API 29 a credential cannot authorize a per-use key, so those phones keep envelope and enrolled modes | Per operation — mint, card, revoke, rotate, envelope put — then zeroized |
 | Successor seed | **Never on the phone.** Generated, shown once as a code (Crockford base32, groups of five) or saved to a file the user picks, confirmed by re-entry, then zeroized. Only its hash is committed | At rotation, typed back in |
 | Recovery code | Never stored. It wraps the identity seed in an §9.1 envelope; the envelope goes to the registrar when it serves envelopes and otherwise to a file the user saves off the phone | At recovery |
 
@@ -187,9 +187,26 @@ copy when the login is done, but not the copy in the JSON body it builds
 for the auth request, and the HTTP client's buffers are out of its reach.
 A seed crossing the FFI either way (`Enrollee::seed`, a login's device)
 also passes through a uniffi `RustBuffer` that is freed and not wiped.
+The same holds for an identity seed in holder mode: made by
+`new_identity` and handed to `holder_mint` per operation, it crosses in
+a buffer freed unwiped each way, beside the copy each side makes; the
+core keeps its own copy in `Zeroizing` and never hands the identity
+seed back, so what crosses is one copy out at creation and one in per
+use. Accepted, as for device seeds.
 Backups: `android:allowBackup="false"` and `dataExtractionRules`
 excluding everything; a Keystore key never leaves the device anyway, so
 a backed-up blob would be undecryptable.
+
+**No screen lock, or one removed.** Without a secure screen lock there is
+no Key B, so holder mode is refused with a message to set one, and
+envelope and enrolled modes are offered. Removing the lock later ends
+every Key B for good: at start and on coming to the front the app finds
+that and demotes the identity to a device alone here (as if restored by
+envelope: the device seed under Key A keeps working, and renewal goes as
+an envelope or enrolled device's), with a notice until the person has
+read it. Holding it again is setting a lock and restoring from the
+recovery code or the passphrase, which wraps the seed under a new Key B.
+There is no half-held identity.
 
 **Losing the phone.** Holder mode makes the phone the worst-case asset
 (threat model, "stolen identity key"). Mitigations Hexline enforces in
@@ -390,7 +407,7 @@ Slices, in order:
    capabilities the device has. Screens that need `manage` come with 6c.
 5. **Enrolled-device mode** by typed code. A QR scanner (ZXing core,
    Apache-2.0) comes later.
-6. **Holder mode:** 6a Key B behind a per-use prompt; 6b creation with
+6. **Holder mode** (API 30+): 6a Key B behind a per-use prompt; 6b creation with
    the successor and recovery codes; 6c self-renewal and revoking lost
    devices.
 
@@ -446,3 +463,24 @@ typed-code ceremony:
   request and bundle objects, rather than `hlid` driven by its stdin: it
   answers, denies, answers for another device, and stands by, with no
   second binary for CI to install.
+
+Slice 6 holder mode, decided 2026-11-16:
+
+- **Key B** is one Keystore key per held identity, in StrongBox where the
+  phone has one and the TEE otherwise (§2.2), each use allowed by
+  `androidx.biometric`'s prompt, BIOMETRIC_STRONG or DEVICE_CREDENTIAL.
+- **API 30+ only.** API 29 phones keep envelope and enrolled modes; there
+  is no validity-window path.
+- **No screen lock**: holder mode is refused with a message to set one,
+  and envelope and enrolled modes are offered.
+- **No secure hardware**: where Key B would be software-backed, a release
+  build refuses holder mode, deletes the key it made, and offers envelope
+  and enrolled modes. A debug build allows it (`BuildConfig.DEBUG`), so
+  the emulator, whose KeyMint is software, can still drive the real
+  prompt.
+- **A screen lock removed** demotes the identity to a device alone, with
+  a notice until read (§2.2); holding it again is restoring by recovery
+  code or passphrase under a new Key B.
+- **6a's entry point** (hold a throwaway identity, mint this phone's
+  device from it) lives in the debug source set and is not compiled into
+  other builds.

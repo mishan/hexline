@@ -5,6 +5,7 @@ import android.app.Application
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import androidx.lifecycle.AndroidViewModel
@@ -14,6 +15,7 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -21,6 +23,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.foggyden.hexline.BuildConfig
 import org.foggyden.hexline.core.ClassicLogin
 import org.foggyden.hexline.core.Connection
 import org.foggyden.hexline.core.CoreException
@@ -39,6 +42,7 @@ import org.foggyden.hexline.core.refusalLasts
 import org.foggyden.hexline.core.restoreIdentity
 import org.foggyden.hexline.identity.EnrollProblem
 import org.foggyden.hexline.identity.Enrolling
+import org.foggyden.hexline.identity.HeldSeeds
 import org.foggyden.hexline.identity.Identities
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
@@ -48,12 +52,15 @@ import org.foggyden.hexline.identity.enrollProblem
 import org.foggyden.hexline.identity.restoreProblem
 import org.foggyden.hexline.identity.standing
 import org.foggyden.hexline.identity.usable
+import org.foggyden.hexline.secrets.KeystoreHolderKeys
+import org.foggyden.hexline.secrets.NoHolderKeys
 import org.foggyden.hexline.secrets.SecretUnavailable
 import org.foggyden.hexline.servers.SavedServers
 import org.foggyden.hexline.servers.Server
 import org.foggyden.hexline.servers.SignIn
 import org.foggyden.hexline.servers.StoreQueue
 import org.foggyden.hexline.servers.stored
+import java.io.File
 import java.io.IOException
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -71,6 +78,8 @@ class ChatViewModel internal constructor(
     app: Application,
     private val servers: SavedServers,
     private val identities: Identities,
+    /** The identity seeds this phone holds, whose keys are checked each time the app comes to the front. */
+    private val held: HeldSeeds,
     /**
      * Where every read and write of [servers] and [identities] this makes
      * is made. A forget or a delete lets go of what it names on the main
@@ -99,6 +108,12 @@ class ChatViewModel internal constructor(
         app,
         SavedServers(app),
         Identities(app),
+        HeldSeeds(
+            File(app.filesDir, "held"),
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) KeystoreHolderKeys(app) else NoHolderKeys,
+            Dispatchers.IO,
+            softwareKeys = BuildConfig.DEBUG,
+        ),
         StoreQueue.process,
         ::coreConnection,
         ::coreEnrollment,
@@ -127,6 +142,15 @@ class ChatViewModel internal constructor(
 
     /** The identities this phone is a device of. */
     val identityList: StateFlow<List<StoredIdentity>> = kept
+
+    private val heldLost = MutableStateFlow<List<String>>(emptyList())
+
+    /**
+     * Identities this phone held and holds no longer, their key gone with
+     * the screen lock: each a device alone here now, until the person has
+     * read why.
+     */
+    val heldLostNotices: StateFlow<List<String>> = heldLost
 
     private val refused = MutableStateFlow<Map<String, String>>(emptyMap())
 
@@ -289,6 +313,8 @@ class ChatViewModel internal constructor(
             val found =
                 withContext(store) {
                     publishIdentities()
+                    held.sweep()
+                    demoteHeld()
                     publishRefusals()
                     publishServers()
                     servers.last()?.let { Triple(it, servers.session(it), servers.password(it)) }
@@ -573,7 +599,11 @@ class ChatViewModel internal constructor(
                     .find { it.fingerprint == fingerprint }
                     ?.info
                     ?.device
+            // The held seed first: an identity gone with its seed left would hold it unseen.
+            held.forget(fingerprint)
+            held.dismiss(fingerprint)
             identities.delete(fingerprint)
+            heldLost.value = held.notices()
             publishIdentities()
             for (s in servers.all().filter { it.signIn == signedIn }) servers.forgetSession(s, since)
             device?.let { servers.forgetRefusalsOf(it, since) }
@@ -593,6 +623,20 @@ class ChatViewModel internal constructor(
             identities.list().find { it.fingerprint == fingerprint }?.let { servers.forgetRefusal(server, it.info.device) }
             publishRefusals()
         }
+    }
+
+    /** The person has read why [fingerprint] is held no longer. */
+    fun dismissHeldLost(fingerprint: String) {
+        later {
+            held.dismiss(fingerprint)
+            heldLost.value = held.notices()
+        }
+    }
+
+    /** Lets go of each held identity whose key went with the screen lock; on the store queue. */
+    private fun demoteHeld() {
+        held.demoteLost(identities.list().map { it.fingerprint })
+        heldLost.value = held.notices()
     }
 
     // Called on the store queue alone, so a slower read is never shown over a newer one.
@@ -838,7 +882,10 @@ class ChatViewModel internal constructor(
         this.foreground = foreground
         connection?.setForeground(foreground)
         if (!foreground) save()
-        if (foreground) viewModelScope.launch { quiet.run() }
+        if (foreground) {
+            later { demoteHeld() }
+            viewModelScope.launch { quiet.run() }
+        }
     }
 
     /**

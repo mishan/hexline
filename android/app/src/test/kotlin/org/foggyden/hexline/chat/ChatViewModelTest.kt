@@ -1,9 +1,11 @@
 package org.foggyden.hexline.chat
 
 import android.app.Application
+import androidx.lifecycle.Lifecycle
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.CoreUpdate
 import org.foggyden.hexline.identity.Enrolling
@@ -950,4 +952,97 @@ class ChatViewModelTest : ViewModelHarness() {
             assertFalse("$name: a wait begun before the process died ended after it", woke)
         }
     }
+
+    @Test
+    fun aHeldIdentityWhoseKeyWentWithTheScreenLockIsADeviceAloneWithANoticeUntilRead() {
+        keepIdentity()
+        hold()
+        stores.keys.removeLock()
+        val vm = model()
+        settle()
+        assertEquals(listOf(FINGERPRINT), vm.heldLostNotices.value)
+        assertFalse("its seed let go of", stores.held.isHeld(FINGERPRINT))
+        assertEquals(
+            "still a device here",
+            FINGERPRINT,
+            vm.identityList.value
+                .single()
+                .fingerprint,
+        )
+        vm.dismissHeldLost(FINGERPRINT)
+        settle()
+        assertEquals(emptyList<String>(), vm.heldLostNotices.value)
+    }
+
+    @Test
+    fun aKeyLostWhileTheAppWasAwayIsNoticedAsItComesBack() {
+        keepIdentity()
+        hold()
+        val vm = model()
+        settle()
+        assertEquals(emptyList<String>(), vm.heldLostNotices.value)
+        stores.keys.removeLock()
+        process.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_START)
+        settle()
+        assertEquals(listOf(FINGERPRINT), vm.heldLostNotices.value)
+    }
+
+    @Test
+    fun deletingAHeldIdentityLetsGoOfItsSeedAndItsKey() {
+        keepIdentity()
+        hold()
+        val vm = model()
+        settle()
+        vm.deleteIdentity(FINGERPRINT)
+        settle()
+        assertFalse(stores.held.isHeld(FINGERPRINT))
+        assertEquals("every key let go of", emptyList<String>(), stores.keys.aliases)
+    }
+
+    @Test
+    fun aKeyNoHeldFileNamesIsLetGoOfAtStart() {
+        keepIdentity()
+        hold()
+        stores.keys.create("hexline-held-stray")
+        model()
+        settle()
+        assertTrue(stores.held.isHeld(FINGERPRINT))
+        assertEquals("the held identity's key alone", 1, stores.keys.aliases.size)
+    }
+
+    @Test
+    fun aHeldSeedOutlivesAnIdentityListingThatFailedAtStart() {
+        keepIdentity()
+        hold()
+        stores.identityDir.setReadable(false)
+        try {
+            model()
+            settle()
+        } finally {
+            stores.identityDir.setReadable(true)
+        }
+        val opened = runBlocking { stores.held.use(FINGERPRINT, stores.keys.authorizer()) { it.copyOf() } }
+        assertArrayEquals(ByteArray(32) { 1 }, opened)
+    }
+
+    @Test
+    fun aHeldIdentityWhoseFileDoesNotReadAtStartKeepsItsSeed() {
+        keepIdentity()
+        hold()
+        val file = stores.identityDir.listFiles()!!.single { it.name.startsWith("identity-") }
+        val bytes = file.readBytes()
+        file.writeBytes("{".toByteArray())
+        model()
+        settle()
+        file.writeBytes(bytes)
+        val opened = runBlocking { stores.held.use(FINGERPRINT, stores.keys.authorizer()) { it.copyOf() } }
+        assertArrayEquals(ByteArray(32) { 1 }, opened)
+    }
+
+    private fun hold() =
+        assertTrue(
+            runBlocking {
+                stores.held.hold(FINGERPRINT, ByteArray(32) { 1 }, stores.keys.authorizer())
+            },
+        )
 }

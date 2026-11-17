@@ -143,4 +143,7 @@
     <string name="enroll_failed">This phone could not be enrolled.</string>
     <string name="no_holder_banner">%1$s needs renewing, and its holder is not standing by. Renew it with a new code.</string>
     <string name="needs_manage">Needs a device that may manage the identity\'s links.</string>
+    <string name="held_key_lost">Your screen lock was removed, so this phone no longer holds the identity key of %1$s. It still works as your device. To hold the key again, set a screen lock and restore it from your recovery code.</string>
+    <string name="dismiss">Dismiss</string>
+    <string name="holder_software_only">This phone keeps its keys in software, not in secure hardware, so it cannot hold your identity key. Sign in with your handle and passphrase instead, or enroll this phone from a device that holds the key.</string>
 </resources>
