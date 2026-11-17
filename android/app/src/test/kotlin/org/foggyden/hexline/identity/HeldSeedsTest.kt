@@ -326,6 +326,19 @@ class HeldSeedsTest {
         assertArrayEquals(again, open())
     }
 
+    @Test
+    fun aHoldCutShortSparesItsOwnKeysAloneFromTheSweep() {
+        assertTrue(hold())
+        val kept = keys.aliases.single()
+        val cut = "hexline-held-" + shortHash(OTHER.toByteArray()) + "-cut"
+        keys.create(cut)
+        keys.create("hexline-held-stray")
+        File(dir, "held-" + shortHash(OTHER.toByteArray()) + ".new").writeBytes(byteArrayOf(2, 0))
+        held.sweep()
+        assertEquals(listOf(cut, kept).sorted(), keys.aliases.sorted())
+        assertArrayEquals(seed, open())
+    }
+
     private companion object {
         const val FP = "6htgz65xb7yfs53dmhdanfmk7fgn995n1571rjnz8a36a1fks5z0"
         const val OTHER = "9htgz65xb7yfs53dmhdanfmk7fgn995n1571rjnz8a36a1fks5z0"

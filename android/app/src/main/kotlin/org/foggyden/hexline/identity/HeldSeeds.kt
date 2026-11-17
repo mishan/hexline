@@ -151,26 +151,33 @@ class HeldSeeds(
 
     /**
      * Lets go of every key no held file names (a hold cut short by the
-     * process's end leaves one), once every held file here has been read and
-     * names a key its own name allows; of nothing at all otherwise. A held
-     * file is never let go of here: one whose identity is not kept may be
-     * the only copy of an identity key, so only [forget] lets one go.
+     * process's end leaves one), once the held files here are listed and the
+     * keys are; of nothing otherwise. A file not read, or not naming a key
+     * its own name allows (a write cut short leaves only its `.new`), spares
+     * every key its name's hash is in the alias of. A held file is never let
+     * go of here: one whose identity is not kept may be the only copy of an
+     * identity key, so only [forget] lets one go.
      */
     fun sweep() =
         synchronized(LOCK) {
             try {
                 val files = dir.listFiles() ?: throw IOException("held seeds not listed")
-                val named =
-                    files
-                        .map { it.name.substringBefore('.') }
-                        .filter { it.startsWith("held-") }
-                        .distinct()
-                        .map { name ->
-                            decode(AtomicFile(File(dir, name)).readFully()).alias.also {
-                                if (!it.startsWith(ALIAS + name.removePrefix("held-") + "-")) throw BadHeldFile()
-                            }
-                        }.toSet()
-                for (alias in keys.aliases(ALIAS)) if (alias !in named && alias !in pending) keys.delete(alias)
+                val named = HashSet<String>()
+                val unsure = HashSet<String>()
+                for (name in files.map { it.name.substringBefore('.') }.filter { it.startsWith("held-") }.distinct()) {
+                    val hash = name.removePrefix("held-")
+                    try {
+                        val alias = decode(AtomicFile(File(dir, name)).readFully()).alias
+                        named += alias
+                        if (!alias.startsWith("$ALIAS$hash-")) unsure += hash
+                    } catch (_: Exception) {
+                        unsure += hash
+                    }
+                }
+                for (alias in keys.aliases(ALIAS)) {
+                    if (alias in named || alias in pending || alias.removePrefix(ALIAS).substringBefore('-') in unsure) continue
+                    keys.delete(alias)
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "held keys left to sweep: ${e.javaClass.simpleName}")
             }
