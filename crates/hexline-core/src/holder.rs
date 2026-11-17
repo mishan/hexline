@@ -272,8 +272,10 @@ impl HolderSetup {
     }
 
     /// This phone's device, certified by the identity as a holder's own;
-    /// the setup keeps it, to put the card by.
+    /// the setup keeps it, to put the card by. `busy` while a commit is
+    /// under way.
     pub fn mint(&self, device_name: String) -> Result<HolderMinted, CoreError> {
+        self.not_committing()?;
         let mut s = self.confirmed()?;
         let id = IdentityKey::from_seed(&s.seed);
         let device = DeviceKey::generate();
@@ -288,8 +290,10 @@ impl HolderSetup {
     }
 
     /// The app holds the seed and keeps the device minted: the commit may
-    /// be asked for. `unminted` before [`HolderSetup::mint`].
+    /// be asked for. `unminted` before [`HolderSetup::mint`], `busy` while a
+    /// commit is under way.
     pub fn held(&self) -> Result<(), CoreError> {
+        self.not_committing()?;
         let mut s = self.confirmed()?;
         if s.device.is_none() {
             return Err(refused("unminted"));
@@ -370,6 +374,15 @@ impl HolderSetup {
         let (release, waited) = tokio::sync::oneshot::channel();
         *self.pause.lock().unwrap() = Some((said, waited));
         (registered, release)
+    }
+
+    /// `busy` while a commit is under way: its cleanup lets go of the
+    /// device, so a device minted or said held meanwhile would go with it.
+    fn not_committing(&self) -> Result<(), CoreError> {
+        if self.committing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(refused("busy"));
+        }
+        Ok(())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Setup> {

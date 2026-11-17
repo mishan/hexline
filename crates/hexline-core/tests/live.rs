@@ -1993,3 +1993,27 @@ async fn a_commit_while_another_is_under_way_is_refused_and_the_first_goes_throu
         setup.fingerprint()
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_is_not_minted_or_held_while_a_commit_is_under_way() {
+    let server = Server::with_registrar(&[]).await;
+    let (setup, recovery, _) = confirmed_setup();
+    let (registered, release) = setup.hold_after_registering();
+    let first = tokio::spawn(
+        setup
+            .clone()
+            .commit(server.http.clone(), "kim0".into(), None),
+    );
+    registered.await.unwrap();
+    match setup.mint("Tablet".into()) {
+        Err(e) => assert_eq!(refused_as(&e), "busy"),
+        Ok(_) => panic!("minted while a commit was under way"),
+    }
+    assert_eq!(refused_as(&setup.held().unwrap_err()), "busy");
+    release.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    assert_eq!(
+        restored_by(&server, "kim0", &recovery).await.unwrap(),
+        setup.fingerprint()
+    );
+}
