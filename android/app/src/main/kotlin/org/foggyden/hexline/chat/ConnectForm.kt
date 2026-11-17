@@ -1,6 +1,7 @@
 package org.foggyden.hexline.chat
 
 import org.foggyden.hexline.core.ClassicLogin
+import org.foggyden.hexline.core.shortHash
 import org.foggyden.hexline.identity.StoredIdentity
 import org.foggyden.hexline.identity.standing
 import org.foggyden.hexline.identity.usable
@@ -95,5 +96,30 @@ data class ConnectForm(
                 null
             }
         return ConnectRequest(server, null, false, link)
+    }
+}
+
+/** What Renew does for an identity this phone holds, by what servers said of its device. */
+enum class HeldRenewal {
+    /** Certify the same device again. */
+    Renew,
+
+    /** A server revoked the device: a new one, by the key held here. */
+    NewDevice,
+
+    /** The identity was rotated away: nothing this key certifies is taken. */
+    None,
+}
+
+fun heldRenewal(
+    kept: StoredIdentity,
+    refusals: Map<String, String>,
+): HeldRenewal {
+    val device = "/" + shortHash(kept.info.device)
+    val said = refusals.filterKeys { it.endsWith(device) }.values
+    return when {
+        "rotated" in said -> HeldRenewal.None
+        said.isNotEmpty() -> HeldRenewal.NewDevice
+        else -> HeldRenewal.Renew
     }
 }

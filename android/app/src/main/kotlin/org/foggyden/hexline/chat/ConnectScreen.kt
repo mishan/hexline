@@ -50,9 +50,11 @@ import org.foggyden.hexline.core.CertInfo
 import org.foggyden.hexline.core.ClassicLogin
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.coreVersion
+import org.foggyden.hexline.identity.BackingUp
 import org.foggyden.hexline.identity.EnrollProblem
 import org.foggyden.hexline.identity.Enrolling
 import org.foggyden.hexline.identity.HolderRefusal
+import org.foggyden.hexline.identity.Renewing
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
 import org.foggyden.hexline.identity.SettingUp
@@ -97,7 +99,10 @@ fun ConnectFlow(
     settingUp: SettingUp = SettingUp.Idle,
     /** Holder setup, where the phone offers it. */
     setup: SetupActions? = null,
+    renewing: Renewing = Renewing.Idle,
+    backingUp: BackingUp = BackingUp.Idle,
 ) {
+    var backupFor by rememberSaveable { mutableStateOf<String?>(null) }
     val form = rememberSaveable(stateSaver = FormSaver) { mutableStateOf(ConnectForm()) }
     var setupOpen by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(settingUp) {
@@ -113,8 +118,11 @@ fun ConnectFlow(
     LaunchedEffect(restore) { if (restore is Restoring.Done) restoreFor = null }
     val opened = restoreFor
     // Open while the view model has a run under way: it holds the device.
+    val backing = backupFor?.let { fp -> identities.find { it.fingerprint == fp } }
     if (setup != null && (setupOpen || settingUp !is SettingUp.Idle && settingUp !is SettingUp.Done)) {
         HolderSetupScreen(settingUp, setup) { setupOpen = false }
+    } else if (setup != null && backing != null) {
+        BackupScreen(backing.fingerprint, named(backing), backingUp, setup) { backupFor = null }
     } else if (enrolling.open) {
         val renewing = enrolling.renewing?.let { fp -> identities.find { it.fingerprint == fp } }
         EnrollScreen(
@@ -142,11 +150,20 @@ fun ConnectFlow(
             onConnect = onConnect,
             onForget = onForget,
             onRestore = { renewing ->
-                if (renewing?.mailbox != null) {
-                    onStartEnroll(renewing.fingerprint)
-                } else {
-                    onRestoreSeen()
-                    restoreFor = (renewing?.registrar.orEmpty()) to (renewing?.handle.orEmpty())
+                val held = renewing?.takeIf { it.held && setup != null }
+                when {
+                    held != null ->
+                        when (heldRenewal(held, refusals)) {
+                            HeldRenewal.Renew -> setup?.renew(held.fingerprint)
+                            HeldRenewal.NewDevice -> setup?.newDevice(held.fingerprint)
+                            // Rotated away: nothing to renew, and no button offers it.
+                            HeldRenewal.None -> {}
+                        }
+                    renewing?.mailbox != null -> onStartEnroll(renewing.fingerprint)
+                    else -> {
+                        onRestoreSeen()
+                        restoreFor = (renewing?.registrar.orEmpty()) to (renewing?.handle.orEmpty())
+                    }
                 }
             },
             onEnroll = { onStartEnroll(null) },
@@ -160,6 +177,9 @@ fun ConnectFlow(
             onHeldLostSeen = onHeldLostSeen,
             onSetup = setup?.let { { setupOpen = true } },
             onFinishSetup = setup?.let { s -> { fingerprint: String -> s.finish(fingerprint) } },
+            onBackup = setup?.let { { fingerprint: String -> backupFor = fingerprint } },
+            renewing = renewing,
+            onRenewSeen = { setup?.renewSeen() },
         )
     }
 }
@@ -184,6 +204,9 @@ private fun ConnectScreen(
     onHeldLostSeen: (fingerprint: String) -> Unit,
     onSetup: (() -> Unit)?,
     onFinishSetup: ((fingerprint: String) -> Unit)?,
+    onBackup: ((fingerprint: String) -> Unit)?,
+    renewing: Renewing,
+    onRenewSeen: () -> Unit,
 ) {
     var form by form
     val now = certificateClock(identities)
@@ -219,6 +242,15 @@ private fun ConnectScreen(
                 TextButton({ onHeldLostSeen(lost) }) { Text(stringResource(R.string.dismiss)) }
             }
         }
+        when (renewing) {
+            is Renewing.Done, is Renewing.Failed ->
+                Column {
+                    if (renewing is Renewing.Failed) Problem(describe(renewing.problem)) else Text(stringResource(R.string.renewed))
+                    TextButton(onRenewSeen) { Text(stringResource(R.string.dismiss)) }
+                }
+            Renewing.Working -> Text(stringResource(R.string.holder_working))
+            Renewing.Idle -> Unit
+        }
         for (kept in identities) {
             val banner =
                 when (val s = standing(kept, now)) {
@@ -228,7 +260,9 @@ private fun ConnectScreen(
                 } ?: stringResource(R.string.no_holder_banner, named(kept)).takeIf { kept.noHolder } ?: continue
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(banner, Modifier.weight(1f), color = MaterialTheme.colorScheme.error)
-                TextButton({ onRestore(kept) }) { Text(stringResource(R.string.renew)) }
+                if (!kept.held || heldRenewal(kept, refusals) != HeldRenewal.None) {
+                    TextButton({ onRestore(kept) }) { Text(stringResource(R.string.renew)) }
+                }
             }
         }
         if (saved.isNotEmpty()) {
@@ -304,7 +338,9 @@ private fun ConnectScreen(
                     }
                     Row {
                         // Offered whatever a server said: a new device is the way back.
-                        if (standing != Standing.Good || refusedHere != null) {
+                        if ((standing != Standing.Good || refusedHere != null) &&
+                            (!kept.held || heldRenewal(kept, refusals) != HeldRenewal.None)
+                        ) {
                             TextButton({ onRestore(kept) }) { Text(stringResource(R.string.renew)) }
                         }
                         // The server may have lifted it: asked again there.
@@ -312,6 +348,9 @@ private fun ConnectScreen(
                             TextButton({ onTryAgain(form.identityServer(kept), kept.fingerprint) }) {
                                 Text(stringResource(R.string.try_again))
                             }
+                        }
+                        if (kept.held && onBackup != null) {
+                            TextButton({ onBackup(kept.fingerprint) }) { Text(stringResource(R.string.backup)) }
                         }
                         TextButton({ deleting = kept }) { Text(stringResource(R.string.delete)) }
                     }
@@ -481,7 +520,7 @@ private fun whom(
     }
 
 @Composable
-private fun PasswordField(
+internal fun PasswordField(
     value: String,
     onChange: (String) -> Unit,
     label: Int = R.string.password,
@@ -492,7 +531,8 @@ private fun PasswordField(
         label = { Text(stringResource(label)) },
         singleLine = true,
         visualTransformation = PasswordVisualTransformation(),
-        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+        // No suggestion learned from it, nor one that could append a space.
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false),
         modifier = Modifier.fillMaxWidth(),
     )
 }

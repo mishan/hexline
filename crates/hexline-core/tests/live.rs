@@ -2068,3 +2068,159 @@ async fn a_resumed_setup_whose_handle_is_anothers_takes_another() {
         resumed.fingerprint()
     );
 }
+
+/// A held identity committed at `server`'s registrar as `handle`: its seed,
+/// its device and its card.
+async fn held(server: &Server, handle: &str) -> (Vec<u8>, hexline_core::HolderMinted, Vec<u8>) {
+    let (setup, _, minted) = confirmed_setup();
+    let seed = setup.identity_seed().unwrap();
+    let committed = setup
+        .commit(server.http.clone(), handle.into(), None)
+        .await
+        .unwrap();
+    (seed, minted, committed.card)
+}
+
+async fn restored_with(
+    server: &Server,
+    handle: &str,
+    kind: hexline_core::SecretKind,
+    secret: &str,
+) -> Result<String, CoreError> {
+    hexline_core::restore_identity(
+        server.http.clone(),
+        handle.into(),
+        kind,
+        secret.into(),
+        "Tablet".into(),
+    )
+    .await
+    .map(|r| r.fingerprint)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_passphrase_backup_is_put_changed_and_removed() {
+    use hexline_core::{backup_delete, backup_passphrase, SecretKind::Passphrase};
+    let server = Server::with_registrar(&[]).await;
+    let (seed, ..) = held(&server, "liam").await;
+    let fingerprint = hl_identity::IdentityKey::from_seed(&seed.clone().try_into().unwrap())
+        .fingerprint()
+        .to_string();
+    for short in ["  ", "nine char"] {
+        let e = backup_passphrase(seed.clone(), server.http.clone(), short.into())
+            .await
+            .unwrap_err();
+        assert_eq!(refused_as(&e), "bad_passphrase", "{short:?}");
+    }
+    backup_passphrase(seed.clone(), server.http.clone(), "correct horse".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        restored_with(&server, "liam", Passphrase, "correct horse")
+            .await
+            .unwrap(),
+        fingerprint
+    );
+    backup_passphrase(seed.clone(), server.http.clone(), "battery staple".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        refused_as(
+            &restored_with(&server, "liam", Passphrase, "correct horse")
+                .await
+                .unwrap_err()
+        ),
+        "not_found"
+    );
+    assert_eq!(
+        restored_with(&server, "liam", Passphrase, "battery staple")
+            .await
+            .unwrap(),
+        fingerprint
+    );
+    backup_delete(seed.clone(), server.http.clone(), Passphrase)
+        .await
+        .unwrap();
+    assert_eq!(
+        refused_as(
+            &restored_with(&server, "liam", Passphrase, "battery staple")
+                .await
+                .unwrap_err()
+        ),
+        "not_found"
+    );
+    backup_delete(seed, server.http.clone(), Passphrase)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_recovery_code_replaces_the_one_before_once_typed_back() {
+    use hexline_core::{RecoveryCodeSetup, SecretKind::RecoveryCode};
+    let server = Server::with_registrar(&[]).await;
+    let (setup, first, _) = confirmed_setup();
+    let seed = setup.identity_seed().unwrap();
+    setup
+        .commit(server.http.clone(), "mia".into(), None)
+        .await
+        .unwrap();
+    let new = RecoveryCodeSetup::new();
+    let code = String::from_utf8(new.code().unwrap()).unwrap();
+    assert_eq!(
+        refused_as(
+            &new.clone()
+                .put(seed.clone(), server.http.clone())
+                .await
+                .unwrap_err()
+        ),
+        "unconfirmed"
+    );
+    assert!(!new.confirm(first.clone().into_bytes()));
+    assert!(new.confirm(code.to_lowercase().into_bytes()));
+    assert_eq!(new.code(), None, "shown no more once typed back");
+    new.clone()
+        .put(seed.clone(), server.http.clone())
+        .await
+        .unwrap();
+    assert!(restored_with(&server, "mia", RecoveryCode, &code)
+        .await
+        .is_ok());
+    assert_eq!(
+        refused_as(
+            &restored_with(&server, "mia", RecoveryCode, &first)
+                .await
+                .unwrap_err()
+        ),
+        "not_found"
+    );
+    assert_eq!(
+        refused_as(&new.put(seed, server.http.clone()).await.unwrap_err()),
+        "committed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_holders_renewed_certificate_logs_its_device_in() {
+    use hexline_core::holder_renew;
+    let server = Server::with_registrar_vouching(&[]).await;
+    let (seed, minted, card) = held(&server, "noah").await;
+    let cert = holder_renew(
+        seed,
+        card.clone(),
+        minted.device_seed.clone(),
+        minted.cert.clone(),
+    )
+    .unwrap();
+    let conn = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
+    let device = DeviceIdentity {
+        device_seed: minted.device_seed,
+        cert,
+        card,
+    };
+    assert!(conn
+        .login_identity(device, true, None, None)
+        .await
+        .unwrap()
+        .fingerprint
+        .is_some());
+}

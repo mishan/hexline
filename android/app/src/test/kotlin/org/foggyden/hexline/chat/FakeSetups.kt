@@ -9,8 +9,10 @@ import org.foggyden.hexline.core.Restored
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.certForDevice
 import org.foggyden.hexline.core.holderMint
+import org.foggyden.hexline.core.holderRenew
 import org.foggyden.hexline.core.newIdentity
 import org.foggyden.hexline.identity.HolderSetups
+import org.foggyden.hexline.identity.NewRecoveryCode
 import org.foggyden.hexline.identity.Setup
 
 /**
@@ -66,6 +68,77 @@ class FakeSetups : HolderSetups {
         val minted = holderMint(identity.seed, identity.card, deviceName)
         val seed = identity.seed.copyOf().also { handed += it }
         return HeldRestore(Restored(minted.deviceSeed, minted.cert, identity.card, identity.fingerprint, false, true), seed)
+    }
+
+    /** Each renewal asked for: the identity seed it was handed, and the certificate it renews. */
+    val renewals = mutableListOf<Pair<ByteArray, ByteArray>>()
+
+    override fun renew(
+        identitySeed: ByteArray,
+        card: ByteArray,
+        deviceSeed: ByteArray,
+        cert: ByteArray,
+    ): ByteArray {
+        renewals += identitySeed.copyOf() to cert
+        return holderRenew(identitySeed, card, deviceSeed, cert)
+    }
+
+    /** Each backup the registrar was asked for, as what and the registrar. */
+    val backups = mutableListOf<Pair<String, String>>()
+
+    /** What the registrar answers the next backup asked for, if not that it is done. */
+    var backupFails: CoreException? = null
+
+    private fun backedUp(
+        what: String,
+        registrar: String,
+    ) {
+        backupFails?.let {
+            backupFails = null
+            throw it
+        }
+        backups += what to registrar
+    }
+
+    override suspend fun putPassphrase(
+        identitySeed: ByteArray,
+        registrar: String,
+        passphrase: String,
+    ) {
+        if (passphrase.trim().length < 10) throw CoreException.Refused("bad_passphrase", "")
+        backedUp("passphrase $passphrase", registrar)
+    }
+
+    override suspend fun deleteBackup(
+        identitySeed: ByteArray,
+        registrar: String,
+        kind: SecretKind,
+    ) = backedUp("delete $kind", registrar)
+
+    val newCodes = mutableListOf<FakeRecoveryCode>()
+
+    override fun newRecoveryCode() = FakeRecoveryCode().also { newCodes += it }
+
+    inner class FakeRecoveryCode : NewRecoveryCode {
+        val code = "NEWRC-0DE00-00000-00002"
+        private var confirmed = false
+        var closed = false
+
+        override fun code() = code.toByteArray().takeIf { !confirmed }?.also { codes += it }
+
+        override fun confirm(typed: ByteArray) = (String(typed) == code).also { confirmed = confirmed || it }
+
+        override suspend fun put(
+            identitySeed: ByteArray,
+            registrar: String,
+        ) {
+            if (!confirmed) throw CoreException.Refused("unconfirmed", "")
+            backedUp("recovery", registrar)
+        }
+
+        override fun close() {
+            closed = true
+        }
     }
 
     inner class FakeSetup(

@@ -182,5 +182,29 @@
     <string name="restore_not_held">Restored as this phone\'s device only: the prompt to hold its key was not answered. Restore it again to hold the key.</string>
     <string name="holder_unrecoverable">Its key was lost before setup was finished: it can be neither finished nor recovered. It works as this phone\'s device until its certificate expires.</string>
     <string name="held_key_lost_unfinished">Your screen lock was removed before %1$s was set up, so its identity key is gone and there is no recovery code to restore it from. It still works as this phone\'s device until its certificate expires; you may delete it.</string>
+    <string name="backup">Backup&#8230;</string>
+    <string name="backup_title">Backup of %1$s</string>
+    <plurals name="backup_passphrase_intro">
+        <item quantity="one">With your handle, a passphrase restores this identity on another phone. It needs at least %1$d character, and saving one replaces any passphrase saved before.</item>
+        <item quantity="other">With your handle, a passphrase restores this identity on another phone. It needs at least %1$d characters, and saving one replaces any passphrase saved before.</item>
+    </plurals>
+    <string name="backup_remove_title">Remove the passphrase backup?</string>
+    <string name="backup_remove_body">This identity can then be restored by its recovery code alone. If you no longer have that code, the passphrase may be the only way left to restore it.</string>
+    <string name="backup_recovery_maybe">The new recovery code may already be in effect: keep it, as well as the one before, until it is saved.</string>
+    <string name="backup_passphrase_again">The passphrase again</string>
+    <string name="backup_passphrase_differs">The two are not the same.</string>
+    <string name="backup_save_passphrase">Save passphrase backup</string>
+    <string name="backup_remove_passphrase">Remove passphrase backup</string>
+    <string name="backup_new_recovery_code">Make a new recovery code</string>
+    <string name="backup_recovery_replaces">Write this down, apart from this phone. Once it is saved, the recovery code you wrote down before no longer works.</string>
+    <string name="backup_passphrase_saved">The passphrase backup is saved.</string>
+    <string name="backup_passphrase_removed">The passphrase backup is removed.</string>
+    <string name="backup_recovery_saved">The new recovery code is saved; the one before no longer works.</string>
+    <plurals name="backup_bad_passphrase">
+        <item quantity="one">A passphrase needs at least %1$d character.</item>
+        <item quantity="other">A passphrase needs at least %1$d characters.</item>
+    </plurals>
+    <string name="backup_not_registered">The registrar has not registered this identity, so it keeps no backup of it.</string>
+    <string name="renewed">This phone\'s certificate is renewed.</string>
     <string name="holder_software_only">This phone keeps its keys in software, not in secure hardware, so it cannot hold your identity key. Sign in with your handle and passphrase instead, or enroll this phone from a device that holds the key.</string>
 </resources>

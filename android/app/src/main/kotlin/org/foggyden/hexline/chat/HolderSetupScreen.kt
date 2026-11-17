@@ -26,6 +26,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
@@ -35,11 +36,12 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import org.foggyden.hexline.R
+import org.foggyden.hexline.core.minPassphrase
 import org.foggyden.hexline.identity.HolderRefusal
 import org.foggyden.hexline.identity.SettingUp
 import org.foggyden.hexline.identity.SetupProblem
 
-/** What the holder setup screen asks of the model; the prompt each needs is the activity's. */
+/** What the screens of an identity this phone holds ask of the model; the prompt each needs is the activity's. */
 interface SetupActions {
     fun start(
         registrar: String,
@@ -72,6 +74,36 @@ interface SetupActions {
     fun cancel()
 
     fun seen()
+
+    /** Certifies this phone's device for [fingerprint] again. */
+    fun renew(fingerprint: String)
+
+    /** A new device for [fingerprint], in place of one a server revoked. */
+    fun newDevice(fingerprint: String)
+
+    fun retryNewRecoveryCode(fingerprint: String)
+
+    fun renewSeen()
+
+    fun backUpPassphrase(
+        fingerprint: String,
+        passphrase: String,
+    )
+
+    fun removePassphraseBackup(fingerprint: String)
+
+    fun newRecoveryCode()
+
+    fun newRecoveryCodeWritten()
+
+    fun showNewRecoveryCodeAgain()
+
+    fun confirmNewRecoveryCode(
+        fingerprint: String,
+        typed: ByteArray,
+    )
+
+    fun backupSeen()
 }
 
 /**
@@ -204,7 +236,7 @@ fun HolderSetupScreen(
 }
 
 @Composable
-private fun Field(
+internal fun Field(
     value: String,
     onChange: (String) -> Unit,
     label: Int,
@@ -219,10 +251,10 @@ private fun Field(
 )
 
 @Composable
-private fun Code(code: String) = Text(code, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.titleMedium)
+internal fun Code(code: String) = Text(code, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.titleMedium)
 
 @Composable
-private fun Confirm(
+internal fun Confirm(
     typed: String,
     onChange: (String) -> Unit,
     label: Int,
@@ -245,7 +277,7 @@ private fun Confirm(
 }
 
 @Composable
-private fun Problem(text: String) =
+internal fun Problem(text: String) =
     Text(text, color = MaterialTheme.colorScheme.error, modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
 
 @Composable
@@ -257,13 +289,20 @@ internal fun describe(why: HolderRefusal): String =
     }
 
 @Composable
-private fun describe(problem: SetupProblem): String =
+internal fun describe(problem: SetupProblem): String =
     when (problem) {
         SetupProblem.NotARegistrar -> stringResource(R.string.restore_not_a_registrar)
         SetupProblem.NoBackups -> stringResource(R.string.holder_no_backups)
         SetupProblem.HandleTaken -> stringResource(R.string.holder_handle_taken)
         SetupProblem.HandleInvalid -> stringResource(R.string.holder_handle_invalid)
         SetupProblem.BadDeviceName -> stringResource(R.string.restore_bad_device_name)
+        SetupProblem.BadPassphrase ->
+            pluralStringResource(
+                R.plurals.backup_bad_passphrase,
+                minPassphrase().toInt(),
+                minPassphrase().toInt(),
+            )
+        SetupProblem.NotRegistered -> stringResource(R.string.backup_not_registered)
         SetupProblem.InviteNeeded -> stringResource(R.string.holder_invite_needed)
         SetupProblem.InviteWrong -> stringResource(R.string.holder_invite_wrong)
         SetupProblem.NotBackedUp -> stringResource(R.string.holder_not_backed_up)
