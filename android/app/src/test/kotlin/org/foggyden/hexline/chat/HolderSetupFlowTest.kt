@@ -382,4 +382,21 @@ class HolderSetupFlowTest : ViewModelHarness() {
         settle()
         assertEquals(1, resumed.commits.size)
     }
+
+    @Test
+    fun aHandleCommittedAtTheRegistrarIsTheOneKeptWhateverARetryAsks() {
+        val vm = model()
+        settle()
+        val setup = throughTheCodes(vm)
+        setup.onCommit = { stores.identityDir.setWritable(false) }
+        vm.holdSetup(stores.keys.authorizer())
+        settle()
+        stores.identityDir.setWritable(true)
+        setup.onCommit = {}
+        vm.retrySetup("carol2", null)
+        settle()
+        assertEquals(SettingUp.Done(setup.fingerprint()), vm.holderSetup.value)
+        assertEquals("as the registrar took it", "carol", keptIdentities().single().handle)
+        assertEquals(1, setup.commits.size)
+    }
 }

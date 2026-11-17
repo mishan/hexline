@@ -30,13 +30,16 @@ fi
 
 results=app/build/outputs/androidTest-results/connected
 rm -rf "$results"
-./gradlew --no-daemon :app:connectedFdroidDebugAndroidTest
+failed=
+./gradlew --no-daemon :app:connectedFdroidDebugAndroidTest || failed=1
 
 # The Android Gradle plugin records a run whose app crashed as a failed
 # test in its results and still reports the build successful, so the
-# results are what decide.
-if grep -rqE 'failures="[1-9]|errors="[1-9]' "$results" || ! grep -rq '<testcase' "$results"; then
-    grep -rh '<failure' "$results" | head -5 >&2
+# results are what decide. Its log names no failing test: each is shown
+# here with what it failed with, and anything that crashed.
+if [ -n "$failed" ] || grep -rqE 'failures="[1-9]|errors="[1-9]' "$results" || ! grep -rq '<testcase' "$results"; then
+    find "$results" -name '*.xml' -exec awk '/<testcase/ { test = $0 } /<failure/ { print test; shown = 1 } shown { print } /<\/failure>/ { shown = 0 }' {} + >&2 || true
+    "$adb" logcat -d -b crash >&2 || true
     echo "instrumented tests failed" >&2
     exit 1
 fi

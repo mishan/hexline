@@ -186,12 +186,20 @@ class HolderSetupScreenTest {
         rule.waitForIdle()
         assertFalse("no code on screen", secure())
         rule.onNode(hasText(text(R.string.holder_hold))).performClick()
-        val deadline = System.currentTimeMillis() + 30_000
+        // Typed only into the system's own prompt, once it has the focus: keys sent
+        // before it is up go to nothing, or count as a wrong PIN.
+        val deadline = System.currentTimeMillis() + 60_000
+        var typed = false
         while (vm.holderSetup.value !is SettingUp.Done && System.currentTimeMillis() < deadline) {
-            Thread.sleep(1_500)
-            if (vm.holderSetup.value is SettingUp.Done) break
-            shell("input text $PIN")
-            shell("input keyevent KEYCODE_ENTER")
+            Thread.sleep(1_000)
+            val focus = shell("dumpsys window").lineSequence().firstOrNull { "mCurrentFocus=" in it }.orEmpty()
+            if (!typed && "Window{" in focus && context.packageName !in focus) {
+                shell("input text $PIN")
+                shell("input keyevent KEYCODE_ENTER")
+                typed = true
+            } else if (context.packageName in focus) {
+                typed = false
+            }
         }
         val fingerprint = reached(vm, SettingUp.Done::class.java).fingerprint.also { made = it }
         val kept = identities.list().single { it.fingerprint == fingerprint }
@@ -255,11 +263,10 @@ class HolderSetupScreenTest {
         override fun close() = setup.close()
     }
 
-    private fun shell(command: String) {
+    private fun shell(command: String): String =
         instrumentation.uiAutomation.executeShellCommand(command).use { pfd ->
-            ParcelFileDescriptor.AutoCloseInputStream(pfd).readBytes()
+            String(ParcelFileDescriptor.AutoCloseInputStream(pfd).readBytes())
         }
-    }
 
     private companion object {
         const val PIN = "1234"

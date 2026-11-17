@@ -776,7 +776,8 @@ class ChatViewModel internal constructor(
             settingUp.value = SettingUp.ReadyToHold
             return
         }
-        val next = if (failed.fixed) target.handle else handle.trim()
+        // A commit the registrar made is of its handle: only keeping it here is asked again.
+        val next = if (failed.fixed || target.committed != null) target.handle else handle.trim()
         setupFor = target.copy(handle = next, invite = invite?.ifBlank { null } ?: target.invite)
         if (next != target.handle) {
             val fingerprint = checkNotNull(setup).fingerprint()
