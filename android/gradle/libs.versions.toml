@@ -23,6 +23,7 @@ compose-ui-test-manifest = { module = "androidx.compose.ui:ui-test-manifest" }
 activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activity-compose" }
 biometric = { module = "androidx.biometric:biometric", version.ref = "biometric" }
 fragment = { module = "androidx.fragment:fragment", version.ref = "fragment" }
+fragment-testing-manifest = { module = "androidx.fragment:fragment-testing-manifest", version.ref = "fragment" }
 jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
 coroutines = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
 coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }

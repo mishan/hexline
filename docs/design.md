@@ -485,8 +485,8 @@ Slice 6 holder mode, decided 2026-11-16:
   a notice until read (§2.2); holding it again is restoring by recovery
   code or passphrase under a new Key B.
 - **6a's entry point** (hold a throwaway identity, mint this phone's
-  device from it) lives in the debug source set and is not compiled into
-  other builds.
+  device from it) lived in the debug source set alone, and went once 6b's
+  setup screen could be driven in its place.
 - **6b's setup** needs a registrar that serves envelopes; the recovery
   envelope saved to a file, with no handle, waits, as does the successor
   saved to a file. Both codes are confirmed by typing them back. The

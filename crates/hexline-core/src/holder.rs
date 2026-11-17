@@ -465,7 +465,21 @@ impl HolderSetup {
             .sign(&id)
             .map_err(|e| protocol(&e.to_string()))?;
             let reply =
-                auth::post(&http, &register, Some(json!({ "request": b64(&request) }))).await?;
+                match auth::post(&http, &register, Some(json!({ "request": b64(&request) }))).await
+                {
+                    Ok(reply) => reply,
+                    Err(e) => {
+                        let e = CoreError::from(e);
+                        // Refused the handle, this identity does not hold it: a
+                        // resumed setup may take another.
+                        if let CoreError::Refused { code, .. } = &e {
+                            if code.starts_with("handle_") {
+                                self.lock().target = None;
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
             let attestation = bytes(&reply, "attestation")?;
             if !ours(&attestation, &reg, &id, handle) {
                 return Err(protocol(
@@ -525,6 +539,32 @@ impl Drop for Committing {
             .committing
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// Whether `name` makes a certificate a server reads, refused
+/// `bad_device_name` if not: asked before any code is shown, as a mint
+/// would refuse it after.
+#[uniffi::export]
+pub fn check_device_name(name: String) -> Result<(), CoreError> {
+    crate::restore::check_name(&name)
+}
+
+/// Whether a holder's identity may be set up at `registrar`: one that
+/// registers handles and keeps the recovery code's envelope. Refused
+/// `bad_registrar`, `not_a_registrar` or `no_envelopes` as
+/// [`HolderSetup::commit`] would be, before any code is shown.
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn check_holder_registrar(registrar: String) -> Result<(), CoreError> {
+    crate::connection::RUNTIME
+        .spawn(async move {
+            let base = registrar_base(&registrar)?;
+            let http = auth::http_client(base.as_str(), None)?;
+            let reg = discovered(&http, &base).await?;
+            endpoint(&base, &reg.envelopes)?;
+            endpoint(&base, &reg.register).map(drop)
+        })
+        .await
+        .unwrap_or_else(|_| Err(protocol("the check stopped")))
 }
 
 /// The time a commit signs: later than the last, as the registrar refuses

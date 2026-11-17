@@ -52,8 +52,10 @@ import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.coreVersion
 import org.foggyden.hexline.identity.EnrollProblem
 import org.foggyden.hexline.identity.Enrolling
+import org.foggyden.hexline.identity.HolderRefusal
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
+import org.foggyden.hexline.identity.SettingUp
 import org.foggyden.hexline.identity.Standing
 import org.foggyden.hexline.identity.StoredIdentity
 import org.foggyden.hexline.identity.nextChange
@@ -80,7 +82,7 @@ fun ConnectFlow(
     connecting: Boolean,
     onConnect: (server: Server, password: String?, remember: Boolean, link: ClassicLogin?) -> Unit,
     onForget: (Server) -> Unit,
-    onRestore: (registrar: String, handle: String, kind: SecretKind, secret: String, deviceName: String) -> Unit,
+    onRestore: (registrar: String, handle: String, kind: SecretKind, secret: String, deviceName: String, hold: Boolean) -> Unit,
     onRestoreSeen: () -> Unit,
     onDelete: (fingerprint: String) -> Unit,
     onTryAgain: (server: Server, fingerprint: String) -> Unit,
@@ -92,15 +94,28 @@ fun ConnectFlow(
     onEnrollSeen: () -> Unit,
     heldLost: List<String> = emptyList(),
     onHeldLostSeen: (fingerprint: String) -> Unit = {},
+    settingUp: SettingUp = SettingUp.Idle,
+    /** Holder setup, where the phone offers it. */
+    setup: SetupActions? = null,
 ) {
     val form = rememberSaveable(stateSaver = FormSaver) { mutableStateOf(ConnectForm()) }
+    var setupOpen by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(settingUp) {
+        if (settingUp is SettingUp.Done) {
+            setupOpen = false
+            form.value = form.value.restored(settingUp.fingerprint)
+            setup?.seen()
+        }
+    }
     // The registrar and handle the restore screen opens with: blank for a
     // new identity, an identity's own to renew it. Null while it is closed.
     var restoreFor by rememberSaveable { mutableStateOf<Pair<String, String>?>(null) }
     LaunchedEffect(restore) { if (restore is Restoring.Done) restoreFor = null }
     val opened = restoreFor
     // Open while the view model has a run under way: it holds the device.
-    if (enrolling.open) {
+    if (setup != null && (setupOpen || settingUp !is SettingUp.Idle && settingUp !is SettingUp.Done)) {
+        HolderSetupScreen(settingUp, setup) { setupOpen = false }
+    } else if (enrolling.open) {
         val renewing = enrolling.renewing?.let { fp -> identities.find { it.fingerprint == fp } }
         EnrollScreen(
             enrolling = enrolling,
@@ -143,6 +158,8 @@ fun ConnectFlow(
             onTryAgain = onTryAgain,
             heldLost = heldLost,
             onHeldLostSeen = onHeldLostSeen,
+            onSetup = setup?.let { { setupOpen = true } },
+            onFinishSetup = setup?.let { s -> { fingerprint: String -> s.finish(fingerprint) } },
         )
     }
 }
@@ -165,6 +182,8 @@ private fun ConnectScreen(
     onTryAgain: (server: Server, fingerprint: String) -> Unit,
     heldLost: List<String>,
     onHeldLostSeen: (fingerprint: String) -> Unit,
+    onSetup: (() -> Unit)?,
+    onFinishSetup: ((fingerprint: String) -> Unit)?,
 ) {
     var form by form
     val now = certificateClock(identities)
@@ -192,9 +211,11 @@ private fun ConnectScreen(
     ) {
         Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineMedium)
         for (lost in heldLost) {
-            val name = identities.find { it.fingerprint == lost }?.let(::named) ?: lost.take(16)
+            val identity = identities.find { it.fingerprint == lost }
+            val name = identity?.let(::named) ?: lost.take(16)
+            val notice = if (identity?.unrecoverable == true) R.string.held_key_lost_unfinished else R.string.held_key_lost
             Column {
-                Text(stringResource(R.string.held_key_lost, name), color = MaterialTheme.colorScheme.error)
+                Text(stringResource(notice, name), color = MaterialTheme.colorScheme.error)
                 TextButton({ onHeldLostSeen(lost) }) { Text(stringResource(R.string.dismiss)) }
             }
         }
@@ -266,6 +287,21 @@ private fun ConnectScreen(
                             Text(capabilities(kept), style = MaterialTheme.typography.bodySmall)
                         }
                     }
+                    if (kept.unrecoverable) {
+                        Text(
+                            stringResource(R.string.holder_unrecoverable),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                    if (kept.unfinished && onFinishSetup != null) {
+                        Text(
+                            stringResource(R.string.holder_unfinished),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                        TextButton({ onFinishSetup(kept.fingerprint) }) { Text(stringResource(R.string.holder_finish)) }
+                    }
                     Row {
                         // Offered whatever a server said: a new device is the way back.
                         if (standing != Standing.Good || refusedHere != null) {
@@ -283,6 +319,7 @@ private fun ConnectScreen(
             }
             TextButton({ onRestore(null) }) { Text(stringResource(R.string.restore_identity)) }
             TextButton(onEnroll) { Text(stringResource(R.string.enroll_identity)) }
+            onSetup?.let { TextButton(it) { Text(stringResource(R.string.holder_setup)) } }
             // Linking writes to the account, which a device may do only with manage.
             if (identity != null && !identity.info.canManage) {
                 Text(stringResource(R.string.needs_manage), style = MaterialTheme.typography.bodySmall)
@@ -484,10 +521,11 @@ fun RestoreScreen(
     restoring: Restoring,
     initialRegistrar: String,
     initialHandle: String,
-    onRestore: (registrar: String, handle: String, kind: SecretKind, secret: String, deviceName: String) -> Unit,
+    onRestore: (registrar: String, handle: String, kind: SecretKind, secret: String, deviceName: String, hold: Boolean) -> Unit,
     onCancel: () -> Unit,
 ) {
     var registrar by rememberSaveable { mutableStateOf(initialRegistrar) }
+    var hold by rememberSaveable { mutableStateOf(false) }
     var handle by rememberSaveable { mutableStateOf(initialHandle) }
     var byCode by rememberSaveable { mutableStateOf(false) }
     // Not saveable: saved state is written to disk with the task.
@@ -535,6 +573,13 @@ fun RestoreScreen(
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
+        Checked(hold, { hold = it }, stringResource(R.string.restore_hold))
+        if (restoring is Restoring.NotHeld) {
+            Text(
+                stringResource(R.string.restore_not_held),
+                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+            )
+        }
         if (restoring is Restoring.Failed) {
             Text(
                 describe(restoring.problem),
@@ -546,7 +591,7 @@ fun RestoreScreen(
             Button(
                 onClick = {
                     val kind = if (byCode) SecretKind.RECOVERY_CODE else SecretKind.PASSPHRASE
-                    onRestore(registrar.trim(), handle.trim(), kind, secret, deviceName.trim())
+                    onRestore(registrar.trim(), handle.trim(), kind, secret, deviceName.trim(), hold)
                 },
                 enabled = registrar.isNotBlank() && handle.isNotBlank() && secret.isNotEmpty() && !working,
             ) { Text(stringResource(if (working) R.string.restoring else R.string.restore)) }
@@ -566,6 +611,9 @@ private fun describe(problem: RestoreProblem): String =
         RestoreProblem.RateLimited -> stringResource(R.string.restore_rate_limited)
         RestoreProblem.Unreachable -> stringResource(R.string.restore_unreachable)
         RestoreProblem.NotKept -> stringResource(R.string.restore_not_kept)
+        RestoreProblem.TooOld -> describe(HolderRefusal.TooOld)
+        RestoreProblem.NoScreenLock -> describe(HolderRefusal.NoScreenLock)
+        RestoreProblem.SoftwareOnly -> describe(HolderRefusal.SoftwareOnly)
         RestoreProblem.Other -> stringResource(R.string.restore_failed)
     }
 

@@ -20,7 +20,7 @@ enum class EnrollProblem {
     Denied,
     Expired,
 
-    /** The holder may have answered: the answer was lost on its way, and a mailbox hands it over once. */
+    /** The holder may have answered: the answer was lost on its way, and the mailbox no longer has it. */
     AnswerLost,
 
     /** The answer certifies another device, or is from another identity than expected. */

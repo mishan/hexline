@@ -2017,3 +2017,54 @@ async fn a_device_is_not_minted_or_held_while_a_commit_is_under_way() {
         setup.fingerprint()
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registrar_is_checked_for_a_holder_before_any_code_is_shown() {
+    use hexline_core::check_holder_registrar;
+    let server = Server::with_registrar(&[]).await;
+    check_holder_registrar(server.http.clone()).await.unwrap();
+    let plain = Server::start(&[]).await;
+    let e = check_holder_registrar(plain.http.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(refused_as(&e), "not_a_registrar");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_setup_whose_handle_is_anothers_takes_another() {
+    use hexline_core::HolderSetup;
+    let server = Server::with_registrar(&[]).await;
+    let (theirs, ..) = confirmed_setup();
+    theirs
+        .commit(server.http.clone(), "ivy".into(), None)
+        .await
+        .unwrap();
+    let (setup, _, minted) = confirmed_setup();
+    let resumed = HolderSetup::resume(
+        setup.identity_seed().unwrap(),
+        setup.card(),
+        server.http.clone(),
+        "ivy".into(),
+        minted.device_seed,
+        minted.cert,
+    )
+    .unwrap();
+    let code = resumed.recovery_code().unwrap();
+    assert!(resumed.confirm_recovery(code.clone()));
+    let taken = resumed
+        .clone()
+        .commit(server.http.clone(), "ivy".into(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(refused_as(&taken), "handle_taken");
+    resumed
+        .clone()
+        .commit(server.http.clone(), "ivy2".into(), None)
+        .await
+        .unwrap();
+    let code = String::from_utf8(code).unwrap();
+    assert_eq!(
+        restored_by(&server, "ivy2", &code).await.unwrap(),
+        resumed.fingerprint()
+    );
+}

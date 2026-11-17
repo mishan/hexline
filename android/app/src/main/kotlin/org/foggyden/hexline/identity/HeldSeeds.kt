@@ -67,10 +67,7 @@ class HeldSeeds(
         try {
             val seal =
                 withContext(io) {
-                    keys.create(alias)
-                    // A key in software is no better than a file the app could read; only a debug
-                    // build, for the emulator, holds a seed behind one.
-                    if (!softwareKeys && keys.security(alias) == "software") throw SoftwareKeysOnly()
+                    made(alias)
                     keys.begin(alias, null)
                 }
             if (!authorizer.allow(seal)) return false
@@ -98,6 +95,32 @@ class HeldSeeds(
                 }
             }
         }
+    }
+
+    /**
+     * Whether this phone could hold a seed now, asking the person nothing:
+     * a key made and let go of at once. [org.foggyden.hexline.secrets.NoScreenLock],
+     * [SoftwareKeysOnly] or [org.foggyden.hexline.secrets.HolderUnsupported]
+     * if not. Blocks on the Keystore.
+     */
+    fun probe() {
+        val alias = ALIAS + "probe-" + UUID.randomUUID().toString().replace("-", "")
+        synchronized(LOCK) { pending += alias }
+        try {
+            made(alias)
+        } finally {
+            synchronized(LOCK) {
+                pending -= alias
+                runCatching { keys.delete(alias) }
+            }
+        }
+    }
+
+    private fun made(alias: String) {
+        keys.create(alias)
+        // A key in software is no better than a file the app could read; only a debug
+        // build, for the emulator, holds a seed behind one.
+        if (!softwareKeys && keys.security(alias) == "software") throw SoftwareKeysOnly()
     }
 
     /**

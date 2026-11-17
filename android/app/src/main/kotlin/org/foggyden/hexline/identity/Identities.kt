@@ -35,6 +35,12 @@ class StoredIdentity(
      * registered, with the recovery code, to resume it by.
      */
     val unfinished: Boolean = false,
+    /**
+     * A holder's setup whose key went before it was committed: it can be
+     * neither finished nor restored, and works as this phone's device
+     * alone until its certificate ends.
+     */
+    val unrecoverable: Boolean = false,
 ) {
     /** The identity, in the form the core gives it: the only one to pass back. */
     val fingerprint: String get() = info.fingerprint
@@ -166,6 +172,50 @@ class Identities(
                     at,
                     noHolder,
                     stored.unfinished,
+                    stored.unrecoverable,
+                ),
+            )
+        }
+
+    /** [fingerprint]'s unfinished setup now to be committed as [handle]; nothing once it is finished. */
+    fun intends(
+        fingerprint: String,
+        handle: String,
+    ): Unit =
+        synchronized(LOCK) {
+            val file = file(fingerprint)
+            val stored = load(file)?.takeIf { it.unfinished } ?: return
+            write(
+                file,
+                StoredIdentity(
+                    handle,
+                    stored.cert,
+                    stored.card,
+                    stored.info,
+                    stored.registrar,
+                    stored.mailbox,
+                    unfinished = true,
+                ),
+            )
+        }
+
+    /** [fingerprint]'s setup, its key gone before it was committed: no longer to be finished. */
+    fun unrecoverable(fingerprint: String): Unit =
+        synchronized(LOCK) {
+            val file = file(fingerprint)
+            val stored = load(file)?.takeIf { it.unfinished } ?: return
+            write(
+                file,
+                StoredIdentity(
+                    stored.handle,
+                    stored.cert,
+                    stored.card,
+                    stored.info,
+                    stored.registrar,
+                    stored.mailbox,
+                    stored.renewTried,
+                    stored.noHolder,
+                    unrecoverable = true,
                 ),
             )
         }
@@ -224,6 +274,7 @@ class Identities(
                 json.optLong("renew_tried"),
                 json.optBoolean("no_holder"),
                 json.optBoolean("unfinished"),
+                json.optBoolean("unrecoverable"),
             )
         } catch (_: Exception) {
             null
@@ -247,6 +298,7 @@ class Identities(
                     if (stored.renewTried != 0L) put("renew_tried", stored.renewTried)
                     if (stored.noHolder) put("no_holder", true)
                     if (stored.unfinished) put("unfinished", true)
+                    if (stored.unrecoverable) put("unrecoverable", true)
                 }
         val atomic = AtomicFile(file)
         val out = atomic.startWrite()

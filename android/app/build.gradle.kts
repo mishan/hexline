@@ -132,6 +132,8 @@ dependencies {
     androidTestImplementation(libs.androidx.test.ext)
     androidTestImplementation(libs.androidx.test.runner)
     debugImplementation(libs.compose.ui.test.manifest)
+    // A FragmentActivity of its own for the instrumented tests, as the key's prompt needs one.
+    debugImplementation(libs.fragment.testing.manifest)
 }
 
 // The bindings are uniffi's, not ours to format.

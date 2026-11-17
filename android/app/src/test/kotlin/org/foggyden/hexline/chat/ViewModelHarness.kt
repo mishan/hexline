@@ -89,6 +89,7 @@ abstract class ViewModelHarness {
 
     protected val opened = mutableListOf<FakeConnection>()
     protected val enrollments = mutableListOf<FakeEnrollment>()
+    protected var setups = FakeSetups()
 
     /** What the store held of the identity's last try when the holder was asked. */
     protected var triedWhenAsked: Long? = null
@@ -170,7 +171,7 @@ abstract class ViewModelHarness {
                         connection(url, sink).also { opened += it }
                     }, { renewing, expecting ->
                         enrollment(renewing, expecting).also { enrollments += it }
-                    }, { now }, process.lifecycle) as T
+                    }, setups, { now }, process.lifecycle) as T
             }
         armed = true
         return ViewModelProvider.create(owner, factory)[ChatViewModel::class.java]

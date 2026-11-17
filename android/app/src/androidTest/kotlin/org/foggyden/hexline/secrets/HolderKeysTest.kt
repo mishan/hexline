@@ -1,18 +1,10 @@
 package org.foggyden.hexline.secrets
 
 import android.os.Build
-import android.os.SystemClock
 import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
-import androidx.lifecycle.lifecycleScope
-import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import kotlinx.coroutines.async
-import kotlinx.coroutines.runBlocking
-import org.foggyden.hexline.debug.HolderDebugActivity
-import org.foggyden.hexline.identity.HeldSeeds
-import org.foggyden.hexline.identity.Identities
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -22,11 +14,9 @@ import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
-import java.io.File
 import java.security.KeyStore
 import javax.crypto.SecretKey
 import javax.crypto.SecretKeyFactory
-import kotlin.coroutines.EmptyCoroutineContext
 
 /**
  * The Keystore's Keys B on a real Android: the screen lock is set and
@@ -38,7 +28,6 @@ class HolderKeysTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val context = instrumentation.targetContext
     private val alias = "hexline-held-test"
-    private var minted: String? = null
 
     @Before
     fun lock() {
@@ -50,8 +39,6 @@ class HolderKeysTest {
     @After
     fun unlock() {
         KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(alias)
-        File(context.filesDir, "held").deleteRecursively()
-        minted?.let { Identities(context).delete(it) }
         shell("locksettings clear --old $PIN")
     }
 
@@ -83,44 +70,6 @@ class HolderKeysTest {
     fun withoutAScreenLockNoKeyBIsMade() {
         shell("locksettings clear --old $PIN")
         assertThrows(NoScreenLock::class.java) { KeystoreHolderKeys(context).create(alias) }
-    }
-
-    @Test
-    fun aSeedHeldBehindThePromptMintsThisPhonesDeviceAndGoesWithTheScreenLock() {
-        ActivityScenario.launch(HolderDebugActivity::class.java).use { scenario ->
-            assertTrue("held", answered(scenario) { it.hold() })
-            minted = answered(scenario) { it.mint() }
-            var activity: HolderDebugActivity? = null
-            scenario.onActivity { activity = it }
-            val shown = checkNotNull(activity)
-            assertEquals("this phone's device, minted by its identity", shown.fingerprint, minted)
-            val fp = checkNotNull(shown.fingerprint)
-            assertTrue(shown.held.isHeld(fp))
-            shell("locksettings clear --old $PIN")
-            val held = HeldSeeds(File(context.filesDir, "held"), KeystoreHolderKeys(context), EmptyCoroutineContext)
-            assertEquals(listOf(fp), held.demoteLost(listOf(fp)))
-            assertFalse(held.isHeld(fp))
-            assertEquals(listOf(fp), held.notices())
-        }
-    }
-
-    /** [act] run in the activity, the system's prompt answered with the PIN while it waits. */
-    private fun <T> answered(
-        scenario: ActivityScenario<HolderDebugActivity>,
-        act: suspend (HolderDebugActivity) -> T,
-    ): T {
-        var job: kotlinx.coroutines.Deferred<T>? = null
-        scenario.onActivity { a -> job = a.lifecycleScope.async { act(a) } }
-        val deferred = checkNotNull(job)
-        val deadline = SystemClock.uptimeMillis() + 30_000
-        while (!deferred.isCompleted && SystemClock.uptimeMillis() < deadline) {
-            SystemClock.sleep(1_500)
-            if (deferred.isCompleted) break
-            shell("input text $PIN")
-            shell("input keyevent KEYCODE_ENTER")
-        }
-        assertTrue("the prompt was answered", deferred.isCompleted)
-        return runBlocking { deferred.await() }
     }
 
     private fun shell(command: String) {

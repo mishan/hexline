@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <application>
-        <!-- Holder mode's Key B, exercised before its screens exist: debug builds only. -->
-        <activity
-            android:name=".debug.HolderDebugActivity"
-            android:exported="false" />
-    </application>
-</manifest>
