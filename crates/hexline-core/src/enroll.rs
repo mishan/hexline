@@ -299,10 +299,12 @@ impl Enrollee {
         // for room are all asked again under the same secret until the
         // request's life is out.
         let mut backoff = POLL_FLOOR;
-        // The mailbox hands an answer, or a denial, over once and forgets
-        // it. One cut short on its way, or taken by a poll this phone gave
-        // up on (the mailbox's side of it waits on), is gone, and "expired"
-        // would tell the person the holder never said.
+        // The mailbox hands an answer, or a denial, over again for a minute
+        // after it is first fetched, then forgets it; an older mailbox, once.
+        // One cut short on its way, or taken by a poll this phone gave up on
+        // (the mailbox's side of it waits on), is fetched again by the next
+        // poll inside that minute. Gone after it, "expired" would tell the
+        // person the holder never said.
         let mut lost = false;
         let mut abandoned = false;
         // A mailbox whose last word was to wait: the wait it asked for.
@@ -1617,7 +1619,7 @@ mod tests {
         // answered, so none was left at the mailbox to take the answer.
         for (first, ends) in [
             ("200 OK", "answer_lost"),
-            // A denial is handed over once too.
+            // A denial is forgotten as an answer is.
             ("403 Forbidden", "answer_lost"),
             ("202 Accepted", "expired"),
         ] {
