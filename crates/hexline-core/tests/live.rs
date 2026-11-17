@@ -2225,24 +2225,30 @@ async fn a_holders_renewed_certificate_logs_its_device_in() {
         .is_some());
 }
 
+/// `work` polled once, as far as it goes before it first waits.
+async fn begun<F: std::future::Future>(work: &mut std::pin::Pin<&mut F>) {
+    std::future::poll_fn(|cx| {
+        assert!(work.as_mut().poll(cx).is_pending(), "done at once");
+        std::task::Poll::Ready(())
+    })
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_backup_begun_after_another_supersedes_it_before_it_signs() {
     use hexline_core::{backup_passphrase, SecretKind::Passphrase};
     let server = Server::with_registrar(&[]).await;
     let (seed, ..) = held(&server, "una").await;
-    // Both asked for at once: the first is still sealing as the second begins.
-    let first = tokio::spawn(backup_passphrase(
-        seed.clone(),
-        server.http.clone(),
-        "first passphrase".into(),
-    ));
-    let second = tokio::spawn(backup_passphrase(
-        seed,
-        server.http.clone(),
-        "second passphrase".into(),
-    ));
-    assert_eq!(refused_as(&first.await.unwrap().unwrap_err()), "superseded");
-    second.await.unwrap().unwrap();
+    // Each begun in the order asked, the first still sealing as the second
+    // begins: begun as a task, the second could be begun before the first.
+    let first = backup_passphrase(seed.clone(), server.http.clone(), "first passphrase".into());
+    let second = backup_passphrase(seed, server.http.clone(), "second passphrase".into());
+    tokio::pin!(first, second);
+    begun(&mut first).await;
+    begun(&mut second).await;
+    let (first, second) = tokio::join!(first, second);
+    assert_eq!(refused_as(&first.unwrap_err()), "superseded");
+    second.unwrap();
     assert!(
         restored_with(&server, "una", Passphrase, "second passphrase")
             .await
