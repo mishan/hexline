@@ -236,7 +236,15 @@ fn base_of(url: &str) -> Result<(String, String), Error> {
 /// [`Error::Refused`] with the server's code, or by status where there is
 /// none (§6.2).
 pub async fn post(http: &reqwest::Client, url: &str, body: Option<Value>) -> Result<Value, Error> {
-    let req = http.post(url);
+    send(http.post(url), body).await
+}
+
+/// As [`post`], by PUT: a registrar's envelope put.
+pub async fn put(http: &reqwest::Client, url: &str, body: Value) -> Result<Value, Error> {
+    send(http.put(url), Some(body)).await
+}
+
+async fn send(req: reqwest::RequestBuilder, body: Option<Value>) -> Result<Value, Error> {
     let req = match body {
         Some(b) => req.json(&b),
         None => req,

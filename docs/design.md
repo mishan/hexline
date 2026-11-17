@@ -126,7 +126,7 @@ single tokio runtime lives in the core for the process.
 |---|---|---|---|
 | **Holder** | identity seed (wrapped), device keys | Generate identity + device; self-certify; card; register a handle; make the recovery code (§2.2) and the successor (§2.2) and confirm both were written down **before** the registration that commits them; put a passphrase envelope where the registrar serves them | Self-mint, behind a biometric/PIN prompt |
 | **Enrolled device** | device keys only | Scan the QR an `hlid` (or another Hexline holder) draws, or type the code; the mailbox flow of `identity-enrollment.md` §5 | `prev`-renewal through the mailbox to a standing holder (`hlid agent`); `no_holder` falls back to a code, so without an agent expect a code a quarter |
-| **Envelope** | device keys only; seed for seconds | Handle + passphrase (or recovery code) → fetch envelope → unwrap → mint own cert → drop seed (`identity-registrar.md` §9.4) | Same: passphrase, unwrap, mint, drop. Needs registrar envelopes, which are not built (§2.4) |
+| **Envelope** | device keys only; seed for seconds | Handle + passphrase (or recovery code) → fetch envelope → unwrap → mint own cert → drop seed (`identity-registrar.md` §9.4) | Same: passphrase, unwrap, mint, drop. Needs a registrar that serves envelopes (§2.4) |
 
 When renewal is asked for: a holder self-mints silently once a third of
 the certificate's life is left. Envelope and enrolled devices need the
@@ -187,12 +187,16 @@ copy when the login is done, but not the copy in the JSON body it builds
 for the auth request, and the HTTP client's buffers are out of its reach.
 A seed crossing the FFI either way (`Enrollee::seed`, a login's device)
 also passes through a uniffi `RustBuffer` that is freed and not wiped.
-The same holds for an identity seed in holder mode: made by
-`new_identity` and handed to `holder_mint` per operation, it crosses in
-a buffer freed unwiped each way, beside the copy each side makes; the
-core keeps its own copy in `Zeroizing` and never hands the identity
-seed back, so what crosses is one copy out at creation and one in per
-use. Accepted, as for device seeds.
+The same holds for an identity seed in holder mode, which crosses in a
+buffer freed unwiped each way, beside the copy each side makes: out of
+the core once to be held (`HolderSetup::identity_seed` at creation,
+`HeldRestore::identity_seed` when an existing identity is held), and in
+for each use (`holder_mint`, and `HolderSetup::resume` for a setup the
+process ended in). The core keeps its own copies in `Zeroizing`.
+Accepted, as for device seeds. A holder setup's successor and recovery
+codes cross as bytes the app wipes, and are typed back as bytes; what
+remains is the `String` each is shown and typed as, which the runtime
+may keep, and what the input method saw.
 Backups: `android:allowBackup="false"` and `dataExtractionRules`
 excluding everything; a Keystore key never leaves the device anyway, so
 a backed-up blob would be undecryptable.
@@ -228,12 +232,11 @@ Push registration needs `message`.
 | Piece | State | Needed for |
 |---|---|---|
 | Enrollment mailbox (`hxd-ng-session/enroll.rs`) | Built | Enrolled mode |
-| Registrar envelopes (`identity-registrar.md` §9: Argon2id + XChaCha20-Poly1305, put/fetch, lockout) | **Specified, not built** — `[registrar] envelopes` is refused at startup (`crates/hxd/src/registrar.rs`), no Argon2 in `Cargo.lock` | Envelope mode, holder backup |
+| Registrar envelopes (`identity-registrar.md` §9: Argon2id + XChaCha20-Poly1305, put/fetch, lockout) | Built (`[registrar] envelopes = true`) | Envelope mode, holder setup's recovery code, holder backup |
 | Push payload sealed to `device_enc` (push §5.1, P6) | Not built | Nothing in v1 (Web Push's own encryption suffices) |
 
-The envelope object and its derivation belong in `hl-identity` (with
-vectors), the endpoints in `hxd-registrar`. That is a server slice
-ahead of Hexline's envelope mode.
+The envelope object and its derivation are `hl-identity`'s (with
+vectors), the endpoints `hxd-registrar`'s.
 
 ## 3. Background, presence and push
 
@@ -484,3 +487,13 @@ Slice 6 holder mode, decided 2026-11-16:
 - **6a's entry point** (hold a throwaway identity, mint this phone's
   device from it) lives in the debug source set and is not compiled into
   other builds.
+- **6b's setup** needs a registrar that serves envelopes; the recovery
+  envelope saved to a file, with no handle, waits, as does the successor
+  saved to a file. Both codes are confirmed by typing them back. The
+  seed is held, and the device kept marked unfinished, before anything
+  is sent; the registration and the recovery envelope follow, and a
+  setup the process ended in the middle of is committed again from the
+  held seed under a new recovery code (a reissue keeps the successor the
+  card commits to). The passphrase envelope is 6c's.
+- **Holding an existing identity** is restoring it by recovery code or
+  passphrase and keeping its seed under a new Key B.

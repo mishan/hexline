@@ -16,13 +16,15 @@ pub use connection::{
     ClassicLogin, CoreError, CoreUpdate, DeviceIdentity, LoginInfo, ServerConnection, UpdateSink,
 };
 pub use enroll::{card_name, enrollment_code, newer_card, renewal_due, Enrolled, Enrollee};
-pub use holder::{holder_mint, new_identity, HolderMinted, NewIdentity};
+pub use holder::{
+    holder_mint, new_identity, HolderCommitted, HolderMinted, HolderSetup, NewIdentity,
+};
 pub use identity::{
     cert_for_device, cert_info, cert_time, new_device, CertInfo, CertTime, NewDevice,
 };
 pub use model::{ChatLine, HistoryPage, Status, User};
 pub use names::{parts_hash, short_hash};
-pub use restore::{restore_identity, Restored, SecretKind};
+pub use restore::{restore_identity, restore_identity_to_hold, HeldRestore, Restored, SecretKind};
 
 uniffi::setup_scaffolding!();
 

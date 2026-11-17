@@ -65,15 +65,47 @@ pub async fn restore_identity(
         .spawn(async move { restore(&registrar, &handle, kind, secret, &device_name).await })
         .await
         .unwrap_or_else(|_| Err(protocol("the restore stopped")))
+        .map(|(restored, _)| restored)
 }
 
+/// A restore (as [`restore_identity`]) for a phone that will hold the
+/// identity (design §2.1): the identity's seed comes back beside the
+/// device, for the app to seal behind a Key B at once and then wipe.
+#[derive(uniffi::Record)]
+pub struct HeldRestore {
+    pub device: Restored,
+    pub identity_seed: Vec<u8>,
+}
+
+/// [`restore_identity`], keeping the identity's seed to be held.
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn restore_identity_to_hold(
+    registrar: String,
+    handle: String,
+    kind: SecretKind,
+    secret: String,
+    device_name: String,
+) -> Result<HeldRestore, CoreError> {
+    let secret = Zeroizing::new(secret);
+    crate::connection::RUNTIME
+        .spawn(async move { restore(&registrar, &handle, kind, secret, &device_name).await })
+        .await
+        .unwrap_or_else(|_| Err(protocol("the restore stopped")))
+        .map(|(device, seed)| HeldRestore {
+            device,
+            identity_seed: seed.to_vec(),
+        })
+}
+
+/// The device made, and the identity's seed: dropped, and so wiped, by a
+/// caller that does not hold it.
 async fn restore(
     registrar: &str,
     handle: &str,
     kind: SecretKind,
     secret: Zeroizing<String>,
     device_name: &str,
-) -> Result<Restored, CoreError> {
+) -> Result<(Restored, Zeroizing<[u8; 32]>), CoreError> {
     // Everything that can be refused here is, before the registrar is
     // asked anything: each fetch counts toward the handle's lockout.
     let base = registrar_base(registrar)?;
@@ -149,15 +181,19 @@ async fn restore(
         None => (card, false),
     };
     let fingerprint = id.fingerprint().to_string();
+    let seed = id.seed();
     drop(id);
-    Ok(Restored {
-        seed: device.seed().to_vec(),
-        cert,
-        card,
-        fingerprint,
-        new_card,
-        attested,
-    })
+    Ok((
+        Restored {
+            seed: device.seed().to_vec(),
+            cert,
+            card,
+            fingerprint,
+            new_card,
+            attested,
+        },
+        seed,
+    ))
 }
 
 /// The phone's certificate: login, messages and managing, no vouch, since
@@ -194,7 +230,7 @@ pub(crate) fn check_name(name: &str) -> Result<(), CoreError> {
 /// The base a registrar is reached at: `https://host` for a host, or a
 /// URL that names nothing but an origin. Plain http only to this
 /// machine, since what is sent is half of what the secret derives.
-fn registrar_base(registrar: &str) -> Result<Url, CoreError> {
+pub(crate) fn registrar_base(registrar: &str) -> Result<Url, CoreError> {
     let text = if registrar.contains("://") {
         registrar.to_owned()
     } else {
@@ -231,16 +267,16 @@ pub(crate) fn endpoint(base: &Url, path: &str) -> Result<String, CoreError> {
 }
 
 /// What a registrar's discovery document says of it.
-struct Registrar {
-    host: String,
+pub(crate) struct Registrar {
+    pub(crate) host: String,
     /// Its key, and any it is retiring: what an attestation may be signed by.
-    keys: Vec<[u8; 32]>,
-    envelopes: String,
-    register: String,
+    pub(crate) keys: Vec<[u8; 32]>,
+    pub(crate) envelopes: String,
+    pub(crate) register: String,
 }
 
 /// The registrar, from its discovery document.
-async fn discovered(
+pub(crate) async fn discovered(
     http: &hxng_client::reqwest::Client,
     base: &Url,
 ) -> Result<Registrar, CoreError> {
@@ -323,17 +359,23 @@ async fn reattest(
     let Ok(signed) = bytes(&reply, "attestation") else {
         return Ok(None);
     };
-    let ours = Attestation::parse(&signed).is_ok_and(|att| {
+    Ok(ours(&signed, reg, id, handle).then_some(signed))
+}
+
+/// Whether `signed` is `reg`'s attestation of `id` as `handle`, on a key
+/// it publishes.
+pub(crate) fn ours(signed: &[u8], reg: &Registrar, id: &IdentityKey, handle: &str) -> bool {
+    Attestation::parse(signed).is_ok_and(|att| {
         att.identity == id.public()
             && att.registrar == reg.host
+            && att.handle == handle
             && reg.keys.contains(&att.registrar_key)
-    });
-    Ok(ours.then_some(signed))
+    })
 }
 
 /// `card` re-signed with `attestation` in place of any other for the
 /// same handle at the same registrar, every other kept as signed.
-fn with_attestation(
+pub(crate) fn with_attestation(
     id: &IdentityKey,
     card: &[u8],
     attestation: &[u8],
@@ -391,11 +433,11 @@ pub(crate) fn retry_after(body: &[u8]) -> Option<u64> {
 
 /// Now, less the clock skew a server allows: a phone's clock ahead of the
 /// server's must not make the certificate not yet valid there.
-fn issued() -> u64 {
+pub(crate) fn issued() -> u64 {
     now().saturating_sub(300)
 }
 
-fn derive(secret: &Secret<'_>, kdf: Kdf) -> Result<Keys, CoreError> {
+pub(crate) fn derive(secret: &Secret<'_>, kdf: Kdf) -> Result<Keys, CoreError> {
     // The secret is borrowed, so the work cannot move to another thread:
     // block in place, which the core's multi-threaded runtime allows.
     tokio::task::block_in_place(|| Keys::derive(secret, kdf))
