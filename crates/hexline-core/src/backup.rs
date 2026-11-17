@@ -218,10 +218,8 @@ async fn put(
     let envelopes = endpoint(&base, &reg.envelopes)?;
     // Asked last before signing: a put signed after a newer backup began
     // would replace what that one saved.
-    if !turn.current() {
-        return Err(refused("superseded"));
-    }
-    let request = sign(&reg.host, signing_time()).map_err(|e| protocol(&e.to_string()))?;
+    let time = turn.reserve().ok_or_else(|| refused("superseded"))?;
+    let request = sign(&reg.host, time).map_err(|e| protocol(&e.to_string()))?;
     let reply = auth::put(&http, &envelopes, json!({ "request": b64(&request) })).await?;
     if reply.get(answered).and_then(Value::as_bool) != Some(true) {
         return Err(protocol(&format!("the registrar did not say {answered}")));
@@ -253,11 +251,25 @@ impl Turn {
         }
     }
 
-    /// Whether no backup of the identity was begun after this one.
-    fn current(&self) -> bool {
+    /// A time to sign at, if no backup of the identity was begun after
+    /// this one. Taken under the turns' lock, so a backup begun after it
+    /// signs a later time, which the registrar keeps over this one
+    /// whichever reaches it first.
+    fn reserve(&self) -> Option<u64> {
         let turns = TURNS.lock().unwrap_or_else(|e| e.into_inner());
-        turns.as_ref().and_then(|t| t.get(&self.identity)) == Some(&self.number)
+        if turns.as_ref().and_then(|t| t.get(&self.identity)) != Some(&self.number) {
+            return None;
+        }
+        #[cfg(test)]
+        BETWEEN.with(|hook| hook.borrow().as_ref().map(|hook| hook()));
+        Some(signing_time())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run by a reserve between its check and its time.
+    static BETWEEN: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// A backup's work on the core's runtime, aborted if the app stops waiting
@@ -310,10 +322,40 @@ mod tests {
         let (alice, bob) = (IdentityKey::generate(), IdentityKey::generate());
         let first = Turn::begin(&alice);
         let theirs = Turn::begin(&bob);
-        assert!(first.current());
         let second = Turn::begin(&alice);
-        assert!(!first.current(), "superseded");
-        assert!(second.current() && theirs.current());
+        assert_eq!(first.reserve(), None, "superseded");
+        assert!(second.reserve().is_some() && theirs.reserve().is_some());
+    }
+
+    #[test]
+    fn a_backup_begun_while_another_reserves_signs_a_later_time() {
+        use std::sync::mpsc::channel;
+        let id = IdentityKey::generate();
+        let first = Turn::begin(&id);
+        let (go, gone) = channel();
+        let (begun, has_begun) = channel();
+        let seed = id.seed();
+        let newer = std::thread::spawn(move || {
+            gone.recv().unwrap();
+            let second = Turn::begin(&IdentityKey::from_seed(&seed));
+            let _ = begun.send(());
+            second.reserve().unwrap()
+        });
+        // The newer backup is begun while the first is between its check
+        // and its time, and given the chance to take its own time then.
+        BETWEEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                go.send(()).unwrap();
+                let _ = has_begun.recv_timeout(std::time::Duration::from_millis(300));
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }))
+        });
+        let mine = first.reserve().expect("checked before the newer began");
+        BETWEEN.with(|hook| hook.borrow_mut().take());
+        assert!(
+            newer.join().unwrap() > mine,
+            "the newer backup's put is the one kept"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
