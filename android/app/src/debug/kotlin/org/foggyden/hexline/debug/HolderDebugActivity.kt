@@ -26,6 +26,7 @@ import org.foggyden.hexline.identity.HeldSeeds
 import org.foggyden.hexline.identity.Identities
 import org.foggyden.hexline.secrets.KeystoreHolderKeys
 import org.foggyden.hexline.secrets.NoHolderKeys
+import org.foggyden.hexline.secrets.NoScreenLock
 import org.foggyden.hexline.secrets.SoftwareKeysOnly
 import java.io.File
 
@@ -71,15 +72,20 @@ class HolderDebugActivity : FragmentActivity() {
             "held: ${hold()}"
         } catch (_: SoftwareKeysOnly) {
             getString(R.string.holder_software_only)
+        } catch (_: NoScreenLock) {
+            "Set a screen lock first"
         }
 
     /** A new identity's seed held behind the prompt; whether the person allowed it. */
     suspend fun hold(): Boolean {
         val made = newIdentity("Hexline holder test")
-        card = made.card
-        fingerprint = made.fingerprint
         return try {
-            held.hold(made.fingerprint, made.seed, authorizer)
+            held.hold(made.fingerprint, made.seed, authorizer).also {
+                if (it) {
+                    card = made.card
+                    fingerprint = made.fingerprint
+                }
+            }
         } finally {
             made.seed.fill(0)
         }

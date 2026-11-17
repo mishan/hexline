@@ -19,7 +19,7 @@ class FakeHolderKeys : HolderKeys {
     private val lost = HashSet<String>()
     private var lock = true
 
-    /** What the Keystore throws for now, by alias, from every call naming one. */
+    /** What the Keystore throws for now, by alias (or prefix), from every call naming one. */
     var trouble: ((String) -> Exception?)? = null
 
     /** What a delete throws, once each, before the key goes. */
@@ -79,7 +79,10 @@ class FakeHolderKeys : HolderKeys {
         return alias !in made || alias in lost
     }
 
-    override fun aliases(prefix: String) = made.keys.filter { it.startsWith(prefix) }
+    override fun aliases(prefix: String): List<String> {
+        trouble?.invoke(prefix)?.let { throw it }
+        return made.keys.filter { it.startsWith(prefix) }
+    }
 
     override fun delete(alias: String) {
         deleteFails?.invoke(alias)?.let {

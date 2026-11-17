@@ -65,10 +65,16 @@ class HolderKeysTest {
         assertEquals(KeyProperties.AUTH_BIOMETRIC_STRONG or KeyProperties.AUTH_DEVICE_CREDENTIAL, info.userAuthenticationType)
         // Read back as asked; a phone with no fingerprint reader shows no difference either way.
         assertFalse(info.isInvalidatedByBiometricEnrollment)
-        // The emulator's KeyMint is software; a phone's is its TEE or StrongBox.
-        val emulator = Build.HARDWARE in setOf("ranchu", "goldfish")
+        // The emulator's KeyMint is software; a phone's is its TEE or StrongBox,
+        // which Android 11 tells apart from software alone.
+        val expected =
+            when {
+                Build.HARDWARE in setOf("ranchu", "goldfish") -> setOf("software")
+                Build.VERSION.SDK_INT < Build.VERSION_CODES.S -> setOf("secure hardware")
+                else -> setOf("tee", "strongbox")
+            }
         val level = keys.security(alias)
-        assertTrue("in $level", if (emulator) level == "software" else level in setOf("tee", "strongbox"))
+        assertTrue("in $level", level in expected)
         val seal = keys.begin(alias, null)
         assertThrows("used without the person", Exception::class.java) { seal.run(ByteArray(32)) }
     }

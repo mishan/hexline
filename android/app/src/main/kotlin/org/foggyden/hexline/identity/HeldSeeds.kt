@@ -11,6 +11,7 @@ import org.foggyden.hexline.secrets.HolderKeys
 import org.foggyden.hexline.secrets.SoftwareKeysOnly
 import java.io.File
 import java.io.FileNotFoundException
+import java.io.IOException
 import java.util.UUID
 import kotlin.coroutines.CoroutineContext
 
@@ -150,18 +151,25 @@ class HeldSeeds(
         synchronized(LOCK) {
             val kept = fingerprints.map(::held).toSet()
             val named = HashSet<String>()
+            // A kept file not read now may name any key, so none is let go of.
+            var sure = true
             for (f in dir.listFiles().orEmpty()) {
                 if (!f.name.startsWith("held-") || f.name.contains('.')) continue
                 val alias = runCatching { decode(AtomicFile(f).readFully()).alias }.getOrNull()
                 if (f.name in kept) {
-                    alias?.let(named::add)
+                    if (alias == null) sure = false else named += alias
                 } else {
                     alias?.let { runCatching { keys.delete(it) } }
                     AtomicFile(f).delete()
                 }
             }
-            for (alias in keys.aliases(ALIAS)) {
-                if (alias !in named && alias !in pending) runCatching { keys.delete(alias) }
+            if (!sure) return@synchronized
+            try {
+                for (alias in keys.aliases(ALIAS)) {
+                    if (alias !in named && alias !in pending) runCatching { keys.delete(alias) }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "held keys left to sweep: ${e.javaClass.simpleName}")
             }
         }
 
@@ -178,12 +186,20 @@ class HeldSeeds(
         AtomicFile(File(dir, notice(fingerprint))).delete()
     }
 
-    /** Lets [fingerprint]'s seed go, with its keys: for an identity the person deleted. */
+    /**
+     * Lets [fingerprint]'s seed go, with its keys: for an identity the person
+     * deleted. [IOException] if the Keystore will not let go of one now.
+     */
     fun forget(fingerprint: String) =
         synchronized(LOCK) {
-            runCatching { sealed(fingerprint) }.getOrNull()?.let { keys.delete(it.alias) }
-            file(fingerprint).delete()
-            for (alias in keys.aliases(prefix(fingerprint))) if (alias !in pending) keys.delete(alias)
+            try {
+                runCatching { sealed(fingerprint) }.getOrNull()?.let { keys.delete(it.alias) }
+                file(fingerprint).delete()
+                for (alias in keys.aliases(prefix(fingerprint))) if (alias !in pending) keys.delete(alias)
+            } catch (e: Exception) {
+                // A store's failure, so the delete is set aside, its identity kept, to be asked again.
+                throw IOException("a held seed not let go of", e)
+            }
         }
 
     private class Held(
@@ -234,11 +250,13 @@ class HeldSeeds(
         val out = file.startWrite()
         try {
             out.write(bytes)
-            file.finishWrite(out)
         } catch (e: Exception) {
             file.failWrite(out)
             throw e
         }
+        file.finishWrite(out)
+        // finishWrite logs a rename that failed and returns as if it had not.
+        if (!file.readFully().contentEquals(bytes)) throw IOException("${file.baseFile.name} not written")
     }
 
     private fun file(fingerprint: String) = AtomicFile(File(dir, held(fingerprint)))

@@ -5,6 +5,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import org.foggyden.hexline.core.shortHash
 import org.foggyden.hexline.secrets.FakeHolderKeys
 import org.foggyden.hexline.secrets.HeldKeyLost
 import org.foggyden.hexline.secrets.NoScreenLock
@@ -23,6 +24,7 @@ import org.robolectric.annotation.Config
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
+import java.security.KeyStoreException
 import java.security.ProviderException
 import kotlin.coroutines.EmptyCoroutineContext
 
@@ -229,6 +231,57 @@ class HeldSeedsTest {
         assertFalse(held.isHeld(OTHER))
         assertEquals("the one key named", 1, keys.aliases.size)
         assertArrayEquals(seed, open())
+    }
+
+    @Test
+    fun aKeptFileThatDoesNotReadNowKeepsItsKey() {
+        assertTrue(hold())
+        val file = dir.listFiles()!!.single { it.name.startsWith("held-") }
+        val bytes = file.readBytes()
+        file.writeBytes(byteArrayOf(2, 0))
+        held.sweep(listOf(FP))
+        file.writeBytes(bytes)
+        assertArrayEquals(seed, open())
+    }
+
+    @Test
+    fun aSweepTheKeystoreCannotAnswerNowLetsGoOfNothing() {
+        assertTrue(hold())
+        keys.trouble = { KeyStoreException("busy") }
+        held.sweep(listOf(FP))
+        keys.trouble = null
+        assertArrayEquals(seed, open())
+    }
+
+    @Test
+    fun aKeyTheKeystoreWillNotLetGoOfNowIsAStoreFailureToForgetAgain() {
+        assertTrue(hold())
+        keys.deleteFails = { KeyStoreException("busy") }
+        try {
+            held.forget(FP)
+            fail("forgotten")
+        } catch (_: IOException) {
+        }
+        assertTrue(held.isHeld(FP))
+        held.forget(FP)
+        assertFalse(held.isHeld(FP))
+        assertEquals(emptyList<String>(), keys.aliases)
+    }
+
+    @Test
+    fun aWriteTheFileSystemDidNotMakeLetsGoOfNothing() {
+        // A directory where the file goes: AtomicFile logs the failed rename and returns.
+        fun blocked(name: String) = File(dir, name + "-" + shortHash(FP.toByteArray())).apply { mkdirs() }.resolve("x").writeText("x")
+        assertTrue(hold())
+        blocked("lost")
+        keys.removeLock()
+        assertEquals("not demoted untold", emptyList<String>(), held.demoteLost(listOf(FP)))
+        assertTrue(held.isHeld(FP))
+        keys.setLock()
+        File(dir, "held-" + shortHash(FP.toByteArray())).delete()
+        blocked("held")
+        assertTrue("a hold not written is not held", runCatching { hold() }.isFailure)
+        assertEquals("its key let go of", emptyList<String>(), keys.aliases)
     }
 
     private companion object {
