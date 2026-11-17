@@ -90,22 +90,6 @@ class Identities(
             stored
         }
 
-    /**
-     * The short hash naming every identity file here, whether it reads or
-     * not, and whatever a write cut short left of it: what a held seed is
-     * kept for.
-     */
-    fun names(): Set<String> =
-        synchronized(LOCK) {
-            dir
-                .listFiles()
-                .orEmpty()
-                .map { it.name.substringBefore('.') }
-                .filter { it.startsWith("identity-") }
-                .map { it.removePrefix("identity-") }
-                .toSet()
-        }
-
     /** Every identity kept whose certificate and card still hold. */
     fun list(): List<StoredIdentity> =
         synchronized(LOCK) {

@@ -1000,15 +1000,29 @@ class ChatViewModelTest : ViewModelHarness() {
     }
 
     @Test
-    fun aSeedHeldForAnIdentityNoLongerKeptIsLetGoOfAtStart() {
+    fun aKeyNoHeldFileNamesIsLetGoOfAtStart() {
         keepIdentity()
         hold()
-        hold(OTHER_HELD)
+        stores.keys.create("hexline-held-stray")
         model()
         settle()
         assertTrue(stores.held.isHeld(FINGERPRINT))
-        assertFalse(stores.held.isHeld(OTHER_HELD))
-        assertEquals("the kept identity's key alone", 1, stores.keys.aliases.size)
+        assertEquals("the held identity's key alone", 1, stores.keys.aliases.size)
+    }
+
+    @Test
+    fun aHeldSeedOutlivesAnIdentityListingThatFailedAtStart() {
+        keepIdentity()
+        hold()
+        stores.identityDir.setReadable(false)
+        try {
+            model()
+            settle()
+        } finally {
+            stores.identityDir.setReadable(true)
+        }
+        val opened = runBlocking { stores.held.use(FINGERPRINT, stores.keys.authorizer()) { it.copyOf() } }
+        assertArrayEquals(ByteArray(32) { 1 }, opened)
     }
 
     @Test
@@ -1025,14 +1039,10 @@ class ChatViewModelTest : ViewModelHarness() {
         assertArrayEquals(ByteArray(32) { 1 }, opened)
     }
 
-    private fun hold(fingerprint: String = FINGERPRINT) =
+    private fun hold() =
         assertTrue(
             runBlocking {
-                stores.held.hold(fingerprint, ByteArray(32) { 1 }, stores.keys.authorizer())
+                stores.held.hold(FINGERPRINT, ByteArray(32) { 1 }, stores.keys.authorizer())
             },
         )
-
-    private companion object {
-        const val OTHER_HELD = "9htgz65xb7yfs53dmhdanfmk7fgn995n1571rjnz8a36a1fks5z0"
-    }
 }

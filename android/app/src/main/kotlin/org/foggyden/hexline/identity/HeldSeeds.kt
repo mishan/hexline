@@ -42,6 +42,7 @@ class HeldSeeds(
     private val keys: HolderKeys,
     private val io: CoroutineContext,
     private val softwareKeys: Boolean = false,
+    private val readBack: (AtomicFile) -> ByteArray = AtomicFile::readFully,
 ) {
     init {
         dir.mkdirs()
@@ -77,7 +78,13 @@ class HeldSeeds(
                 val (iv, sealed) = seal.run(seed)
                 synchronized(LOCK) {
                     val before = runCatching { sealed(fingerprint) }.getOrNull()?.alias
-                    write(file(fingerprint), encode(alias, iv, sealed))
+                    try {
+                        write(file(fingerprint), encode(alias, iv, sealed))
+                    } catch (e: UnsureWrite) {
+                        // The file may name either key, so both stay, for the sweep to settle.
+                        kept = true
+                        throw e
+                    }
                     kept = true
                     before?.takeIf { it != alias }?.let(keys::delete)
                 }
@@ -143,32 +150,27 @@ class HeldSeeds(
     }
 
     /**
-     * Lets go of every held seed and key of an identity none of [names]
-     * (the short hashes of [Identities.names]) is, and of every key no
-     * sealed file names: what a delete or a hold cut short by the process's
-     * end left behind.
+     * Lets go of every key no held file names (a hold cut short by the
+     * process's end leaves one), once every held file here has been read and
+     * names a key its own name allows; of nothing at all otherwise. A held
+     * file is never let go of here: one whose identity is not kept may be
+     * the only copy of an identity key, so only [forget] lets one go.
      */
-    fun sweep(names: Set<String>) =
+    fun sweep() =
         synchronized(LOCK) {
-            val kept = names.map { "held-$it" }.toSet()
-            val named = HashSet<String>()
-            // A kept file not read now may name any key, so none is let go of.
-            var sure = true
-            for (f in dir.listFiles().orEmpty()) {
-                if (!f.name.startsWith("held-") || f.name.contains('.')) continue
-                val alias = runCatching { decode(AtomicFile(f).readFully()).alias }.getOrNull()
-                if (f.name in kept) {
-                    if (alias == null) sure = false else named += alias
-                } else {
-                    alias?.let { runCatching { keys.delete(it) } }
-                    AtomicFile(f).delete()
-                }
-            }
-            if (!sure) return@synchronized
             try {
-                for (alias in keys.aliases(ALIAS)) {
-                    if (alias !in named && alias !in pending) runCatching { keys.delete(alias) }
-                }
+                val files = dir.listFiles() ?: throw IOException("held seeds not listed")
+                val named =
+                    files
+                        .map { it.name.substringBefore('.') }
+                        .filter { it.startsWith("held-") }
+                        .distinct()
+                        .map { name ->
+                            decode(AtomicFile(File(dir, name)).readFully()).alias.also {
+                                if (!it.startsWith(ALIAS + name.removePrefix("held-") + "-")) throw BadHeldFile()
+                            }
+                        }.toSet()
+                for (alias in keys.aliases(ALIAS)) if (alias !in named && alias !in pending) keys.delete(alias)
             } catch (e: Exception) {
                 Log.w(TAG, "held keys left to sweep: ${e.javaClass.simpleName}")
             }
@@ -256,8 +258,15 @@ class HeldSeeds(
             throw e
         }
         file.finishWrite(out)
-        // finishWrite logs a rename that failed and returns as if it had not.
-        if (!file.readFully().contentEquals(bytes)) throw IOException("${file.baseFile.name} not written")
+        // finishWrite logs a rename that failed and returns as if it had not;
+        // a read back that fails says neither.
+        val back =
+            try {
+                readBack(file)
+            } catch (e: IOException) {
+                throw UnsureWrite(e)
+            }
+        if (!back.contentEquals(bytes)) throw IOException("${file.baseFile.name} not written")
     }
 
     private fun file(fingerprint: String) = AtomicFile(File(dir, held(fingerprint)))
@@ -267,6 +276,11 @@ class HeldSeeds(
     private fun notice(fingerprint: String) = "lost-" + shortHash(fingerprint.toByteArray())
 
     private fun prefix(fingerprint: String) = ALIAS + shortHash(fingerprint.toByteArray()) + "-"
+
+    /** A write that may or may not have replaced its file. */
+    private class UnsureWrite(
+        cause: IOException,
+    ) : IOException("a write not known to be made", cause)
 
     /** A sealed file that does not read as one: left as it is, never taken for a lost key. */
     class BadHeldFile : Exception("a held seed's file does not read")

@@ -222,15 +222,14 @@ class HeldSeedsTest {
     }
 
     @Test
-    fun whatNoIdentityNamesIsSweptAway() {
+    fun aKeyNoHeldFileNamesIsSweptAway() {
         assertTrue(hold())
         assertTrue(hold(OTHER))
         keys.create("hexline-held-stray")
-        held.sweep(setOf(shortHash(FP.toByteArray())))
-        assertTrue(held.isHeld(FP))
-        assertFalse(held.isHeld(OTHER))
-        assertEquals("the one key named", 1, keys.aliases.size)
+        held.sweep()
+        assertEquals("the keys named", 2, keys.aliases.size)
         assertArrayEquals(seed, open())
+        assertArrayEquals(seed, open(OTHER))
     }
 
     @Test
@@ -239,7 +238,7 @@ class HeldSeedsTest {
         val file = dir.listFiles()!!.single { it.name.startsWith("held-") }
         val bytes = file.readBytes()
         file.writeBytes(byteArrayOf(2, 0))
-        held.sweep(setOf(shortHash(FP.toByteArray())))
+        held.sweep()
         file.writeBytes(bytes)
         assertArrayEquals(seed, open())
     }
@@ -248,7 +247,7 @@ class HeldSeedsTest {
     fun aSweepTheKeystoreCannotAnswerNowLetsGoOfNothing() {
         assertTrue(hold())
         keys.trouble = { KeyStoreException("busy") }
-        held.sweep(setOf(shortHash(FP.toByteArray())))
+        held.sweep()
         keys.trouble = null
         assertArrayEquals(seed, open())
     }
@@ -281,7 +280,50 @@ class HeldSeedsTest {
         File(dir, "held-" + shortHash(FP.toByteArray())).delete()
         blocked("held")
         assertTrue("a hold not written is not held", runCatching { hold() }.isFailure)
-        assertEquals("its key let go of", emptyList<String>(), keys.aliases)
+    }
+
+    @Test
+    fun aHeldListingThatFailedLetsGoOfNoKey() {
+        assertTrue(hold())
+        dir.setReadable(false)
+        try {
+            held.sweep()
+        } finally {
+            dir.setReadable(true)
+        }
+        assertArrayEquals(seed, open())
+    }
+
+    @Test
+    fun aStaleCopyOfAKeptFileLetsGoOfNoKey() {
+        assertTrue(hold())
+        File(dir, "held-" + shortHash(FP.toByteArray())).copyTo(File(dir, "held-" + shortHash(OTHER.toByteArray())))
+        held.sweep()
+        assertArrayEquals(seed, open())
+    }
+
+    @Test
+    fun aSeedForAnIdentityNotKeptOutlivesAKeyListingThatFailed() {
+        assertTrue(hold(OTHER))
+        keys.trouble = { if (it == "hexline-held-") KeyStoreException("busy") else null }
+        held.sweep()
+        keys.trouble = null
+        assertArrayEquals(seed, open(OTHER))
+    }
+
+    @Test
+    fun aHoldWhoseFileMayHaveBeenWrittenKeepsBothKeysUntilTheSweep() {
+        assertTrue(hold())
+        var shaky = false
+        val unsure = HeldSeeds(dir, keys, EmptyCoroutineContext, readBack = { if (shaky) throw IOException("eio") else it.readFully() })
+        val again = ByteArray(32) { 9 }
+        shaky = true
+        assertTrue(runCatching { runBlocking { unsure.hold(FP, again.copyOf(), keys.authorizer()) } }.isFailure)
+        assertArrayEquals(again, open())
+        assertEquals("both kept", 2, keys.aliases.size)
+        held.sweep()
+        assertEquals("the one no file names let go of", 1, keys.aliases.size)
+        assertArrayEquals(again, open())
     }
 
     private companion object {
