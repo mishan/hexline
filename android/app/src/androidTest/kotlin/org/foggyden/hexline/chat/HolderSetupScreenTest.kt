@@ -8,10 +8,12 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.test.ComposeTimeoutException
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import androidx.fragment.app.testing.EmptyFragmentActivity
 import androidx.lifecycle.ProcessLifecycleOwner
@@ -147,9 +149,22 @@ class HolderSetupScreenTest {
     }
 
     private fun begin() {
-        rule.onNode(hasSetTextAction() and hasText(text(R.string.registrar))).performTextInput("reg.example")
-        rule.onNode(hasSetTextAction() and hasText(text(R.string.handle))).performTextInput("carol")
-        rule.onNode(hasText(text(R.string.holder_continue))).performClick()
+        type(R.string.registrar, "reg.example")
+        type(R.string.handle, "carol")
+        tap(R.string.holder_continue)
+    }
+
+    // Scrolled to first, as a person would: a small screen, as CI's emulator has, puts
+    // most of the form below the fold, where a tap lands outside the window.
+    private fun tap(label: Int) {
+        rule.onNode(hasText(text(label))).performScrollTo().performClick()
+    }
+
+    private fun type(
+        label: Int,
+        typed: String,
+    ) {
+        rule.onNode(hasSetTextAction() and hasText(text(label))).performScrollTo().performTextInput(typed)
     }
 
     private fun secure(): Boolean {
@@ -162,7 +177,12 @@ class HolderSetupScreenTest {
         vm: ChatViewModel,
         state: Class<T>,
     ): T {
-        rule.waitUntil(15_000) { state.isInstance(vm.holderSetup.value) }
+        try {
+            rule.waitUntil(15_000) { state.isInstance(vm.holderSetup.value) }
+        } catch (e: ComposeTimeoutException) {
+            // What it stopped at, its codes left out as the states print them.
+            throw AssertionError("waited for ${state.simpleName}, at ${vm.holderSetup.value}", e)
+        }
         return state.cast(vm.holderSetup.value)!!
     }
 
@@ -175,17 +195,17 @@ class HolderSetupScreenTest {
         val successor = reached(vm, SettingUp.Successor::class.java).code
         rule.waitForIdle()
         assertTrue("a code kept off screenshots", secure())
-        rule.onNode(hasText(text(R.string.holder_written))).performClick()
-        rule.onNode(hasSetTextAction() and hasText(text(R.string.holder_confirm_successor))).performTextInput(successor)
-        rule.onNode(hasText(text(R.string.holder_confirm))).performClick()
+        tap(R.string.holder_written)
+        type(R.string.holder_confirm_successor, successor)
+        tap(R.string.holder_confirm)
         val recovery = reached(vm, SettingUp.Recovery::class.java).code
-        rule.onNode(hasText(text(R.string.holder_written))).performClick()
-        rule.onNode(hasSetTextAction() and hasText(text(R.string.holder_confirm_recovery))).performTextInput(recovery)
-        rule.onNode(hasText(text(R.string.holder_confirm))).performClick()
+        tap(R.string.holder_written)
+        type(R.string.holder_confirm_recovery, recovery)
+        tap(R.string.holder_confirm)
         reached(vm, SettingUp.ReadyToHold::class.java)
         rule.waitForIdle()
         assertFalse("no code on screen", secure())
-        rule.onNode(hasText(text(R.string.holder_hold))).performClick()
+        tap(R.string.holder_hold)
         // Typed only into the system's own prompt, once it has the focus: keys sent
         // before it is up go to nothing, or count as a wrong PIN.
         val deadline = System.currentTimeMillis() + 60_000

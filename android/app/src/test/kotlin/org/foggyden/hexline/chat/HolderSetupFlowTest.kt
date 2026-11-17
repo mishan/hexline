@@ -391,6 +391,7 @@ class HolderSetupFlowTest : ViewModelHarness() {
         setup.onCommit = { stores.identityDir.setWritable(false) }
         vm.holdSetup(stores.keys.authorizer())
         settle()
+        assertEquals(SettingUp.Failed(SetupProblem.NotKept, "carol", fixed = false), vm.holderSetup.value)
         stores.identityDir.setWritable(true)
         setup.onCommit = {}
         vm.retrySetup("carol2", null)
