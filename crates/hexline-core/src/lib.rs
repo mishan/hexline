@@ -11,6 +11,7 @@ mod identity;
 mod model;
 mod names;
 mod restore;
+mod rotation;
 #[cfg(target_os = "android")]
 mod tls;
 
@@ -35,6 +36,7 @@ pub use identity::{
 pub use model::{ChatLine, HistoryPage, Status, User};
 pub use names::{parts_hash, short_hash};
 pub use restore::{restore_identity, restore_identity_to_hold, HeldRestore, Restored, SecretKind};
+pub use rotation::RotationSetup;
 
 uniffi::setup_scaffolding!();
 

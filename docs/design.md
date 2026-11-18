@@ -506,3 +506,38 @@ Slice 6 holder mode, decided 2026-11-16:
   card commits to). The passphrase envelope is 6c's.
 - **Holding an existing identity** is restoring it by recovery code or
   passphrase and keeping its seed under a new Key B.
+
+Slice 6c-3a rotation, decided 2026-11-18:
+
+- **Offered** only for a held identity whose card commits to a
+  successor. The typed successor code is read against that commitment,
+  one misread symbol mended and said so; a wrong code costs nothing.
+- **The new key** gets a new successor code and recovery code, both
+  typed back, and its card keeps the name. This phone becomes a new
+  device of it; other devices of the old key enroll again with the new
+  key's holder, listed on the Done screen. The recovery envelope is part
+  of the rotation, the passphrase an optional step after it.
+- **Prompt order:** the new key is held under a new Key B first, then the
+  old key's Key B is opened once, to sign the rotation, and the old key
+  signs nothing else. From a new phone the old key comes out of its
+  envelope inside the core and is dropped there.
+- **The record** is saved and re-posted as the same bytes on every
+  retry, never signed again: the one exception to re-signing over
+  re-posting (section 2.1). A registrar's `bad_time` is therefore
+  retried later, as a phone clock ahead of it signs a time to come.
+- **Registrars:** the home registrar first, then the others the old
+  card is attested at, none until home has published. Cancel is allowed
+  until the first send, never after.
+- **Until home publishes** the old key is the identity: its Key B is
+  kept, and the new key signs in nowhere. A pending `rotation_delay` is
+  finished at or after its time behind one prompt. The new key signs in
+  with `create = false` until every registrar has moved.
+- **Servers:** the record rides the new key's identity `auth`, kept with
+  it, so a server that anchored the old key's commitment moves the
+  account without trusting a registrar; each saved server the old key
+  signed in to is told this way once the rotation is done.
+- **No rotation is signed ahead**, at setup or otherwise: it would be a
+  standing object anyone could post.
+- **The old successor code** is the identity's key once the rotation is
+  published: the Done screen says to destroy it, or keep it as carefully
+  as the phone itself.
