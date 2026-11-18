@@ -340,5 +340,7 @@ internal fun describe(problem: SetupProblem): String =
         SetupProblem.Unreachable -> stringResource(R.string.restore_unreachable)
         SetupProblem.KeyLost -> stringResource(R.string.holder_key_lost)
         SetupProblem.NotKept -> stringResource(R.string.restore_not_kept)
+        SetupProblem.RevocationUnconfirmed -> stringResource(R.string.revoke_unconfirmed)
+        SetupProblem.OwnDevice -> stringResource(R.string.revoke_own_device)
         SetupProblem.Other -> stringResource(R.string.holder_failed)
     }

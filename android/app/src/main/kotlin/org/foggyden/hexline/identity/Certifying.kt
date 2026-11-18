@@ -98,11 +98,9 @@ sealed interface Revoking {
         override val identity: String,
     ) : Revoking
 
-    /** Revoked: [kept] false while this phone's list could not mark it, and it is marked in memory. */
     data class Done(
         override val identity: String,
         val device: MintedDevice,
-        val kept: Boolean = true,
     ) : Revoking
 
     data class Failed(

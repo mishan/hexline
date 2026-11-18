@@ -352,6 +352,7 @@ class Identities(
     fun minted(
         fingerprint: String,
         given: MintedDevice,
+        now: Long,
     ): Unit =
         synchronized(LOCK) {
             // An empty name kept as none, as it reads back.
@@ -368,17 +369,10 @@ class Identities(
                         given.revoking,
                     )
                 } ?: given
-            writeMinted(fingerprint, minted(fingerprint).filter { !it.device.contentEquals(device.device) } + device)
+            // A certificate past [now] is let go of as the list is written, a revoked one kept.
+            val live = minted(fingerprint).filter { it.revoked || it.revoking || it.expires > now }
+            writeMinted(fingerprint, live.filter { !it.device.contentEquals(device.device) } + device)
             if (minted(fingerprint).none { it == device }) throw java.io.IOException("not kept")
-        }
-
-    /** The device [device] taken off [fingerprint]'s list: it was never certified after all. */
-    fun unminted(
-        fingerprint: String,
-        device: ByteArray,
-    ): Unit =
-        synchronized(LOCK) {
-            writeMinted(fingerprint, minted(fingerprint).filter { !it.device.contentEquals(device) })
         }
 
     private fun writeMinted(
@@ -401,6 +395,22 @@ class Identities(
         }
         commit(mintedFile(fingerprint), list.toString().toByteArray())
     }
+
+    /** Lists of devices, and copies set aside, kept for an identity no longer here: let go of. */
+    fun sweepOrphans(): Unit =
+        synchronized(LOCK) {
+            val identities =
+                dir
+                    .list()
+                    .orEmpty()
+                    .map { it.removeSuffix(".bak") }
+                    .filter { it.startsWith("identity-") }
+                    .toSet()
+            for (file in dir.listFiles().orEmpty()) {
+                val hash = file.name.removePrefix("minted-").substringBefore('.')
+                if (file.name.startsWith("minted-") && "identity-$hash" !in identities) file.delete()
+            }
+        }
 
     fun delete(fingerprint: String): Unit =
         synchronized(LOCK) {
