@@ -571,6 +571,38 @@ class CertifyFlowTest : ViewModelHarness() {
     }
 
     @Test
+    fun aDeviceAskingUnderAnEmptyNameIsListedAndSent() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val session = shown(vm, fingerprint)
+        val nameless = asking("")
+        session.next.complete(nameless)
+        settle()
+        vm.approveDevice(fingerprint, manage = false, stores.keys.authorizer())
+        settle()
+        assertTrue(session.delivered)
+        assertEquals(listOf(null), onDisk(fingerprint).map { it.name })
+    }
+
+    @Test
+    fun aRevocationTheKeyFailsBeforeTheRegistrarIsAskedLeavesTheDeviceAsItWas() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        vm.openDevices(fingerprint)
+        certified(vm, fingerprint)
+        val device = devices(vm).single { !it.own }
+        stores.keys.trouble = { java.security.ProviderException("the Keystore busy") }
+        vm.revokeDevice(fingerprint, device, RevokeReason.LOST, stores.keys.authorizer())
+        settle()
+        stores.keys.trouble = null
+        assertEquals(Revoking.Failed(fingerprint, SetupProblem.NotKept), vm.revoking.value)
+        assertEquals(emptyList<Any>(), setups.revocations)
+        assertEquals(listOf(device), onDisk(fingerprint))
+    }
+
+    @Test
     fun aRequestUnansweredWhenTheMailboxLetsItGoEnds() {
         val vm = model()
         settle()

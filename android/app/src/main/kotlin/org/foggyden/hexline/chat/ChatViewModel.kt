@@ -1192,6 +1192,13 @@ class ChatViewModel internal constructor(
                             if (e is CoreException.Refused && e.code != "server_error") withContext(store) { keep(fingerprint, before) }
                             refreshDevices(fingerprint)
                             throw e
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            // The key's own trouble, the registrar not asked: the device is as it was.
+                            withContext(store) { keep(fingerprint, before) }
+                            refreshDevices(fingerprint)
+                            throw e
                         }
                     if (asked == null) {
                         withContext(store) { keep(fingerprint, before) }

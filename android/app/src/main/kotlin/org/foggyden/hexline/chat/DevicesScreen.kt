@@ -145,7 +145,13 @@ fun DevicesScreen(
                 Text(stringResource(R.string.certify_never_vouch), style = MaterialTheme.typography.bodySmall)
                 when (certifying.revoked) {
                     Revoked.Yes -> Problem(stringResource(R.string.certify_revoked))
-                    Revoked.Unknown -> Problem(stringResource(R.string.certify_revoked_unknown))
+                    // What would let it be told: the list read again, or the one set aside discarded.
+                    Revoked.Unknown ->
+                        Problem(
+                            stringResource(
+                                if (devices?.setAside == true) R.string.certify_revoked_unknown else R.string.certify_revoked_unopened,
+                            ),
+                        )
                     Revoked.No -> Unit
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

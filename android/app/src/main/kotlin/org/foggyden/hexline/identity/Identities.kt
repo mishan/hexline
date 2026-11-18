@@ -351,9 +351,23 @@ class Identities(
      */
     fun minted(
         fingerprint: String,
-        device: MintedDevice,
+        given: MintedDevice,
     ): Unit =
         synchronized(LOCK) {
+            // An empty name kept as none, as it reads back.
+            val device =
+                given.name?.takeIf { it.isEmpty() }?.let {
+                    MintedDevice(
+                        given.device,
+                        given.fingerprint,
+                        null,
+                        given.expires,
+                        given.canManage,
+                        given.revoked,
+                        given.own,
+                        given.revoking,
+                    )
+                } ?: given
             writeMinted(fingerprint, minted(fingerprint).filter { !it.device.contentEquals(device.device) } + device)
             if (minted(fingerprint).none { it == device }) throw java.io.IOException("not kept")
         }

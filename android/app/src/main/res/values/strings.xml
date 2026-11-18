@@ -241,6 +241,7 @@
     <string name="certify_manage">Let it manage the identity\'s links. A device that manages can also revoke this identity\'s other devices, this phone included.</string>
     <string name="certify_never_vouch">It will never be able to certify other devices.</string>
     <string name="certify_revoked">This device was revoked. It cannot be certified again.</string>
+    <string name="certify_revoked_unopened">This phone\'s list of devices it certified would not open, so it cannot tell whether this device was revoked. Try again below to approve it.</string>
     <string name="certify_revoked_unknown">This phone\'s list of devices it certified could not be read, so it cannot tell whether this device was revoked. Discard the unreadable list below to approve it.</string>
     <string name="devices_loading">Reading the list&#8230;</string>
     <string name="devices_unreadable">This phone\'s list of devices it certified could not be read. It was kept aside, and devices certified before it may not be listed here. Until it is discarded, no device can be approved.</string>
