@@ -159,6 +159,12 @@ class FakeSetups : HolderSetups {
 
     val revocations = mutableListOf<Revocation>()
 
+    /** What the next revocation throws, if anything, the registrar's answer not had. */
+    var revokeFails: CoreException? = null
+
+    /** Called as each revocation reaches the registrar. */
+    var onRevoke: () -> Unit = {}
+
     override suspend fun revoke(
         identitySeed: ByteArray,
         registrar: String,
@@ -169,6 +175,11 @@ class FakeSetups : HolderSetups {
     ) {
         yield()
         if (device.contentEquals(thisDevice)) throw CoreException.Refused("own_device", "")
+        onRevoke()
+        revokeFails?.let {
+            revokeFails = null
+            throw it
+        }
         revocations += Revocation(identitySeed, registrar, device, reason, until)
     }
 
@@ -196,6 +207,14 @@ class FakeSetups : HolderSetups {
 
         /** What the next sends throw, in turn, before one goes through. */
         val deliverFails = ArrayDeque<CoreException>()
+
+        /** Each send tried. */
+        var sends = 0
+
+        /** Completed when the request asked about can no longer be answered. */
+        val ends = CompletableDeferred<Unit>()
+
+        override suspend fun answerEnds() = ends.await()
 
         /** The device certified: its key and when its certificate ends. */
         val device = ByteArray(32) { 7 }
@@ -239,6 +258,7 @@ class FakeSetups : HolderSetups {
             if (canceled) throw CoreException.Refused("canceled", "")
             if (!certified) throw CoreException.Refused("nothing_certified", "")
             if (delivered) throw CoreException.Refused("used", "")
+            sends++
             deliverFails.removeFirstOrNull()?.let { throw it }
             onDeliver()
             delivered = true

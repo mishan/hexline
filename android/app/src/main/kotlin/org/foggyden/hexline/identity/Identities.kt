@@ -73,6 +73,8 @@ class Identities(
     context: Context,
     private val secrets: Secrets = SecretStore(context),
     private val dir: File = File(context.filesDir, "identities"),
+    /** How a file is written whole: a test's may say it wrote what the disk did not keep. */
+    private val commit: (File, ByteArray) -> Unit = ::writeAtomically,
 ) {
     init {
         dir.mkdirs()
@@ -307,6 +309,7 @@ class Identities(
                         json.getLong("expires"),
                         json.optBoolean("manage"),
                         json.optBoolean("revoked"),
+                        revoking = json.optBoolean("revoking"),
                     )
                 }
             } catch (e: Exception) {
@@ -330,20 +333,37 @@ class Identities(
     ) {
         var n = 0
         while (File(dir, "${file.name}.unread-$n").exists()) n++
-        writeAtomically(File(dir, "${file.name}.unread-$n"), bytes)
+        val copy = File(dir, "${file.name}.unread-$n")
+        commit(copy, bytes)
+        // The original goes only once its copy is known to be there.
+        if (!AtomicFile(copy).readFully().contentEquals(bytes)) throw java.io.IOException("not set aside")
         AtomicFile(file).delete()
     }
 
     private fun unread(fingerprint: String) =
         dir.listFiles().orEmpty().filter { it.name.startsWith(mintedFile(fingerprint).name + ".unread-") }
 
-    /** [device] certified by [fingerprint]'s key, in place of any it certified before for the same key. */
+    /**
+     * [device] certified by [fingerprint]'s key, in place of any it certified
+     * before for the same key. Read back once written: one the disk did not
+     * keep, whatever the write said, is an [java.io.IOException].
+     */
     fun minted(
         fingerprint: String,
         device: MintedDevice,
     ): Unit =
         synchronized(LOCK) {
             writeMinted(fingerprint, minted(fingerprint).filter { !it.device.contentEquals(device.device) } + device)
+            if (minted(fingerprint).none { it == device }) throw java.io.IOException("not kept")
+        }
+
+    /** The device [device] taken off [fingerprint]'s list: it was never certified after all. */
+    fun unminted(
+        fingerprint: String,
+        device: ByteArray,
+    ): Unit =
+        synchronized(LOCK) {
+            writeMinted(fingerprint, minted(fingerprint).filter { !it.device.contentEquals(device) })
         }
 
     private fun writeMinted(
@@ -360,10 +380,11 @@ class Identities(
                         d.name?.let { put("name", it) }
                         if (d.canManage) put("manage", true)
                         if (d.revoked) put("revoked", true)
+                        if (d.revoking) put("revoking", true)
                     },
             )
         }
-        writeAtomically(mintedFile(fingerprint), list.toString().toByteArray())
+        commit(mintedFile(fingerprint), list.toString().toByteArray())
     }
 
     fun delete(fingerprint: String): Unit =
@@ -431,22 +452,7 @@ class Identities(
                     if (stored.unfinished) put("unfinished", true)
                     if (stored.unrecoverable) put("unrecoverable", true)
                 }
-        writeAtomically(file, json.toString().toByteArray())
-    }
-
-    private fun writeAtomically(
-        file: File,
-        bytes: ByteArray,
-    ) {
-        val atomic = AtomicFile(file)
-        val out = atomic.startWrite()
-        try {
-            out.write(bytes)
-            atomic.finishWrite(out)
-        } catch (e: Exception) {
-            atomic.failWrite(out)
-            throw e
-        }
+        commit(file, json.toString().toByteArray())
     }
 
     /** Names from the identity, and the device: never anything typed. */
@@ -466,5 +472,21 @@ class Identities(
     private companion object {
         /** One for the process: AtomicFile is not safe for two writers of one name. */
         val LOCK = Any()
+    }
+}
+
+/** [bytes] written as [file] whole, or not at all, as [AtomicFile] writes. */
+fun writeAtomically(
+    file: File,
+    bytes: ByteArray,
+) {
+    val atomic = AtomicFile(file)
+    val out = atomic.startWrite()
+    try {
+        out.write(bytes)
+        atomic.finishWrite(out)
+    } catch (e: Exception) {
+        atomic.failWrite(out)
+        throw e
     }
 }

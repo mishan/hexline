@@ -261,7 +261,7 @@ class HolderSetupScreenTest {
         tap(R.string.certify_start)
         rule.waitUntil(15_000) { vm.certify.value is Certifying.Showing }
         val lm = Caps(login = true, message = true, manage = false, vouch = false)
-        val asked = HolderRequest(ByteArray(32) { 7 }, "b283bthc", "Tablet", false, false, null, null, lm, true, 90u)
+        val asked = HolderRequest(ByteArray(32) { 7 }, "b283bthc", "Tablet", false, false, null, null, lm, true, 90uL * 86_400uL)
         OfflineSetups.session.next.complete(asked)
         rule.waitUntil(15_000) { vm.certify.value is Certifying.Asked }
         rule.onNode(hasText("b283bthc")).assertExists()
@@ -269,7 +269,9 @@ class HolderSetupScreenTest {
         answer { vm.certify.value is Certifying.Approved }
         val approved = (vm.certify.value as Certifying.Approved).device
         assertEquals("certified by the identity's own key", fingerprint, OfflineSetups.session.certifiedBy)
-        assertArrayEquals("the device asked about", asked.device, approved.device)
+        // The key the screen handed the core to certify, not the subject of a certificate:
+        // this mailbox makes none for it.
+        assertArrayEquals("the device asked about, as passed to certify", asked.device, approved.device)
         assertTrue(OfflineSetups.session.delivered)
         rule.waitUntil(15_000) {
             vm.devices.value
@@ -446,6 +448,8 @@ class HolderSetupScreenTest {
         override fun qr(): Qr? = null
 
         override suspend fun nextRequest() = next.await()
+
+        override suspend fun answerEnds() = CompletableDeferred<Unit>().await()
 
         var delivered = false
 

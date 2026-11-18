@@ -111,11 +111,16 @@ sealed interface Revoking {
     ) : Revoking
 }
 
-/** The devices [identity]'s key certified here, this phone's own first; [unreadable] when a list of them did not read and was kept aside. */
+/**
+ * The devices [identity]'s key certified here, this phone's own first;
+ * [unreadable] when the list would not open just now, and [setAside] when
+ * one that did not read is kept aside.
+ */
 data class DeviceList(
     val identity: String,
     val devices: List<MintedDevice>,
     val unreadable: Boolean = false,
+    val setAside: Boolean = false,
 )
 
 /** A device certified by a held identity's key on this phone, this phone's own among them. */
@@ -130,7 +135,14 @@ class MintedDevice(
     val revoked: Boolean = false,
     /** This phone's own device: revoked only with the identity. */
     val own: Boolean = false,
+    /** Asked of the registrar, whose answer was not had: counted as revoked, and to be asked again. */
+    val revoking: Boolean = false,
 ) {
+    fun with(
+        revoked: Boolean = this.revoked,
+        revoking: Boolean = this.revoking,
+    ) = MintedDevice(device, fingerprint, name, expires, canManage, revoked, own, revoking)
+
     override fun equals(other: Any?) =
         other is MintedDevice &&
             device.contentEquals(other.device) &&
@@ -139,9 +151,10 @@ class MintedDevice(
             expires == other.expires &&
             canManage == other.canManage &&
             revoked == other.revoked &&
-            own == other.own
+            own == other.own &&
+            revoking == other.revoking
 
     override fun hashCode() = device.contentHashCode()
 
-    override fun toString() = "MintedDevice($fingerprint, $name, revoked=$revoked, own=$own)"
+    override fun toString() = "MintedDevice($fingerprint, $name, revoked=$revoked, revoking=$revoking, own=$own)"
 }

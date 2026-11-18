@@ -95,7 +95,8 @@ fun DevicesScreen(
         window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         onDispose { window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE) }
     }
-    BackHandler(enabled = !busy) { close() }
+    // Held while an answer or a revocation is under way: Back would end the model with it.
+    BackHandler { if (!busy) close() }
     Column(
         Modifier
             .fillMaxSize()
@@ -139,7 +140,7 @@ fun DevicesScreen(
                         request.asksDays?.let { days(it) } ?: stringResource(R.string.certify_asks_whatever),
                     ),
                 )
-                Text(stringResource(R.string.certify_gets, capabilities(gets), days(request.getsDays)))
+                Text(stringResource(R.string.certify_gets, capabilities(gets), lifetime(request.getsSecs)))
                 if (request.mayManage) Checked(manage, { manage = it }, stringResource(R.string.certify_manage))
                 Text(stringResource(R.string.certify_never_vouch), style = MaterialTheme.typography.bodySmall)
                 when (certifying.revoked) {
@@ -191,6 +192,10 @@ fun DevicesScreen(
         Text(stringResource(R.string.devices_certified), style = MaterialTheme.typography.titleMedium)
         if (devices == null) Text(stringResource(R.string.devices_loading))
         if (devices?.unreadable == true) {
+            Problem(stringResource(R.string.devices_unopened))
+            TextButton({ actions.openDevices(fingerprint) }) { Text(stringResource(R.string.try_again)) }
+        }
+        if (devices?.setAside == true) {
             Problem(stringResource(R.string.devices_unreadable))
             TextButton({ actions.discardUnreadable(fingerprint) }) { Text(stringResource(R.string.devices_discard_unreadable)) }
         }
@@ -201,6 +206,7 @@ fun DevicesScreen(
                 for (about in listOfNotNull(
                     stringResource(R.string.device_this_phone).takeIf { device.own },
                     stringResource(R.string.device_revoked).takeIf { device.revoked },
+                    stringResource(R.string.device_revoking).takeIf { device.revoking && !device.revoked },
                     stringResource(R.string.device_can_manage).takeIf { device.canManage && !device.revoked },
                     stringResource(R.string.enroll_until, expiry(device.expires.toULong())).takeIf { !device.revoked },
                 )) {
@@ -242,6 +248,18 @@ fun DevicesScreen(
         )
     }
 }
+
+/** [secs] of a certificate's life, in days, or in minutes where it is under one. */
+@Composable
+private fun lifetime(secs: ULong): String =
+    if (secs >= DAY) {
+        days(secs / DAY)
+    } else {
+        val minutes = (secs / 60u).toInt()
+        pluralStringResource(R.plurals.minutes, minutes, minutes)
+    }
+
+private const val DAY = 86_400uL
 
 /** [count] days, however many: a request may ask for more than an Int holds. */
 @Composable

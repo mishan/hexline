@@ -108,6 +108,8 @@ fun ConnectFlow(
     backingUp: BackingUp = BackingUp.Idle,
     certifying: Certifying = Certifying.Idle,
     devices: DeviceList? = null,
+    /** Whether [identities] has been read yet: a selection is not judged against the list before it has. */
+    identitiesRead: Boolean = false,
     revoking: Revoking = Revoking.Idle,
 ) {
     var backupFor by rememberSaveable { mutableStateOf<String?>(null) }
@@ -129,9 +131,9 @@ fun ConnectFlow(
     // Open while the view model has a run under way: it holds the device.
     val backing = backupFor?.let { fp -> identities.find { it.fingerprint == fp } }
     val certifier = devicesFor?.let { fp -> identities.find { it.fingerprint == fp && it.held } }
-    // Held here no longer, its Devices screen is not to come back by itself.
-    LaunchedEffect(identities, devicesFor) {
-        if (identities.any { it.fingerprint == devicesFor && !it.held }) devicesFor = null
+    // Held here no longer, or gone, its Devices screen is not to come back by itself.
+    LaunchedEffect(identities, identitiesRead, devicesFor) {
+        if (identitiesRead && devicesFor != null && certifier == null) devicesFor = null
     }
     if (setup != null && (setupOpen || settingUp !is SettingUp.Idle && settingUp !is SettingUp.Done)) {
         HolderSetupScreen(settingUp, setup) { setupOpen = false }
@@ -195,10 +197,7 @@ fun ConnectFlow(
                 onRestoreSeen()
                 onEnrollSeen()
             },
-            onDelete = { fingerprint ->
-                if (fingerprint == devicesFor) devicesFor = null
-                onDelete(fingerprint)
-            },
+            onDelete = onDelete,
             onTryAgain = onTryAgain,
             heldLost = heldLost,
             onHeldLostSeen = onHeldLostSeen,

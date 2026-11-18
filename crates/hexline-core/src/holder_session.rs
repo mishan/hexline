@@ -31,6 +31,8 @@ const LIFETIME: u64 = hl_identity::cert::RECOMMENDED_LIFETIME;
 const SKEW: u64 = 300;
 /// How long an expiry waits for its session to be given back.
 const RELEASE_WAIT: Duration = Duration::from_secs(2);
+/// A request's lifetime at the mailbox (§10), from when it was received.
+const REQUEST_SECS: u64 = 300;
 /// A session's lifetime (§10): the most a mailbox may say it has.
 const SESSION_SECS: u64 = 600;
 /// A revocation's `until` from a signer that may not know the device's
@@ -114,7 +116,8 @@ pub struct HolderRequest {
     pub gets: Caps,
     /// Whether the holder may let it manage: it asked to, or left it to the holder.
     pub may_manage: bool,
-    pub gets_days: u64,
+    /// The lifetime it gets, in seconds: a renewal's may be under a day.
+    pub gets_secs: u64,
 }
 
 /// The request being asked about, and what was decided it may get.
@@ -127,6 +130,8 @@ struct Asked {
     shown: HolderRequest,
     /// The answer made for it by [`HolderSession::certify`], until it is delivered.
     bundle: Option<Vec<u8>>,
+    /// When the mailbox lets the request go: no answer after.
+    deadline: tokio::time::Instant,
 }
 
 /// What a request may be certified for (§6, §8).
@@ -286,6 +291,22 @@ impl HolderSession {
             .unwrap_or_else(|_| Err(protocol("the session stopped")))
     }
 
+    /// Returns when the request asked about can no longer be answered, its
+    /// session or the request itself gone at the mailbox, or at once if
+    /// none is asked about.
+    #[uniffi::method(async_runtime = "tokio")]
+    pub async fn answer_ends(self: Arc<Self>) {
+        let _ = crate::connection::RUNTIME
+            .spawn(async move {
+                let Some(deadline) = self.lock().as_ref().map(|a| a.deadline) else {
+                    return;
+                };
+                let session = *self.deadline.lock().unwrap_or_else(|e| e.into_inner());
+                tokio::time::sleep_until(deadline.min(session)).await;
+            })
+            .await;
+    }
+
     /// Sends the device the certificate [`HolderSession::certify`] made.
     /// Refused `used` once it is sent, `nothing_certified` before, and
     /// `canceled` once the session is.
@@ -442,6 +463,9 @@ impl HolderSession {
             }
             // Asked once, it is asked as it was shown: what is approved is what the person saw.
             if let Some(asked) = self.lock().as_ref() {
+                if self.past(asked) {
+                    return Err(refused("expired"));
+                }
                 return Ok(asked.shown.clone());
             }
             let deadline = *self.deadline.lock().unwrap_or_else(|e| e.into_inner());
@@ -490,6 +514,13 @@ impl HolderSession {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
+            // Its age by the mailbox's own reckoning, which its lifetime is counted by.
+            let age = first
+                .get("received")
+                .and_then(Value::as_u64)
+                .map_or(0, |at| crate::restore::now().saturating_sub(at));
+            let request_deadline =
+                tokio::time::Instant::now() + Duration::from_secs(REQUEST_SECS.saturating_sub(age));
             let request = first
                 .get("request")
                 .and_then(Value::as_str)
@@ -530,8 +561,14 @@ impl HolderSession {
                 asks_days: request.days,
                 gets: Caps::of(decided.caps),
                 may_manage: decided.may_manage,
-                gets_days: decided.lifetime / DAY,
+                gets_secs: decided.lifetime,
             };
+            // Under the answer lock, so a wait alongside this one does not say no
+            // to unasked what this one has shown, nor show what it said no to.
+            let _answering = self.answering.lock().await;
+            if self.spent.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(refused("used"));
+            }
             return Ok(settle(
                 &self.asked,
                 Asked {
@@ -540,6 +577,7 @@ impl HolderSession {
                     decided,
                     shown: asked,
                     bundle: None,
+                    deadline: request_deadline,
                 },
             ));
         }
@@ -611,7 +649,20 @@ impl HolderSession {
         if self.spent.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(refused("used"));
         }
-        self.lock().clone().ok_or_else(|| refused("nothing_asked"))
+        let asked = self
+            .lock()
+            .clone()
+            .ok_or_else(|| refused("nothing_asked"))?;
+        if self.past(&asked) {
+            return Err(refused("expired"));
+        }
+        Ok(asked)
+    }
+
+    /// Whether `asked` can no longer be answered: its request or its session gone.
+    fn past(&self, asked: &Asked) -> bool {
+        let session = *self.deadline.lock().unwrap_or_else(|e| e.into_inner());
+        tokio::time::Instant::now() >= asked.deadline.min(session)
     }
 
     /// Its one answer: once the mailbox has it, the session is spent and
@@ -620,7 +671,9 @@ impl HolderSession {
         let url = format!("{}/{}/answers", self.sessions, *self.secret);
         auth::post(&self.http, &url, Some(body)).await?;
         self.spent.store(true, std::sync::atomic::Ordering::SeqCst);
-        self.release();
+        // Given a moment, so a session opened next is not refused for this one's
+        // place; no more, so a stalled DELETE does not hold up an answer made.
+        let _ = tokio::time::timeout(RELEASE_WAIT, self.release()).await;
         Ok(())
     }
 
@@ -635,6 +688,10 @@ impl HolderSession {
         let _answering = self.answering.lock().await;
         if *self.canceled.borrow() {
             return Err(refused("canceled"));
+        }
+        // One shown already, by a wait alongside this one, is the person's to answer.
+        if let Some(asked) = self.lock().as_ref() {
+            return Ok(asked.shown.clone());
         }
         self.answer(json!({ "id": id, "denied": why })).await?;
         Err(refused(code))
@@ -675,9 +732,11 @@ fn decide(
     let prev = prev.filter(|prev| {
         let life = prev.expires.saturating_sub(prev.issued);
         // A renewal for no longer than `prev`, issued backdated, must not be
-        // due to be renewed again as it is made.
+        // due to be renewed again by the time the enrollee checks it, after
+        // delivery and whatever skew there is between the two clocks: the
+        // enrollee refuses one that is (`short_renewal`).
         let issued = now.saturating_sub(crate::restore::BACKDATE);
-        !crate::enroll::renewal_due(issued, issued.saturating_add(life), now)
+        !crate::enroll::renewal_due(issued, issued.saturating_add(life), now + SKEW)
             && prev.expires > now
             && request
                 .caps
@@ -902,8 +961,8 @@ mod tests {
             (NOW - DAY, month, LM, None, Some(60), false, LM, 60),
             // Too short to renew: its renewal, backdated, would be due as it was made.
             (NOW - 30, 60, LM, None, None, false, LM, 90),
-            (NOW - 30, 450, LM, None, None, false, LM, 90),
-            (NOW - 30, 460, LM, None, None, true, LM, 0),
+            (NOW - 30, 900, LM, None, None, false, LM, 90),
+            (NOW - 30, 960, LM, None, None, true, LM, 0),
         ] {
             let (mut r, device) = request(asked, days);
             r.prev = Some(prev(&device, issued, life, had));
@@ -936,7 +995,7 @@ mod tests {
                 asks_days: Some(days),
                 gets: Caps::of(decided.caps),
                 may_manage: decided.may_manage,
-                gets_days: decided.lifetime / DAY,
+                gets_secs: decided.lifetime,
             };
             Asked {
                 id: days.to_string(),
@@ -944,14 +1003,19 @@ mod tests {
                 decided,
                 shown,
                 bundle: None,
+                deadline: tokio::time::Instant::now(),
             }
         };
         let slot = Mutex::new(None);
-        assert_eq!(settle(&slot, asked(7)).gets_days, 7);
+        assert_eq!(settle(&slot, asked(7)).gets_secs, 7 * DAY);
         let mut certified = slot.lock().unwrap().clone().unwrap();
         certified.bundle = Some(vec![1]);
         *slot.lock().unwrap() = Some(certified);
-        assert_eq!(settle(&slot, asked(30)).gets_days, 7, "what was shown");
+        assert_eq!(
+            settle(&slot, asked(30)).gets_secs,
+            7 * DAY,
+            "what was shown"
+        );
         let kept = slot.lock().unwrap().clone().unwrap();
         assert_eq!((kept.id.as_str(), kept.bundle), ("7", Some(vec![1])));
     }

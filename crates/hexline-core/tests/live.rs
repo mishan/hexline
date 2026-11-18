@@ -2623,7 +2623,7 @@ async fn a_device_gets_the_days_it_asked_for_and_a_renewal_only_in_its_time() {
     request.days = Some(7);
     let secret = post_request(&server, &session.code(), &request.sign(&device)).await;
     let asked = within(session.clone().next_request()).await.unwrap();
-    assert_eq!((asked.asks_days, asked.gets_days), (Some(7), 7));
+    assert_eq!((asked.asks_days, asked.gets_secs), (Some(7), 7 * 86_400));
     assert!(!asked.renewal && asked.may_manage);
     let certified = approved(&session, &seed, false, asked.device)
         .await
@@ -2653,8 +2653,57 @@ async fn a_device_gets_the_days_it_asked_for_and_a_renewal_only_in_its_time() {
         .await;
         let asked = asked.unwrap();
         assert_eq!(asked.renewal, renewal, "issued {issued}");
-        assert_eq!(asked.gets_days, if renewal { 30 } else { 90 });
+        assert_eq!(asked.gets_secs / 86_400, if renewal { 30 } else { 90 });
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_asked_about_past_its_session_is_answered_no_more() {
+    use hexline_core::Enrollee;
+    let server = Server::with_registrar(&[]).await;
+    let (seed, _, card) = held(&server, "xia").await;
+    let phone = Enrollee::new();
+    let (session, asked, _asking) = asked_by(&server, &card, &phone).await;
+    session.run_out();
+    within(session.clone().answer_ends()).await;
+    assert_eq!(
+        refused_as(
+            &session
+                .clone()
+                .certify(seed, false, asked.device)
+                .await
+                .unwrap_err()
+        ),
+        "expired"
+    );
+    assert_eq!(
+        refused_as(&within(session.clone().next_request()).await.unwrap_err()),
+        "expired"
+    );
+    assert_eq!(
+        refused_as(&session.deny("no".into()).await.unwrap_err()),
+        "expired"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_short_renewal_the_holder_approves_is_one_its_device_takes() {
+    use hexline_core::Enrollee;
+    use hl_identity::{caps, DeviceCert, DeviceKey, IdentityKey};
+    let server = Server::with_registrar(&[]).await;
+    let (seed, _, card) = held(&server, "yan").await;
+    let id = IdentityKey::from_seed(seed.as_slice().try_into().unwrap());
+    let device = DeviceKey::generate();
+    let mut prev = DeviceCert::for_device(&id, &device, unix_now() - 60, 960).unwrap();
+    prev.caps = Some(caps::LOGIN | caps::MESSAGE);
+    let phone = Enrollee::renewing(device.seed().to_vec(), prev.sign(&id)).unwrap();
+    let (session, asked, asking) = asked_by(&server, &card, &phone).await;
+    assert!(asked.renewal);
+    assert_eq!(asked.gets_secs, 960, "no longer than it had");
+    approved(&session, &seed, false, asked.device)
+        .await
+        .unwrap();
+    within(asking).await.unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

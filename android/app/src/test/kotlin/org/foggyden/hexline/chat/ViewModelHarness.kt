@@ -37,6 +37,7 @@ import org.foggyden.hexline.core.certForDevice
 import org.foggyden.hexline.identity.Enrolling
 import org.foggyden.hexline.identity.HeldSeeds
 import org.foggyden.hexline.identity.Identities
+import org.foggyden.hexline.identity.writeAtomically
 import org.foggyden.hexline.secrets.FakeHolderKeys
 import org.foggyden.hexline.secrets.Secrets
 import org.foggyden.hexline.servers.SavedServers
@@ -125,7 +126,13 @@ abstract class ViewModelHarness {
     ) {
         val servers = SavedServers(app, secrets, QueuedPrefs(app.getSharedPreferences("servers-$n", 0)))
         val identityDir = File(app.filesDir, "identities-$n")
-        val identities = Identities(app, secrets, identityDir)
+
+        /** Whether a device list written is lost while the write says it was made, as a failed rename can. */
+        var losesLists = false
+        val identities =
+            Identities(app, secrets, identityDir) { file, bytes ->
+                if (!(losesLists && file.name.startsWith("minted-"))) writeAtomically(file, bytes)
+            }
         val keys = FakeHolderKeys()
         val held = HeldSeeds(File(app.filesDir, "held-$n"), keys, EmptyCoroutineContext)
     }

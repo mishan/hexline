@@ -141,6 +141,7 @@ fun Hexline(
     val backingUp by chat.backingUp.collectAsStateWithLifecycle()
     val certifying by chat.certify.collectAsStateWithLifecycle()
     val devices by chat.devices.collectAsStateWithLifecycle()
+    val identitiesRead by chat.identitiesRead.collectAsStateWithLifecycle()
     val revoking by chat.revoking.collectAsStateWithLifecycle()
     when (val link = state.link) {
         Link.Live, is Link.Reconnecting -> ChatScreen(state, chat::send, chat::loadEarlier, chat::disconnect)
@@ -173,6 +174,7 @@ fun Hexline(
                 backingUp = backingUp,
                 certifying = certifying,
                 devices = devices,
+                identitiesRead = identitiesRead,
                 revoking = revoking,
                 setup = setupActions(chat, authorizer),
             )
