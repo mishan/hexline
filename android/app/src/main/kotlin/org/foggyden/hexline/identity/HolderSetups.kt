@@ -7,6 +7,7 @@ import org.foggyden.hexline.core.HolderSetup
 import org.foggyden.hexline.core.HolderSetupInterface
 import org.foggyden.hexline.core.RecoveryCodeSetup
 import org.foggyden.hexline.core.RecoveryCodeSetupInterface
+import org.foggyden.hexline.core.RevokeReason
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.backupDelete
 import org.foggyden.hexline.core.backupPassphrase
@@ -157,7 +158,7 @@ object CoreHolderSetups : HolderSetups {
         reason: RevokeReason,
         until: Long,
         thisDevice: ByteArray,
-    ) = revokeDevice(identitySeed, registrar, device, reason.code, until.toULong(), thisDevice)
+    ) = revokeDevice(identitySeed, registrar, device, reason, until.toULong(), thisDevice)
 
     override fun deviceFingerprint(device: ByteArray) = deviceFingerprintOf(device)
 }

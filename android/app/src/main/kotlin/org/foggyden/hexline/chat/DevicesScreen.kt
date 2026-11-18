@@ -43,11 +43,13 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import org.foggyden.hexline.R
 import org.foggyden.hexline.core.Caps
+import org.foggyden.hexline.core.CertifyEnd
 import org.foggyden.hexline.core.Qr
-import org.foggyden.hexline.identity.CertifyEnd
+import org.foggyden.hexline.core.RevokeReason
 import org.foggyden.hexline.identity.Certifying
+import org.foggyden.hexline.identity.DeviceList
 import org.foggyden.hexline.identity.MintedDevice
-import org.foggyden.hexline.identity.RevokeReason
+import org.foggyden.hexline.identity.Revoked
 import org.foggyden.hexline.identity.Revoking
 
 /**
@@ -60,7 +62,7 @@ fun DevicesScreen(
     fingerprint: String,
     name: String,
     initialMailbox: String,
-    devices: List<MintedDevice>,
+    devices: DeviceList?,
     certifying: Certifying,
     revoking: Revoking,
     actions: SetupActions,
@@ -71,16 +73,14 @@ fun DevicesScreen(
         actions.openDevices(fingerprint)
         onDispose { actions.cancelCertifying() }
     }
-    val certifying =
-        when (certifying) {
-            is Certifying.Showing -> certifying.takeIf { it.identity == fingerprint }
-            is Certifying.Asked -> certifying.takeIf { it.identity == fingerprint }
-            else -> certifying
-        } ?: Certifying.Idle
+    // Another identity's, under way or done, is not this screen's to show.
+    val certifying = certifying.takeIf { it.identity == fingerprint } ?: Certifying.Idle
+    val revoking = revoking.takeIf { it.identity == fingerprint } ?: Revoking.Idle
+    val devices = devices?.takeIf { it.identity == fingerprint }
     var mailbox by rememberSaveable { mutableStateOf(initialMailbox) }
     var manage by remember(certifying::class) { mutableStateOf(false) }
     var revokingDevice by remember { mutableStateOf<MintedDevice?>(null) }
-    val busy = certifying == Certifying.Answering || revoking == Revoking.Working
+    val busy = certifying is Certifying.Answering || revoking is Revoking.Working
     val close = {
         actions.cancelCertifying()
         actions.certifySeen()
@@ -104,7 +104,7 @@ fun DevicesScreen(
     ) {
         Text(stringResource(R.string.devices_title, name), style = MaterialTheme.typography.headlineMedium)
         when (certifying) {
-            Certifying.Opening, Certifying.Answering -> Text(stringResource(R.string.holder_working))
+            is Certifying.Opening, is Certifying.Answering -> Text(stringResource(R.string.holder_working))
             is Certifying.Showing -> {
                 Text(stringResource(R.string.certify_type_code))
                 Code(certifying.code)
@@ -114,7 +114,7 @@ fun DevicesScreen(
                     Text(stringResource(R.string.certify_or_scan))
                     QrCode(it)
                 }
-                val minutes = ((certifying.expiresIn + 59) / 60).toInt()
+                val minutes = ((certifying.lasts + 59) / 60).toInt()
                 Text(pluralStringResource(R.plurals.certify_expires, minutes, minutes), style = MaterialTheme.typography.bodySmall)
                 TextButton(actions::cancelCertifying) { Text(stringResource(R.string.cancel)) }
             }
@@ -134,22 +134,19 @@ fun DevicesScreen(
                     stringResource(
                         R.string.certify_asks,
                         request.asks?.let { capabilities(it) } ?: stringResource(R.string.certify_asks_whatever),
-                        request.asksDays?.let { pluralStringResource(R.plurals.days, it.toInt(), it.toInt()) }
-                            ?: stringResource(R.string.certify_asks_whatever),
+                        request.asksDays?.let { days(it) } ?: stringResource(R.string.certify_asks_whatever),
                     ),
                 )
-                Text(
-                    stringResource(
-                        R.string.certify_gets,
-                        capabilities(gets),
-                        pluralStringResource(R.plurals.days, request.getsDays.toInt(), request.getsDays.toInt()),
-                    ),
-                )
+                Text(stringResource(R.string.certify_gets, capabilities(gets), days(request.getsDays)))
                 if (request.mayManage) Checked(manage, { manage = it }, stringResource(R.string.certify_manage))
                 Text(stringResource(R.string.certify_never_vouch), style = MaterialTheme.typography.bodySmall)
-                if (certifying.revoked) Problem(stringResource(R.string.certify_revoked))
+                when (certifying.revoked) {
+                    Revoked.Yes -> Problem(stringResource(R.string.certify_revoked))
+                    Revoked.Unknown -> Problem(stringResource(R.string.certify_revoked_unknown))
+                    Revoked.No -> Unit
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (!certifying.revoked) {
+                    if (certifying.revoked != Revoked.Yes) {
                         Button({ actions.approveDevice(fingerprint, manage) }) { Text(stringResource(R.string.certify_approve)) }
                     }
                     TextButton({ actions.denyDevice(fingerprint) }) { Text(stringResource(R.string.certify_deny)) }
@@ -157,9 +154,11 @@ fun DevicesScreen(
             }
             else -> {
                 when (certifying) {
-                    is Certifying.Approved ->
+                    is Certifying.Approved -> {
                         Text(stringResource(R.string.certify_approved, certifying.device.name ?: certifying.device.fingerprint))
-                    Certifying.Denied -> Text(stringResource(R.string.certify_denied))
+                        if (!certifying.kept) Problem(stringResource(R.string.devices_not_kept))
+                    }
+                    is Certifying.Denied -> Text(stringResource(R.string.certify_denied))
                     is Certifying.Ended -> Problem(describe(certifying.why))
                     is Certifying.Failed -> Problem(describe(certifying.problem))
                     else -> Unit
@@ -178,13 +177,18 @@ fun DevicesScreen(
             }
         }
         when (revoking) {
-            is Revoking.Done -> Text(stringResource(R.string.revoke_done, revoking.device.name ?: revoking.device.fingerprint))
+            is Revoking.Done -> {
+                Text(stringResource(R.string.revoke_done, revoking.device.name ?: revoking.device.fingerprint))
+                if (!revoking.kept) Problem(stringResource(R.string.devices_not_kept))
+            }
             is Revoking.Failed -> Problem(describe(revoking.problem))
-            Revoking.Working -> Text(stringResource(R.string.holder_working))
+            is Revoking.Working -> Text(stringResource(R.string.holder_working))
             Revoking.Idle -> Unit
         }
         Text(stringResource(R.string.devices_certified), style = MaterialTheme.typography.titleMedium)
-        for (device in devices) {
+        if (devices == null) Text(stringResource(R.string.devices_loading))
+        if (devices?.unreadable == true) Problem(stringResource(R.string.devices_unreadable))
+        for (device in devices?.devices.orEmpty()) {
             Column {
                 Text(device.name ?: stringResource(R.string.device_unnamed), style = MaterialTheme.typography.bodyLarge)
                 Text(stringResource(R.string.enroll_fingerprint, device.fingerprint), style = MaterialTheme.typography.bodySmall)
@@ -204,7 +208,7 @@ fun DevicesScreen(
         TextButton(close, enabled = !busy) { Text(stringResource(R.string.dismiss)) }
     }
     revokingDevice?.let { device ->
-        var reason by remember { mutableStateOf(RevokeReason.Lost) }
+        var reason by remember { mutableStateOf(RevokeReason.LOST) }
         AlertDialog(
             onDismissRequest = { revokingDevice = null },
             title = { Text(stringResource(R.string.revoke_title, device.name ?: device.fingerprint)) },
@@ -232,6 +236,11 @@ fun DevicesScreen(
         )
     }
 }
+
+/** [count] days, however many: a request may ask for more than an Int holds. */
+@Composable
+private fun days(count: ULong): String =
+    pluralStringResource(R.plurals.days, count.coerceAtMost(Int.MAX_VALUE.toULong()).toInt(), count.toString())
 
 /** [caps] as a list a person reads: never empty, as nothing that signs in nowhere is asked about. */
 @Composable
@@ -271,18 +280,18 @@ private const val QUIET = 4
 private fun describe(why: CertifyEnd): String =
     stringResource(
         when (why) {
-            CertifyEnd.Expired -> R.string.certify_expired
-            CertifyEnd.NoMailbox -> R.string.certify_no_mailbox
-            CertifyEnd.Unpaired -> R.string.certify_unpaired
-            CertifyEnd.Stale -> R.string.certify_stale
-            CertifyEnd.Unreadable -> R.string.certify_unreadable
-            CertifyEnd.NoLogin -> R.string.certify_no_login
+            CertifyEnd.EXPIRED -> R.string.certify_expired
+            CertifyEnd.NO_MAILBOX -> R.string.certify_no_mailbox
+            CertifyEnd.UNPAIRED -> R.string.certify_unpaired
+            CertifyEnd.STALE -> R.string.certify_stale
+            CertifyEnd.UNREADABLE -> R.string.certify_unreadable
+            CertifyEnd.NO_LOGIN -> R.string.certify_no_login
         },
     )
 
 private fun describe(reason: RevokeReason) =
     when (reason) {
-        RevokeReason.Lost -> R.string.revoke_lost
-        RevokeReason.Stolen -> R.string.revoke_stolen
-        RevokeReason.Retired -> R.string.revoke_retired
+        RevokeReason.LOST -> R.string.revoke_lost
+        RevokeReason.STOLEN -> R.string.revoke_stolen
+        RevokeReason.RETIRED -> R.string.revoke_retired
     }

@@ -14,9 +14,9 @@ import org.foggyden.hexline.chat.ChatViewModel
 import org.foggyden.hexline.chat.ConnectFlow
 import org.foggyden.hexline.chat.Link
 import org.foggyden.hexline.chat.SetupActions
+import org.foggyden.hexline.core.RevokeReason
 import org.foggyden.hexline.identity.BiometricAuthorizer
 import org.foggyden.hexline.identity.MintedDevice
-import org.foggyden.hexline.identity.RevokeReason
 import org.foggyden.hexline.secrets.Authorizer
 
 /** A FragmentActivity, as the prompt an identity's key asks by needs one. */

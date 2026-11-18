@@ -29,6 +29,8 @@ const POLL_TRIES: u32 = 3;
 const LIFETIME: u64 = hl_identity::cert::RECOMMENDED_LIFETIME;
 /// A request made longer ago than this is taken for a replay (§5.3).
 const SKEW: u64 = 300;
+/// How long an expiry waits for its session to be given back.
+const RELEASE_WAIT: Duration = Duration::from_secs(2);
 /// A session's lifetime (§10): the most a mailbox may say it has.
 const SESSION_SECS: u64 = 600;
 /// A revocation's `until` from a signer that may not know the device's
@@ -121,6 +123,10 @@ struct Asked {
     id: String,
     request: EnrollRequest,
     decided: Decided,
+    /// What the person was shown of it: the same for every wait that returns it.
+    shown: HolderRequest,
+    /// The answer made for it by [`HolderSession::certify`], until it is delivered.
+    bundle: Option<Vec<u8>>,
 }
 
 /// What a request may be certified for (§6, §8).
@@ -142,6 +148,55 @@ pub struct Certified {
     pub name: Option<String>,
     pub can_manage: bool,
     pub expires: u64,
+}
+
+/// Why a device is revoked, as the registrar's record says it (registrar §4.4).
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Enum)]
+pub enum RevokeReason {
+    Lost,
+    Stolen,
+    Retired,
+}
+
+impl RevokeReason {
+    fn code(self) -> u64 {
+        match self {
+            RevokeReason::Lost => 1,
+            RevokeReason::Stolen => 2,
+            RevokeReason::Retired => 3,
+        }
+    }
+}
+
+/// How a wait for a request ended where a new code is the way on.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Enum)]
+pub enum CertifyEnd {
+    /// The code ran out, or admitted its one request.
+    Expired,
+    /// The server keeps no mailbox to certify through.
+    NoMailbox,
+    /// A request carrying a pairing this session did not draw, said no to unasked.
+    Unpaired,
+    /// A request from a device whose clock is far from this phone's, said no to unasked.
+    Stale,
+    /// A request no device makes, said no to unasked.
+    Unreadable,
+    /// A request for a certificate that signs in nowhere, said no to unasked.
+    NoLogin,
+}
+
+/// The end a session's refusal `code` says, if it is one.
+#[uniffi::export]
+pub fn certify_end(code: String) -> Option<CertifyEnd> {
+    Some(match code.as_str() {
+        "expired" | "used" => CertifyEnd::Expired,
+        "no_mailbox" => CertifyEnd::NoMailbox,
+        "unpaired_request" => CertifyEnd::Unpaired,
+        "stale_request" => CertifyEnd::Stale,
+        "unreadable_request" => CertifyEnd::Unreadable,
+        "no_login_request" => CertifyEnd::NoLogin,
+        _ => return None,
+    })
 }
 
 /// A device's key as a holder's prompt shows it (enrollment §6), for a
@@ -211,11 +266,14 @@ impl HolderSession {
 
     /// Certifies `device`, the device asked about, with the identity whose
     /// seed is `identity_seed`: for what it gets, managing with `manage`
-    /// where it may, under the name it asked for. Refused `not_asked` for
-    /// any other device, `manage_not_asked` for managing where it may not,
-    /// and `used` once the session's one request is answered.
+    /// where it may, under the name it asked for. The certificate is kept
+    /// here until [`HolderSession::deliver`] sends it, so the caller can
+    /// record it first: one that may be out in the world is one it can
+    /// revoke. Refused `not_asked` for any other device, `manage_not_asked`
+    /// for managing where it may not, `used` once the session's one request
+    /// is answered or certified, and `canceled` once the session is.
     #[uniffi::method(async_runtime = "tokio")]
-    pub async fn approve(
+    pub async fn certify(
         self: Arc<Self>,
         identity_seed: Vec<u8>,
         manage: bool,
@@ -223,19 +281,40 @@ impl HolderSession {
     ) -> Result<Certified, CoreError> {
         let seed = Zeroizing::new(identity_seed);
         crate::connection::RUNTIME
-            .spawn(async move { self.approving(&seed, manage, &device).await })
+            .spawn(async move { self.certifying(&seed, manage, &device).await })
+            .await
+            .unwrap_or_else(|_| Err(protocol("the session stopped")))
+    }
+
+    /// Sends the device the certificate [`HolderSession::certify`] made.
+    /// Refused `used` once it is sent, `nothing_certified` before, and
+    /// `canceled` once the session is.
+    #[uniffi::method(async_runtime = "tokio")]
+    pub async fn deliver(self: Arc<Self>) -> Result<(), CoreError> {
+        crate::connection::RUNTIME
+            .spawn(async move {
+                let _answering = self.answering.lock().await;
+                let asked = self.unanswered()?;
+                let bundle = asked.bundle.ok_or_else(|| refused("nothing_certified"))?;
+                self.answer(json!({ "id": asked.id, "bundle": b64(&bundle) }))
+                    .await
+            })
             .await
             .unwrap_or_else(|_| Err(protocol("the session stopped")))
     }
 
     /// Says no to the device asked about, giving `reason`. Refused `used`
-    /// once the session's one request is answered.
+    /// once the session's one request is answered or certified, and
+    /// `canceled` once the session is.
     #[uniffi::method(async_runtime = "tokio")]
     pub async fn deny(self: Arc<Self>, reason: String) -> Result<(), CoreError> {
         crate::connection::RUNTIME
             .spawn(async move {
                 let _answering = self.answering.lock().await;
                 let asked = self.unanswered()?;
+                if asked.bundle.is_some() {
+                    return Err(refused("used"));
+                }
                 self.answer(json!({ "id": asked.id, "denied": reason }))
                     .await
             })
@@ -244,11 +323,12 @@ impl HolderSession {
     }
 
     /// Ends a wait for a request, and gives the session back, so its code
-    /// admits nobody from now on.
+    /// admits nobody from now on. An answer under way finishes; none starts
+    /// after.
     pub fn cancel(self: Arc<Self>) {
         // Kept for a wait begun after it, as well as told to one under way.
         self.canceled.send_replace(true);
-        crate::connection::RUNTIME.spawn(async move { self.give_back().await });
+        self.release();
     }
 }
 
@@ -268,11 +348,16 @@ impl HolderSession {
     }
 
     /// The session closed at the mailbox (`DELETE`, §5.1), which keeps any
-    /// answer already made for the enrollee to collect. Best effort: a
-    /// session not given back ends at its expiry anyway.
-    async fn give_back(&self) {
-        let url = format!("{}/{}", self.sessions, *self.secret);
-        let _ = self.http.delete(url).send().await;
+    /// answer already made for the enrollee to collect, on its own task for
+    /// whoever would rather not wait. Best effort: a session not given back
+    /// ends at its expiry anyway.
+    fn release(&self) -> tokio::task::JoinHandle<()> {
+        let request = self
+            .http
+            .delete(format!("{}/{}", self.sessions, *self.secret));
+        crate::connection::RUNTIME.spawn(async move {
+            let _ = request.send().await;
+        })
     }
 
     async fn open(mailbox: &str, card: Vec<u8>) -> Result<Arc<HolderSession>, CoreError> {
@@ -304,8 +389,11 @@ impl HolderSession {
                     Fingerprint::of(&identity),
                     b64(&*secret)
                 )));
-                let qr = qr_of(url.as_str())?;
-                (Some(secret), Some((qr, url.to_string())))
+                // A web client too long-winded for a QR code leaves the typed code.
+                match qr_of(url.as_str()) {
+                    Ok(qr) => (Some(secret), Some((qr, url.to_string()))),
+                    Err(_) => (None, None),
+                }
             }
             None => (None, None),
         };
@@ -348,12 +436,18 @@ impl HolderSession {
             if *canceled.borrow() {
                 return Err(refused("canceled"));
             }
+            // Asked once, it is asked as it was shown: what is approved is what the person saw.
+            if let Some(asked) = self.lock().as_ref() {
+                return Ok(asked.shown.clone());
+            }
             let deadline = *self.deadline.lock().unwrap_or_else(|e| e.into_inner());
             let polled = tokio::select! {
                 polled = auth::get_waiting(&self.http, &url, LONG_POLL) => polled,
                 _ = canceled.changed() => return Err(refused("canceled")),
                 _ = tokio::time::sleep_until(deadline) => {
-                    self.give_back().await;
+                    // Given a moment, so a code shown as expired is one, but no
+                    // more: a stalled network does not hold up the expiry.
+                    let _ = tokio::time::timeout(RELEASE_WAIT, self.release()).await;
                     return Err(refused("expired"));
                 }
             };
@@ -380,11 +474,11 @@ impl HolderSession {
                 _ => return Err(protocol(&format!("the mailbox answered {status}"))),
             }
             let reply: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-            let Some(first) = reply
+            let pending = reply
                 .get("pending")
                 .and_then(Value::as_array)
-                .and_then(|p| p.first())
-            else {
+                .ok_or_else(|| protocol("the mailbox gave no pending list"))?;
+            let Some(first) = pending.first() else {
                 continue;
             };
             let id = first
@@ -438,12 +532,14 @@ impl HolderSession {
                 id,
                 request,
                 decided,
+                shown: asked.clone(),
+                bundle: None,
             });
             return Ok(asked);
         }
     }
 
-    async fn approving(
+    async fn certifying(
         &self,
         seed: &[u8],
         manage: bool,
@@ -457,10 +553,14 @@ impl HolderSession {
         }
         let _answering = self.answering.lock().await;
         let Asked {
-            id: asked,
             request,
             decided,
+            bundle,
+            ..
         } = self.unanswered()?;
+        if bundle.is_some() {
+            return Err(refused("used"));
+        }
         if request.device.as_slice() != device {
             return Err(refused("not_asked"));
         }
@@ -485,9 +585,9 @@ impl HolderSession {
             cert: signed,
             card: self.card.clone(),
         };
-        self.answer(json!({ "id": asked, "bundle": b64(&bundle.encode()) }))
-            .await?;
-        *self.lock() = None;
+        if let Some(asked) = self.lock().as_mut() {
+            asked.bundle = Some(bundle.encode());
+        }
         Ok(Certified {
             device: request.device.to_vec(),
             name: request.name,
@@ -496,18 +596,25 @@ impl HolderSession {
         })
     }
 
-    /// The request asked about, if it is not answered yet.
+    /// The request asked about, if it is not answered yet and the session
+    /// is not canceled.
     fn unanswered(&self) -> Result<Asked, CoreError> {
+        if *self.canceled.borrow() {
+            return Err(refused("canceled"));
+        }
         if self.spent.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(refused("used"));
         }
         self.lock().clone().ok_or_else(|| refused("nothing_asked"))
     }
 
+    /// Its one answer: once the mailbox has it, the session is spent and
+    /// given back, its slot at the mailbox freed for whoever drops it.
     async fn answer(&self, body: Value) -> Result<(), CoreError> {
         let url = format!("{}/{}/answers", self.sessions, *self.secret);
         auth::post(&self.http, &url, Some(body)).await?;
         self.spent.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release();
         Ok(())
     }
 
@@ -519,6 +626,10 @@ impl HolderSession {
         why: &str,
         code: &str,
     ) -> Result<HolderRequest, CoreError> {
+        let _answering = self.answering.lock().await;
+        if *self.canceled.borrow() {
+            return Err(refused("canceled"));
+        }
         self.answer(json!({ "id": id, "denied": why })).await?;
         Err(refused(code))
     }
@@ -533,8 +644,8 @@ impl HolderSession {
 /// nothing it did not ask for, and for no longer than it asked or than
 /// `LIFETIME`. A renewal (§8) is one whose `prev` is this identity's for
 /// the same device, still in its time, and asks for no more than `prev`
-/// gave: it gets no more either. Refused, with why and a code, for zero
-/// days or for no login.
+/// gave, and lasted long enough to be renewed: it gets no more either.
+/// Refused, with why and a code, for zero days or for no login.
 fn decide(
     request: &EnrollRequest,
     identity: &[u8; 32],
@@ -550,7 +661,10 @@ fn decide(
     };
     let prev = prev.filter(|prev| {
         let life = prev.expires.saturating_sub(prev.issued);
-        prev.expires > now
+        // Too short to outlast the backdating of a new certificate's issue
+        // time, a renewal would be due as it was made.
+        life > 2 * SKEW
+            && prev.expires > now
             && request
                 .caps
                 .is_none_or(|asked| asked & !prev.caps.unwrap_or(u64::MAX) == 0)
@@ -589,6 +703,11 @@ async fn discovered(
         base.join("/.well-known/hotline").expect("a path").as_str(),
     )
     .await?;
+    if status == 429 {
+        return Err(CoreError::RateLimited {
+            retry_after: crate::restore::retry_after(&body),
+        });
+    }
     let doc: Value = (status == 200)
         .then(|| serde_json::from_slice(&body).ok())
         .flatten()
@@ -621,8 +740,7 @@ fn qr_of(url: &str) -> Result<Qr, CoreError> {
 
 /// A device's revocation (registrar §4.4), signed by the identity whose
 /// seed is `identity_seed` and posted to `registrar`'s records: `device`, a
-/// device's public key this phone certified, for `reason` (1 lost, 2
-/// stolen, 3 retired), the latest certificate this phone knows of for it
+/// device's public key this phone certified, for `reason`, the latest certificate this phone knows of for it
 /// ending at `until`; for at least two years, as it may have been renewed
 /// elsewhere. Refused
 /// `own_device` for `this_device`, this phone's own: that is the
@@ -632,7 +750,7 @@ pub async fn revoke_device(
     identity_seed: Vec<u8>,
     registrar: String,
     device: Vec<u8>,
-    reason: u64,
+    reason: RevokeReason,
     until: u64,
     this_device: Vec<u8>,
 ) -> Result<(), CoreError> {
@@ -654,7 +772,7 @@ pub async fn revoke_device(
                 device,
                 time,
                 until: revocation_until(until, time),
-                reason: Some(reason),
+                reason: Some(reason.code()),
                 signer: None,
                 signer_cert: None,
             }
@@ -664,7 +782,11 @@ pub async fn revoke_device(
             let http = auth::http_client(base.as_str(), None)?;
             let reg = crate::restore::discovered(&http, &base).await?;
             let records = endpoint(&base, &reg.records)?;
-            auth::post(&http, &records, Some(json!({ "record": b64(&record) }))).await?;
+            let reply =
+                auth::post(&http, &records, Some(json!({ "record": b64(&record) }))).await?;
+            if reply.get("published").and_then(Value::as_bool) != Some(true) {
+                return Err(protocol("the registrar did not publish the revocation"));
+            }
             Ok(())
         })
         .await
@@ -764,6 +886,8 @@ mod tests {
             // Asking for more than it had: enrolled afresh.
             (NOW - DAY, month, caps::LOGIN, Some(LM), None, false, LM, 90),
             (NOW - DAY, month, LM, None, Some(60), false, LM, 60),
+            // Too short to renew: its renewal would be due as it was made.
+            (NOW - 30, 60, LM, None, None, false, LM, 90),
         ] {
             let (mut r, device) = request(asked, days);
             r.prev = Some(prev(&device, issued, life, had));

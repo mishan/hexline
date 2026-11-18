@@ -54,10 +54,10 @@ import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.coreVersion
 import org.foggyden.hexline.identity.BackingUp
 import org.foggyden.hexline.identity.Certifying
+import org.foggyden.hexline.identity.DeviceList
 import org.foggyden.hexline.identity.EnrollProblem
 import org.foggyden.hexline.identity.Enrolling
 import org.foggyden.hexline.identity.HolderRefusal
-import org.foggyden.hexline.identity.MintedDevice
 import org.foggyden.hexline.identity.Renewing
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
@@ -107,7 +107,7 @@ fun ConnectFlow(
     renewing: Renewing = Renewing.Idle,
     backingUp: BackingUp = BackingUp.Idle,
     certifying: Certifying = Certifying.Idle,
-    devices: List<MintedDevice> = emptyList(),
+    devices: DeviceList? = null,
     revoking: Revoking = Revoking.Idle,
 ) {
     var backupFor by rememberSaveable { mutableStateOf<String?>(null) }
@@ -129,6 +129,10 @@ fun ConnectFlow(
     // Open while the view model has a run under way: it holds the device.
     val backing = backupFor?.let { fp -> identities.find { it.fingerprint == fp } }
     val certifier = devicesFor?.let { fp -> identities.find { it.fingerprint == fp && it.held } }
+    // Once the list read says it is held here no longer, its Devices screen is not to come back by itself.
+    LaunchedEffect(identities, devicesFor) {
+        if (identities.isNotEmpty() && devicesFor != null && certifier == null) devicesFor = null
+    }
     if (setup != null && (setupOpen || settingUp !is SettingUp.Idle && settingUp !is SettingUp.Done)) {
         HolderSetupScreen(settingUp, setup) { setupOpen = false }
     } else if (setup != null && backing != null) {

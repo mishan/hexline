@@ -34,6 +34,7 @@ import org.foggyden.hexline.core.HolderRequest
 import org.foggyden.hexline.core.HolderSetup
 import org.foggyden.hexline.core.HolderSetupInterface
 import org.foggyden.hexline.core.Qr
+import org.foggyden.hexline.core.RevokeReason
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.certForDevice
 import org.foggyden.hexline.core.deviceFingerprintOf
@@ -48,7 +49,6 @@ import org.foggyden.hexline.identity.HolderSetups
 import org.foggyden.hexline.identity.Identities
 import org.foggyden.hexline.identity.NewRecoveryCode
 import org.foggyden.hexline.identity.Renewing
-import org.foggyden.hexline.identity.RevokeReason
 import org.foggyden.hexline.identity.SettingUp
 import org.foggyden.hexline.identity.Setup
 import org.foggyden.hexline.secrets.KeystoreHolderKeys
@@ -57,6 +57,7 @@ import org.foggyden.hexline.servers.SavedServers
 import org.foggyden.hexline.servers.StoreQueue
 import org.foggyden.hexline.setupActions
 import org.junit.After
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -268,7 +269,14 @@ class HolderSetupScreenTest {
         answer { vm.certify.value is Certifying.Approved }
         val approved = (vm.certify.value as Certifying.Approved).device
         assertEquals("certified by the identity's own key", fingerprint, OfflineSetups.session.certifiedBy)
-        assertTrue(approved in vm.devices.value)
+        assertArrayEquals("the device asked about", asked.device, approved.device)
+        assertTrue(OfflineSetups.session.delivered)
+        rule.waitUntil(15_000) {
+            vm.devices.value
+                ?.devices
+                .orEmpty()
+                .any { it.device.contentEquals(asked.device) }
+        }
         // A code shown when the screen goes admits nobody.
         tap(R.string.certify_start)
         rule.waitUntil(15_000) { vm.certify.value is Certifying.Showing }
@@ -439,15 +447,24 @@ class HolderSetupScreenTest {
 
         override suspend fun nextRequest() = next.await()
 
-        override suspend fun approve(
+        var delivered = false
+
+        override suspend fun certify(
             identitySeed: ByteArray,
             manage: Boolean,
             device: ByteArray,
         ): Certified {
+            val asked = next.await()
+            check(device.contentEquals(asked.device)) { "certified a device not asked about" }
+            // A certificate the seed it was handed makes: which identity's it is says whose seed that was.
             val minted = holderMint(identitySeed, card, "Tablet")
             val info = certForDevice(minted.cert, card, minted.deviceSeed)
             certifiedBy = info.fingerprint
-            return Certified(info.device, info.name, manage, info.expires)
+            return Certified(device, asked.name, manage, info.expires)
+        }
+
+        override suspend fun deliver() {
+            delivered = true
         }
 
         override suspend fun deny(reason: String) = Unit

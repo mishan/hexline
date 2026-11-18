@@ -2295,12 +2295,22 @@ async fn asked_by(
         "with its port"
     );
     let typed = session.code().to_lowercase().replace('-', " ");
-    let asking = tokio::spawn(phone.clone().enroll(
+    let mut asking = tokio::spawn(phone.clone().enroll(
         server.url.clone(),
         Some(typed),
         "Tablet".into(),
     ));
-    let asked = session.clone().next_request().await.unwrap();
+    let asked = match within(async {
+        tokio::select! {
+            asked = session.clone().next_request() => asked,
+            done = &mut asking => panic!("the enrollee ended before it asked: {:?}", done.unwrap().err()),
+        }
+    })
+    .await
+    {
+        Ok(asked) => asked,
+        Err(e) => panic!("{e:?}"),
+    };
     (session, asked, asking)
 }
 
@@ -2319,9 +2329,18 @@ async fn a_phone_holding_its_identity_enrolls_another_device_by_its_code() {
     );
     assert_eq!(asked.name.as_deref(), Some("Tablet"));
     assert!(!asked.scanned && !asked.renewal);
-    let certified = session
-        .clone()
-        .approve(seed, false, asked.device.clone())
+    // The code admits nobody else meanwhile.
+    let again =
+        within(Enrollee::new().enroll(server.url.clone(), Some(session.code()), "Tablet".into()))
+            .await
+            .unwrap_err();
+    assert_eq!(refused_as(&again), "unknown_code");
+    assert_eq!(
+        within(session.clone().next_request()).await.unwrap(),
+        asked,
+        "asked again, it is asked as it was shown"
+    );
+    let certified = approved(&session, &seed, false, asked.device.clone())
         .await
         .unwrap();
     assert!(!certified.can_manage);
@@ -2391,22 +2410,35 @@ async fn a_code_shown_past_its_time_ends_the_wait_and_admits_nobody() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_this_phone_certified_is_revoked_and_its_login_refused() {
+    use hexline_core::RevokeReason;
     use hexline_core::{revoke_device, Enrollee};
-    let server = Server::with_registrar(&[]).await;
+    let server = Server::with_registrar_fresh_records().await;
     let (seed, minted, card) = held(&server, "ruth").await;
     let own = cert_info_device(&minted.cert, &card, &minted.device_seed);
     let phone = Enrollee::new();
     let (session, asked, asking) = asked_by(&server, &card, &phone).await;
-    let certified = session
-        .approve(seed.clone(), false, asked.device)
+    let certified = approved(&session, &seed, false, asked.device)
         .await
         .unwrap();
     let enrolled = asking.await.unwrap().unwrap();
+    let device = || DeviceIdentity {
+        device_seed: phone.seed(),
+        cert: enrolled.cert.clone(),
+        card: enrolled.card.clone(),
+    };
+    // Admitted before the revocation, its records fetched and held.
+    let before = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
+    assert!(before
+        .login_identity(device(), true, None, None)
+        .await
+        .unwrap()
+        .fingerprint
+        .is_some());
     let e = revoke_device(
         seed.clone(),
         server.http.clone(),
         own.clone(),
-        3,
+        RevokeReason::Retired,
         0,
         own.clone(),
     )
@@ -2417,22 +2449,17 @@ async fn a_device_this_phone_certified_is_revoked_and_its_login_refused() {
         seed,
         server.http.clone(),
         certified.device,
-        1,
+        RevokeReason::Lost,
         certified.expires,
         own,
     )
     .await
     .unwrap();
-    // Past the records the server holds, which it fetched at the approval.
+    // Past the records the server holds, which it fetched at that login.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let conn = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
-    let device = DeviceIdentity {
-        device_seed: phone.seed(),
-        cert: enrolled.cert,
-        card: enrolled.card,
-    };
     let e = conn
-        .login_identity(device, true, None, None)
+        .login_identity(device(), true, None, None)
         .await
         .unwrap_err();
     assert_eq!(refused_as(&e), "revoked");
@@ -2446,17 +2473,33 @@ async fn within<T>(wait: impl std::future::Future<Output = T>) -> T {
         .expect("an answer without waiting out the mailbox")
 }
 
+/// `session`'s request certified and the certificate sent, as the app does.
+async fn approved(
+    session: &Arc<hexline_core::HolderSession>,
+    seed: &[u8],
+    manage: bool,
+    device: Vec<u8>,
+) -> Result<hexline_core::Certified, CoreError> {
+    let certified = session
+        .clone()
+        .certify(seed.to_vec(), manage, device)
+        .await?;
+    session.clone().deliver().await?;
+    Ok(certified)
+}
+
 fn cert_info_device(cert: &[u8], card: &[u8], seed: &[u8]) -> Vec<u8> {
     hexline_core::cert_for_device(cert.to_vec(), card.to_vec(), seed.to_vec())
         .unwrap()
         .device
 }
 
-/// `request`, as an enrollee sends it, posted to `server`'s mailbox by `code`.
-async fn post_request(server: &Server, code: &str, request: &[u8]) {
+/// `request`, as an enrollee sends it, posted to `server`'s mailbox by
+/// `code`; the secret it collects its answer by.
+async fn post_request(server: &Server, code: &str, request: &[u8]) -> String {
     use base64::Engine;
     let http = hxng_client::auth::http_client(&server.http, None).unwrap();
-    hxng_client::auth::post(
+    let posted = hxng_client::auth::post(
         &http,
         &format!("{}/identity/enroll/requests", server.http),
         Some(serde_json::json!({
@@ -2466,6 +2509,26 @@ async fn post_request(server: &Server, code: &str, request: &[u8]) {
     )
     .await
     .unwrap();
+    posted["request"].as_str().unwrap().to_owned()
+}
+
+/// The certificate the holder answered the request `secret` with, as the
+/// enrollee collects it.
+async fn answered_with(server: &Server, secret: &str) -> hl_identity::DeviceCert {
+    use base64::Engine;
+    let http = hxng_client::auth::http_client(&server.http, None).unwrap();
+    let (status, body) = hxng_client::auth::get(
+        &http,
+        &format!("{}/identity/enroll/requests/{secret}", server.http),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, 200);
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let bundle = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(body["bundle"].as_str().unwrap())
+        .unwrap();
+    hl_identity::DeviceCert::parse(&hl_identity::Bundle::parse(&bundle).unwrap().cert).unwrap()
 }
 
 fn unix_now() -> u64 {
@@ -2552,20 +2615,26 @@ async fn a_device_gets_the_days_it_asked_for_and_a_renewal_only_in_its_time() {
     use hl_identity::{DeviceCert, EnrollRequest, IdentityKey};
     let server = Server::with_registrar(&[]).await;
     let (seed, _, card) = held(&server, "uma").await;
-    let (session, asked) = sent(&server, &card, |d| {
-        let mut r = EnrollRequest::new(d, unix_now());
-        r.days = Some(7);
-        r.sign(d)
-    })
-    .await;
-    let asked = asked.unwrap();
-    assert_eq!((asked.asks_days, asked.gets_days), (Some(7), 7));
-    assert!(!asked.renewal && asked.may_manage);
-    let certified = session
-        .approve(seed.clone(), false, asked.device)
+    let session = hexline_core::open_holder_session(server.http.clone(), card.clone())
         .await
         .unwrap();
-    assert!(certified.expires.abs_diff(unix_now() + 7 * 86_400) < 600);
+    let device = hl_identity::DeviceKey::generate();
+    let mut request = EnrollRequest::new(&device, unix_now());
+    request.days = Some(7);
+    let secret = post_request(&server, &session.code(), &request.sign(&device)).await;
+    let asked = within(session.clone().next_request()).await.unwrap();
+    assert_eq!((asked.asks_days, asked.gets_days), (Some(7), 7));
+    assert!(!asked.renewal && asked.may_manage);
+    let certified = approved(&session, &seed, false, asked.device)
+        .await
+        .unwrap();
+    let cert = answered_with(&server, &secret).await;
+    assert_eq!(
+        cert.expires - cert.issued,
+        7 * 86_400,
+        "the lifetime signed"
+    );
+    assert_eq!(cert.expires, certified.expires);
 
     let id = IdentityKey::from_seed(seed.as_slice().try_into().unwrap());
     for (issued, renewal) in [
@@ -2600,36 +2669,74 @@ async fn a_request_is_answered_once_for_the_device_asked_about() {
         refused_as(
             &session
                 .clone()
-                .approve(seed.clone(), false, vec![7; 32])
+                .certify(seed.clone(), false, vec![7; 32])
                 .await
                 .unwrap_err()
         ),
         "not_asked"
     );
+    assert_eq!(
+        refused_as(&session.clone().deliver().await.unwrap_err()),
+        "nothing_certified"
+    );
     let (one, two) = tokio::join!(
         session
             .clone()
-            .approve(seed.clone(), false, asked.device.clone()),
+            .certify(seed.clone(), false, asked.device.clone()),
         session
             .clone()
-            .approve(seed.clone(), false, asked.device.clone()),
+            .certify(seed.clone(), false, asked.device.clone()),
     );
     assert!(one.is_ok() != two.is_ok(), "minted once");
     let again = one.err().or(two.err()).unwrap();
     assert_eq!(refused_as(&again), "used");
+    assert_eq!(
+        refused_as(&session.clone().deny("no".into()).await.unwrap_err()),
+        "used",
+        "no no after a certificate"
+    );
+    assert_eq!(
+        within(session.clone().next_request()).await.unwrap(),
+        asked,
+        "asked again, it is what was certified"
+    );
+    session.clone().deliver().await.unwrap();
+    assert_eq!(
+        refused_as(&session.clone().deliver().await.unwrap_err()),
+        "used",
+        "sent once"
+    );
 
     let (session, asked) = sent(&server, &card, new).await;
     let asked = asked.unwrap();
     session.clone().deny("no".into()).await.unwrap();
     assert_eq!(
         refused_as(
-            &session
-                .approve(seed, false, asked.device)
+            &approved(&session, &seed, false, asked.device)
                 .await
                 .unwrap_err()
         ),
         "used",
         "no approval after a no"
+    );
+
+    // Canceled, it answers nothing, whatever the mailbox would take.
+    let (session, asked) = sent(&server, &card, new).await;
+    let asked = asked.unwrap();
+    session.clone().cancel();
+    assert_eq!(
+        refused_as(
+            &session
+                .clone()
+                .certify(seed.clone(), false, asked.device.clone())
+                .await
+                .unwrap_err()
+        ),
+        "canceled"
+    );
+    assert_eq!(
+        refused_as(&session.deny("no".into()).await.unwrap_err()),
+        "canceled"
     );
 }
 
@@ -2714,11 +2821,11 @@ async fn a_device_that_scanned_the_holders_qr_code_is_taken_by_its_pairing() {
         "{url}"
     );
     scanned(&server, &url, true).await;
-    let asked = session.clone().next_request().await.unwrap();
+    let asked = within(session.clone().next_request()).await.unwrap();
     assert!(asked.scanned);
     assert_eq!(asked.name.as_deref(), Some("Browser"));
     assert!(asked.may_manage, "asking nothing, it is left to the holder");
-    let certified = session.approve(seed, true, asked.device).await.unwrap();
+    let certified = approved(&session, &seed, true, asked.device).await.unwrap();
     assert!(certified.can_manage, "managing, when the holder says so");
 
     let forged = hexline_core::open_holder_session(server.http.clone(), card)
@@ -2735,6 +2842,16 @@ async fn a_device_that_scanned_the_holders_qr_code_is_taken_by_its_pairing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_web_client_on_another_origin_gets_no_qr_code() {
     let server = Server::with_registrar_and_web(false).await;
+    let http = hxng_client::auth::http_client(&server.http, None).unwrap();
+    let (_, discovery) =
+        hxng_client::auth::get(&http, &format!("{}/.well-known/hotline", server.http))
+            .await
+            .unwrap();
+    let discovery: serde_json::Value = serde_json::from_slice(&discovery).unwrap();
+    assert_eq!(
+        discovery["identity"]["web"], "https://web.example/app/",
+        "a web client advertised, on another origin"
+    );
     let (_, _, card) = held(&server, "sid").await;
     let session = hexline_core::open_holder_session(server.http.clone(), card)
         .await

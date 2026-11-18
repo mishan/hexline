@@ -128,7 +128,7 @@ class Identities(
                 .listFiles()
                 .orEmpty()
                 .map { it.name.removeSuffix(".bak") }
-                .filter { !it.contains('.') }
+                .filter { it.startsWith("identity-") && !it.contains('.') }
                 .distinct()
                 // In one order whatever the file system lists them in.
                 .sorted()
@@ -281,7 +281,8 @@ class Identities(
      * The devices [fingerprint]'s key certified on this phone, as it keeps
      * them, its own device apart: public keys and names, nothing secret. A
      * list that does not read is moved aside, kept for whoever can make
-     * sense of it, rather than written over.
+     * sense of it, rather than written over, and [mintedUnreadable] says so
+     * from then on. Throws an [java.io.IOException] the disk gives.
      */
     fun minted(fingerprint: String): List<MintedDevice> =
         synchronized(LOCK) {
@@ -289,7 +290,9 @@ class Identities(
             val bytes =
                 try {
                     AtomicFile(file).readFully()
-                } catch (_: FileNotFoundException) {
+                } catch (e: FileNotFoundException) {
+                    // One that is there and will not open is the disk's trouble, not an empty list.
+                    if (file.exists()) throw e
                     return emptyList()
                 }
             try {
@@ -306,12 +309,30 @@ class Identities(
                         json.optBoolean("revoked"),
                     )
                 }
-            } catch (_: Exception) {
-                File(dir, file.name + ".unread").writeBytes(bytes)
-                AtomicFile(file).delete()
+            } catch (e: Exception) {
+                // What was read did not parse: the disk's own trouble is the caller's.
+                if (e is java.io.IOException) throw e
+                aside(file, bytes)
                 emptyList()
             }
         }
+
+    /** Whether a list of [fingerprint]'s devices did not read and was kept aside: what it said is not known here. */
+    fun mintedUnreadable(fingerprint: String): Boolean = synchronized(LOCK) { unread(fingerprint).isNotEmpty() }
+
+    /** [bytes], [file]'s, under a name of their own beside any kept before, and then [file] gone. */
+    private fun aside(
+        file: File,
+        bytes: ByteArray,
+    ) {
+        var n = 0
+        while (File(dir, "${file.name}.unread-$n").exists()) n++
+        writeAtomically(File(dir, "${file.name}.unread-$n"), bytes)
+        AtomicFile(file).delete()
+    }
+
+    private fun unread(fingerprint: String) =
+        dir.listFiles().orEmpty().filter { it.name.startsWith(mintedFile(fingerprint).name + ".unread-") }
 
     /** [device] certified by [fingerprint]'s key, in place of any it certified before for the same key. */
     fun minted(
@@ -320,24 +341,6 @@ class Identities(
     ): Unit =
         synchronized(LOCK) {
             writeMinted(fingerprint, minted(fingerprint).filter { !it.device.contentEquals(device.device) } + device)
-        }
-
-    /** [device], certified by [fingerprint]'s key, revoked at its registrar. */
-    fun revokedMinted(
-        fingerprint: String,
-        device: ByteArray,
-    ): Unit =
-        synchronized(LOCK) {
-            writeMinted(
-                fingerprint,
-                minted(fingerprint).map {
-                    if (it.device.contentEquals(device)) {
-                        MintedDevice(it.device, it.fingerprint, it.name, it.expires, it.canManage, revoked = true)
-                    } else {
-                        it
-                    }
-                },
-            )
         }
 
     private fun writeMinted(
@@ -365,6 +368,7 @@ class Identities(
             val file = file(fingerprint)
             val stored = load(file)
             AtomicFile(mintedFile(fingerprint)).delete()
+            unread(fingerprint).forEach { it.delete() }
             AtomicFile(file).delete()
             stored?.let { secrets.delete(secretName(it.fingerprint, it.info.device)) }
         }

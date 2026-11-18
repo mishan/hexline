@@ -217,13 +217,13 @@
     <string name="certify_intro">Add another device to this identity: it asks by a code this phone shows, at a server that keeps a mailbox for it.</string>
     <string name="certify_mailbox">Server</string>
     <string name="certify_start">Add a device</string>
-    <string name="certify_type_code">On the new device, choose to use an identity you have, and enter this code:</string>
+    <string name="certify_type_code">On the new device, enter this code. In Hexline, it goes under \"Enroll with a holder\'s code&#8230;\".</string>
     <string name="certify_at_host">at %1$s</string>
     <string name="certify_or_scan">Or, in a web browser, scan this code:</string>
     <string name="certify_qr">A QR code for the new device to scan</string>
     <plurals name="certify_expires">
-        <item quantity="one">The code works for %d more minute.</item>
-        <item quantity="other">The code works for %d more minutes.</item>
+        <item quantity="one">The code works for %d minute from when it is shown.</item>
+        <item quantity="other">The code works for %d minutes from when it is shown.</item>
     </plurals>
     <string name="certify_asked">A device asks to use this identity</string>
     <string name="certify_device_name">It calls itself %1$s.</string>
@@ -235,12 +235,16 @@
     <string name="certify_gets">It will get: %1$s, for %2$s.</string>
     <string name="certify_asks_whatever">whatever this phone gives</string>
     <plurals name="days">
-        <item quantity="one">%d day</item>
-        <item quantity="other">%d days</item>
+        <item quantity="one">%1$s day</item>
+        <item quantity="other">%1$s days</item>
     </plurals>
     <string name="certify_manage">Let it manage the identity\'s links. A device that manages can also revoke this identity\'s other devices, this phone included.</string>
     <string name="certify_never_vouch">It will never be able to certify other devices.</string>
     <string name="certify_revoked">This device was revoked. It cannot be certified again.</string>
+    <string name="certify_revoked_unknown">This phone\'s list of devices it certified could not be read, so it cannot tell whether this device was revoked. Approve it only if you know it was not.</string>
+    <string name="devices_loading">Reading the list&#8230;</string>
+    <string name="devices_unreadable">This phone\'s list of devices it certified could not be read. It was kept aside, and devices certified before it may not be listed here.</string>
+    <string name="devices_not_kept">This phone could not save its list of devices just now. It is shown from memory, and saved again when it next can.</string>
     <string name="certify_no_login">A device asked for a certificate that signs in nowhere, and was told no. Show a new code to try again.</string>
     <string name="certify_approve">Approve</string>
     <string name="certify_deny">Deny</string>

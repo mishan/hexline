@@ -144,7 +144,9 @@ browser or tunnel types, and the QR beside it where discovery advertises
 a same-origin `web`, which a browser scans. (The reverse -- the phone
 scanning a QR of the enrollee's device key -- is not specified;
 `identity-enrollment.md` §5.6 calls it the native-client future. Not in
-v1.) It certifies for `login` and `message`, for `manage` only when the
+v1.) It certifies for `login`, which a request must leave it, for
+`message` where the request and any renewal's limit leave it that, for
+`manage` only where the request asks or leaves it to the holder and the
 person says so, and never for `vouch`. It keeps a list of the devices it
 certified, beside its own, and revokes a lost one from that list, with a
 reason, as a signed device revocation posted to the registrar; never its

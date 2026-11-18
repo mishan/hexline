@@ -9,6 +9,7 @@ import org.foggyden.hexline.core.HolderCommitted
 import org.foggyden.hexline.core.HolderRequest
 import org.foggyden.hexline.core.NewIdentity
 import org.foggyden.hexline.core.Restored
+import org.foggyden.hexline.core.RevokeReason
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.certForDevice
 import org.foggyden.hexline.core.deviceFingerprintOf
@@ -18,7 +19,6 @@ import org.foggyden.hexline.core.newIdentity
 import org.foggyden.hexline.identity.CertifySession
 import org.foggyden.hexline.identity.HolderSetups
 import org.foggyden.hexline.identity.NewRecoveryCode
-import org.foggyden.hexline.identity.RevokeReason
 import org.foggyden.hexline.identity.Setup
 
 /**
@@ -134,10 +134,14 @@ class FakeSetups : HolderSetups {
     /** What the next session's opening throws, if anything. */
     var openFails: CoreException? = null
 
+    /** Held open until completed, where set: a session opened while the model waits. */
+    var opening: CompletableDeferred<Unit>? = null
+
     override suspend fun openSession(
         mailbox: String,
         card: ByteArray,
     ): CertifySession {
+        opening?.await()
         openFails?.let {
             openFails = null
             throw it
@@ -155,6 +159,9 @@ class FakeSetups : HolderSetups {
 
     val revocations = mutableListOf<Revocation>()
 
+    /** Called as each revocation is made, the registrar having it. */
+    var onRevoke: () -> Unit = {}
+
     override suspend fun revoke(
         identitySeed: ByteArray,
         registrar: String,
@@ -166,11 +173,12 @@ class FakeSetups : HolderSetups {
         yield()
         if (device.contentEquals(thisDevice)) throw CoreException.Refused("own_device", "")
         revocations += Revocation(identitySeed, registrar, device, reason, until)
+        onRevoke()
     }
 
     override fun deviceFingerprint(device: ByteArray) = deviceFingerprintOf(device)
 
-    /** A session at a mailbox: what a device asks it, and how it ends, the test's. */
+    /** A session at a mailbox: what a device asks it, and how it ends, the test's; answered once, as the core's. */
     inner class FakeSession(
         val mailbox: String,
         val card: ByteArray,
@@ -178,12 +186,17 @@ class FakeSetups : HolderSetups {
         /** The request a device makes, or what the mailbox ends the wait with. */
         val next = CompletableDeferred<HolderRequest>()
 
-        /** Each approval's seed, as handed (the model's to wipe), and whether it lets the device manage. */
+        /** Each certificate's seed, as handed (the model's to wipe), and whether it lets the device manage. */
         val approvals = mutableListOf<Pair<ByteArray, Boolean>>()
         val denials = mutableListOf<String>()
+        var delivered = false
         var canceled = false
         var closed = false
         private var asked: HolderRequest? = null
+        private var certified = false
+
+        /** Called as the certificate is sent. */
+        var onDeliver: () -> Unit = {}
 
         /** The device certified: its key and when its certificate ends. */
         val device = ByteArray(32) { 7 }
@@ -204,19 +217,35 @@ class FakeSetups : HolderSetups {
             return next.await().also { asked = it }
         }
 
-        override suspend fun approve(
+        private fun answerable() {
+            if (canceled) throw CoreException.Refused("canceled", "")
+            if (certified || denials.isNotEmpty()) throw CoreException.Refused("used", "")
+        }
+
+        override suspend fun certify(
             identitySeed: ByteArray,
             manage: Boolean,
             device: ByteArray,
         ): Certified {
             yield()
+            answerable()
             if (!device.contentEquals(checkNotNull(asked).device)) throw CoreException.Refused("not_asked", "")
+            certified = true
             approvals += identitySeed to manage
             return Certified(device, checkNotNull(asked).name, manage, expires)
         }
 
+        override suspend fun deliver() {
+            yield()
+            if (canceled) throw CoreException.Refused("canceled", "")
+            if (!certified || delivered) throw CoreException.Refused("used", "")
+            onDeliver()
+            delivered = true
+        }
+
         override suspend fun deny(reason: String) {
             yield()
+            answerable()
             denials += reason
         }
 

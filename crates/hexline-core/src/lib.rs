@@ -26,8 +26,8 @@ pub use holder::{
     new_identity, HeldRenewal, HolderCommitted, HolderMinted, HolderSetup, NewIdentity,
 };
 pub use holder_session::{
-    device_fingerprint_of, open_holder_session, revoke_device, Certified, HolderRequest,
-    HolderSession, Qr,
+    certify_end, device_fingerprint_of, open_holder_session, revoke_device, Certified, CertifyEnd,
+    HolderRequest, HolderSession, Qr, RevokeReason,
 };
 pub use identity::{
     cert_for_device, cert_info, cert_time, new_device, CertInfo, CertTime, NewDevice,
