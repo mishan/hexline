@@ -26,7 +26,9 @@ val Standing.usable: Boolean get() = this == Standing.Good || this is Standing.R
  * [identity]'s standing at [now], in seconds: outside its time by the
  * core's own rule, which the core holds a login to, and otherwise how
  * soon it wants renewing. In envelope mode renewing asks for the
- * passphrase again, so it is asked for close to the end (design 2.1).
+ * passphrase again, so it is asked for close to the end; a phone holding
+ * the key asks only for the screen lock, so from a third of the
+ * certificate's life left (design 2.1).
  */
 fun standing(
     identity: StoredIdentity,
@@ -39,8 +41,11 @@ fun standing(
     }
     // Within the skew past its end, it is still a day it may be used.
     val left = (identity.info.expires.toLong() - now).coerceAtLeast(1)
-    return if (left <= RENEW_WITHIN) Standing.Renew((left + DAY - 1) / DAY) else Standing.Good
+    return if (left <= renewWithin(identity)) Standing.Renew((left + DAY - 1) / DAY) else Standing.Good
 }
+
+private fun renewWithin(identity: StoredIdentity) =
+    if (identity.held) (identity.info.expires.toLong() - identity.info.issued.toLong()) / 3 else RENEW_WITHIN
 
 /**
  * The first moment after [now] at which [identity]'s standing is
@@ -53,7 +58,7 @@ fun nextChange(
     now: Long,
 ): Long? {
     val (issued, expires) = identity.info.issued to identity.info.expires
-    val days = (0..RENEW_WITHIN / DAY).map { expires.toLong() - it * DAY }
+    val days = (0..renewWithin(identity) / DAY).map { expires.toLong() - it * DAY } + (expires.toLong() - renewWithin(identity))
     val at = standing(identity, now)
     return (days + listOfNotNull(certTimeChanges(issued, expires, now.toULong())?.toLong()))
         .filter { it > now }

@@ -294,6 +294,14 @@ pub(crate) async fn discovered(
         .then(|| serde_json::from_slice::<Value>(&body).ok())
         .flatten()
         .ok_or_else(|| refused("not_a_registrar"))?;
+    registrar_of(&doc, base)
+}
+
+/// The registrar `doc`, a discovery document fetched from `base`, says
+/// is there: none unless it names itself by the host it was reached at, as
+/// what it signs for is that host's, and a registrar naming another could
+/// gather requests signed for that one.
+fn registrar_of(doc: &Value, base: &Url) -> Result<Registrar, CoreError> {
     let block = doc
         .get("registrar")
         .ok_or_else(|| refused("not_a_registrar"))?;
@@ -312,7 +320,9 @@ pub(crate) async fn discovered(
         )
         .collect();
     Ok(Registrar {
-        host: text(block.get("host")).ok_or_else(|| refused("not_a_registrar"))?,
+        host: text(block.get("host"))
+            .filter(|host| *host == base.host_str().unwrap_or_default())
+            .ok_or_else(|| refused("not_a_registrar"))?,
         envelopes: text(endpoints.and_then(|e| e.get("envelopes")))
             .ok_or_else(|| refused("no_envelopes"))?,
         register: text(endpoints.and_then(|e| e.get("register")))
@@ -518,6 +528,27 @@ mod tests {
                 base,
                 "{given}"
             );
+        }
+    }
+
+    #[test]
+    fn a_registrar_is_one_only_under_the_host_it_was_reached_at() {
+        let doc = |host: &str| {
+            json!({ "registrar": {
+                "host": host,
+                "endpoints": { "envelopes": "/registrar/envelopes", "register": "/registrar/register" },
+            } })
+        };
+        for (reached, named, ours) in [
+            ("https://reg.example", "reg.example", true),
+            ("https://REG.example:8443", "reg.example", true),
+            ("http://127.0.0.1:5700", "127.0.0.1", true),
+            ("https://reg.example", "other.example", false),
+            ("https://reg.example", "REG.example", false),
+            ("http://localhost:5700", "127.0.0.1", false),
+        ] {
+            let got = registrar_of(&doc(named), &Url::parse(reached).unwrap());
+            assert_eq!(got.is_ok(), ours, "{named} at {reached}");
         }
     }
 

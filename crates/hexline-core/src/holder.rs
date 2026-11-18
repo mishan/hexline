@@ -79,6 +79,54 @@ pub fn holder_mint(
     })
 }
 
+/// A new certificate for this phone's own device, `device_seed`'s, by the
+/// identity whose seed is `identity_seed`: a holder's own, as long as
+/// recommended from now, under the name `cert`, the one it renews, gave
+/// it, lapsed or not. Refused `wrong_identity` unless `cert` and `card` are
+/// that identity's and the device's.
+#[uniffi::export]
+pub fn holder_renew(
+    identity_seed: Vec<u8>,
+    card: Vec<u8>,
+    device_seed: Vec<u8>,
+    cert: Vec<u8>,
+) -> Result<Vec<u8>, CoreError> {
+    let (seed, device) = (seed32(identity_seed)?, seed32(device_seed)?);
+    let id = IdentityKey::from_seed(&seed);
+    let device = DeviceKey::from_seed(&device);
+    let info = crate::identity::cert_for_device(cert, card, device.seed().to_vec())
+        .map_err(|_| refused("wrong_identity"))?;
+    if info.fingerprint != id.fingerprint().to_string() {
+        return Err(refused("wrong_identity"));
+    }
+    certify(&id, &device, info.name.as_deref().unwrap_or("Hexline"))
+}
+
+/// What Renew does for an identity this phone holds, by what servers said
+/// of its device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum HeldRenewal {
+    /// Certify the same device again.
+    Renew,
+    /// A server revoked the device: a new one, by the key held here.
+    NewDevice,
+    /// The identity was rotated away: nothing this key certifies is taken.
+    Nothing,
+}
+
+/// [`HeldRenewal`] for a device the servers refused with `refused`, the
+/// codes of its refusals alone: `rotated` before any other.
+#[uniffi::export]
+pub fn held_renewal(refused: Vec<String>) -> HeldRenewal {
+    if refused.iter().any(|code| code == "rotated") {
+        HeldRenewal::Nothing
+    } else if refused.is_empty() {
+        HeldRenewal::Renew
+    } else {
+        HeldRenewal::NewDevice
+    }
+}
+
 /// A holder's identity being made (design §2.1): its key, the successor
 /// its card commits to and its recovery code, all kept here alone until
 /// the person has typed both codes back. Then the app holds the seed
@@ -430,7 +478,8 @@ impl HolderSetup {
                     });
                 }
             }
-            s.signed = later(s.signed, now());
+            s.signed = later(s.signed, crate::backup::signing_time());
+            crate::backup::signed_at(s.signed);
             let id = IdentityKey::from_seed(&s.seed);
             let recovery = s.recovery.as_ref().expect("confirmed");
             let (envelope, keys) = tokio::task::block_in_place(|| {
@@ -782,6 +831,13 @@ mod tests {
     }
 
     #[test]
+    fn a_time_a_setup_signs_is_one_no_backup_signs_again() {
+        let ahead = crate::restore::now() + 1_000;
+        crate::backup::signed_at(ahead);
+        assert!(crate::backup::signing_time() > ahead);
+    }
+
+    #[test]
     fn each_commit_signs_a_time_later_than_the_last_and_never_behind_the_clock() {
         for (signed, now, want) in [
             (0, 1000, 1000),
@@ -791,6 +847,92 @@ mod tests {
         ] {
             assert_eq!(later(signed, now), want, "{signed} at {now}");
         }
+    }
+
+    #[test]
+    fn a_holder_renews_its_own_device_under_its_name_and_no_other() {
+        let made = new_identity("Alice".into()).unwrap();
+        let minted = holder_mint(made.seed.clone(), made.card.clone(), "Pixel".into()).unwrap();
+        let renewed = holder_renew(
+            made.seed.clone(),
+            made.card.clone(),
+            minted.device_seed.clone(),
+            minted.cert.clone(),
+        )
+        .unwrap();
+        let info = crate::identity::cert_for_device(
+            renewed,
+            made.card.clone(),
+            minted.device_seed.clone(),
+        )
+        .unwrap();
+        assert_eq!(info.fingerprint, made.fingerprint);
+        assert_eq!(info.name.as_deref(), Some("Pixel"));
+        assert!(info.can_manage && !info.can_vouch);
+        let bob = new_identity("Bob".into()).unwrap();
+        let theirs = holder_mint(bob.seed.clone(), bob.card.clone(), "Pixel".into()).unwrap();
+        for (seed, card, device, cert) in [
+            (
+                bob.seed.clone(),
+                made.card.clone(),
+                minted.device_seed.clone(),
+                minted.cert.clone(),
+            ),
+            (
+                made.seed.clone(),
+                made.card.clone(),
+                theirs.device_seed.clone(),
+                minted.cert.clone(),
+            ),
+            (
+                made.seed.clone(),
+                bob.card.clone(),
+                theirs.device_seed.clone(),
+                theirs.cert.clone(),
+            ),
+        ] {
+            assert_eq!(
+                refused_as(holder_renew(seed, card, device, cert)),
+                "wrong_identity"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lapsed_certificate_is_renewed_to_end_later_than_it_did() {
+        let made = new_identity("Alice".into()).unwrap();
+        let id = IdentityKey::from_seed(&made.seed.clone().try_into().unwrap());
+        let device = DeviceKey::generate();
+        let mut lapsed = hl_identity::DeviceCert::for_keys(
+            &id,
+            device.public(),
+            device.public_enc(),
+            1_000,
+            1_000,
+        )
+        .unwrap();
+        lapsed.caps = Some(caps::LOGIN | caps::MESSAGE | caps::MANAGE);
+        lapsed.name = Some("Pixel".into());
+        let lapsed = lapsed.sign(&id);
+        let renewed = holder_renew(
+            made.seed.clone(),
+            made.card.clone(),
+            device.seed().to_vec(),
+            lapsed.clone(),
+        )
+        .unwrap();
+        let was =
+            crate::identity::cert_for_device(lapsed, made.card.clone(), device.seed().to_vec())
+                .unwrap();
+        let now =
+            crate::identity::cert_for_device(renewed, made.card, device.seed().to_vec()).unwrap();
+        assert!(
+            now.expires > was.expires && now.expires > crate::restore::now(),
+            "{} after {}",
+            now.expires,
+            was.expires
+        );
+        assert_eq!(now.name.as_deref(), Some("Pixel"));
     }
 
     #[test]

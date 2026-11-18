@@ -64,6 +64,34 @@ fun setupActions(
     override fun cancel() = chat.cancelHolderSetup()
 
     override fun seen() = chat.holderSetupSeen()
+
+    override fun renew(fingerprint: String) = chat.renewHeld(fingerprint, authorizer)
+
+    override fun renewSeen() = chat.renewingSeen()
+
+    override fun newDevice(fingerprint: String) = chat.newDeviceHeld(fingerprint, authorizer)
+
+    override fun retryNewRecoveryCode(fingerprint: String) = chat.retryNewRecoveryCode(fingerprint, authorizer)
+
+    override fun backUpPassphrase(
+        fingerprint: String,
+        passphrase: String,
+    ) = chat.backUpPassphrase(fingerprint, passphrase, authorizer)
+
+    override fun removePassphraseBackup(fingerprint: String) = chat.removePassphraseBackup(fingerprint, authorizer)
+
+    override fun newRecoveryCode() = chat.newRecoveryCode()
+
+    override fun newRecoveryCodeWritten() = chat.newRecoveryCodeWritten()
+
+    override fun showNewRecoveryCodeAgain() = chat.showNewRecoveryCodeAgain()
+
+    override fun confirmNewRecoveryCode(
+        fingerprint: String,
+        typed: ByteArray,
+    ) = chat.confirmNewRecoveryCode(fingerprint, typed, authorizer)
+
+    override fun backupSeen() = chat.backupSeen()
 }
 
 @Composable
@@ -79,6 +107,8 @@ fun Hexline(
     val enrolling by chat.enrollment.collectAsStateWithLifecycle()
     val heldLost by chat.heldLostNotices.collectAsStateWithLifecycle()
     val settingUp by chat.holderSetup.collectAsStateWithLifecycle()
+    val renewing by chat.renewing.collectAsStateWithLifecycle()
+    val backingUp by chat.backingUp.collectAsStateWithLifecycle()
     when (val link = state.link) {
         Link.Live, is Link.Reconnecting -> ChatScreen(state, chat::send, chat::loadEarlier, chat::disconnect)
         else ->
@@ -106,6 +136,8 @@ fun Hexline(
                 heldLost = heldLost,
                 onHeldLostSeen = chat::dismissHeldLost,
                 settingUp = settingUp,
+                renewing = renewing,
+                backingUp = backingUp,
                 setup = setupActions(chat, authorizer),
             )
     }

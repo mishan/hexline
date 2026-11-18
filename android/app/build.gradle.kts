@@ -79,6 +79,8 @@ android {
         abortOnError = true
         // A library's own checks built for another lint; not ours to fix.
         disable += "ObsoleteLintCustomCheck"
+        // What was released today is no reason for a build to fail: Dependabot proposes updates.
+        disable += listOf("NewerVersionAvailable", "GradleDependency")
     }
 
     testOptions {

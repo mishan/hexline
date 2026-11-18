@@ -37,9 +37,13 @@ import org.foggyden.hexline.core.UpdateSink
 import org.foggyden.hexline.core.cardName
 import org.foggyden.hexline.core.coreConnection
 import org.foggyden.hexline.core.coreEnrollment
+import org.foggyden.hexline.core.holderMint
+import org.foggyden.hexline.core.minPassphrase
 import org.foggyden.hexline.core.newerCard
 import org.foggyden.hexline.core.refusalLasts
 import org.foggyden.hexline.core.restoreIdentity
+import org.foggyden.hexline.identity.Backed
+import org.foggyden.hexline.identity.BackingUp
 import org.foggyden.hexline.identity.CoreHolderSetups
 import org.foggyden.hexline.identity.EnrollProblem
 import org.foggyden.hexline.identity.Enrolling
@@ -47,6 +51,8 @@ import org.foggyden.hexline.identity.HeldSeeds
 import org.foggyden.hexline.identity.HolderRefusal
 import org.foggyden.hexline.identity.HolderSetups
 import org.foggyden.hexline.identity.Identities
+import org.foggyden.hexline.identity.NewRecoveryCode
+import org.foggyden.hexline.identity.Renewing
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
 import org.foggyden.hexline.identity.SettingUp
@@ -457,6 +463,8 @@ class ChatViewModel internal constructor(
                     if (seed != null && holdWith != null && !held.hold(device.fingerprint, seed, holdWith)) {
                         Restoring.NotHeld(device.fingerprint)
                     } else {
+                        // Shown as held once it is.
+                        if (seed != null) withContext(store) { publishIdentities() }
                         Restoring.Done(device.fingerprint)
                     }
                 } catch (e: CoreException) {
@@ -614,6 +622,255 @@ class ChatViewModel internal constructor(
     fun restoreSeen() {
         if (restoring.value != Restoring.Working) restoring.value = Restoring.Idle
     }
+
+    private val renewal = MutableStateFlow<Renewing>(Renewing.Idle)
+
+    /** Renewing the certificate of this phone's own device, for an identity it holds. */
+    val renewing: StateFlow<Renewing> = renewal
+
+    /**
+     * Certifies this phone's device for [fingerprint] again, by the key
+     * this phone holds, opened behind [authorizer]'s prompt. A prompt
+     * refused leaves it as it was.
+     */
+    fun renewHeld(
+        fingerprint: String,
+        authorizer: Authorizer,
+    ) {
+        if (renewal.value == Renewing.Working) return
+        renewal.value = Renewing.Working
+        viewModelScope.launch {
+            // Kept where a cancellation before the read returns cannot lose it, and wiped however this ends.
+            var deviceSeed: ByteArray? = null
+            renewal.value =
+                try {
+                    keeping(Renewing::Failed) {
+                        val kept =
+                            withContext(store) { identities.device(fingerprint)?.also { deviceSeed = it.second } }?.first
+                                ?: return@keeping Renewing.Idle
+                        val device = checkNotNull(deviceSeed)
+                        val cert =
+                            held.use(fingerprint, authorizer) { seed -> setups.renew(seed, kept.card, device, kept.cert) }
+                                ?: return@keeping Renewing.Idle
+                        // Only in place of the certificate it began from: one installed meanwhile stands.
+                        withContext(store) { identities.renewed(fingerprint, cert, replacing = kept.cert)?.also { publishIdentities() } }
+                            ?: return@keeping Renewing.Idle
+                        Renewing.Done(fingerprint)
+                    }
+                } finally {
+                    deviceSeed?.fill(0)
+                }
+        }
+    }
+
+    /**
+     * A new device for [fingerprint] on this phone, certified by the key it
+     * holds behind [authorizer]'s prompt, in place of one a server refused
+     * as revoked: renewing that one would certify a key revoked again.
+     */
+    fun newDeviceHeld(
+        fingerprint: String,
+        authorizer: Authorizer,
+    ) {
+        if (renewal.value == Renewing.Working) return
+        renewal.value = Renewing.Working
+        viewModelScope.launch {
+            renewal.value =
+                keeping(Renewing::Failed) {
+                    val kept =
+                        withContext(store) { identities.list().find { it.fingerprint == fingerprint } } ?: return@keeping Renewing.Idle
+                    val minted =
+                        held.use(fingerprint, authorizer) { seed -> holderMint(seed, kept.card, kept.info.name ?: "Hexline") }
+                            ?: return@keeping Renewing.Idle
+                    try {
+                        val at = servers.generation()
+                        val replaced =
+                            withContext(store) {
+                                // Only in place of the device it began from: an identity deleted
+                                // meanwhile stays deleted, and one renewed stands. All else as it
+                                // is now, a commit made meanwhile included: the certificate is the
+                                // identity's whichever of its cards it is kept beside.
+                                val now =
+                                    identities.list().find { it.fingerprint == fingerprint }?.takeIf { it.cert.contentEquals(kept.cert) }
+                                        ?: return@withContext false
+                                identities.save(
+                                    minted.deviceSeed,
+                                    minted.cert,
+                                    now.card,
+                                    now.handle,
+                                    now.registrar,
+                                    now.mailbox,
+                                    unfinished = now.unfinished,
+                                )
+                                servers.forgetRefusalsOf(kept.info.device, at)
+                                publishRefusals()
+                                publishIdentities()
+                                true
+                            }
+                        if (!replaced) return@keeping Renewing.Idle
+                    } finally {
+                        minted.deviceSeed.fill(0)
+                    }
+                    Renewing.Done(fingerprint)
+                }
+        }
+    }
+
+    fun renewingSeen() {
+        if (renewal.value != Renewing.Working) renewal.value = Renewing.Idle
+    }
+
+    private val backup = MutableStateFlow<BackingUp>(BackingUp.Idle)
+
+    /** A held identity's backup at its registrar. */
+    val backingUp: StateFlow<BackingUp> = backup
+
+    /** The new recovery code under way: on the main thread alone. */
+    private var newCode: NewRecoveryCode? = null
+
+    /**
+     * Saves [passphrase] as [fingerprint]'s backup, in place of any before,
+     * behind [authorizer]'s prompt; one too short is refused before the key
+     * is asked for.
+     */
+    fun backUpPassphrase(
+        fingerprint: String,
+        passphrase: String,
+        authorizer: Authorizer,
+    ) {
+        if (passphrase.trim().codePointCount(0, passphrase.trim().length) < minPassphrase().toInt()) {
+            if (backup.value != BackingUp.Working) backup.value = BackingUp.Failed(SetupProblem.BadPassphrase)
+            return
+        }
+        backingUp(fingerprint, authorizer, Backed.PassphraseSaved) { seed, registrar ->
+            setups.putPassphrase(seed, registrar, passphrase)
+        }
+    }
+
+    /** Removes [fingerprint]'s passphrase backup, behind [authorizer]'s prompt. */
+    fun removePassphraseBackup(
+        fingerprint: String,
+        authorizer: Authorizer,
+    ) = backingUp(fingerprint, authorizer, Backed.PassphraseRemoved) { seed, registrar ->
+        setups.deleteBackup(seed, registrar, SecretKind.PASSPHRASE)
+    }
+
+    /** Shows a new recovery code, to be typed back before it replaces the one before. */
+    fun newRecoveryCode() {
+        if (backup.value == BackingUp.Working) return
+        closeNewCode()
+        val made = setups.newRecoveryCode()
+        newCode = made
+        backup.value = BackingUp.Recovery(shown(made.code()))
+    }
+
+    fun newRecoveryCodeWritten() {
+        if (backup.value is BackingUp.Recovery) backup.value = BackingUp.ConfirmRecovery(false)
+    }
+
+    fun showNewRecoveryCodeAgain() {
+        if (backup.value !is BackingUp.ConfirmRecovery) return
+        val code = newCode?.code() ?: return
+        backup.value = BackingUp.Recovery(shown(code))
+    }
+
+    /**
+     * The new recovery code as typed back, [typed] wiped; if it is the code,
+     * it is put as [fingerprint]'s, behind [authorizer]'s prompt.
+     */
+    fun confirmNewRecoveryCode(
+        fingerprint: String,
+        typed: ByteArray,
+        authorizer: Authorizer,
+    ) {
+        val made = newCode
+        val right =
+            try {
+                backup.value is BackingUp.ConfirmRecovery && made != null && made.confirm(typed)
+            } finally {
+                typed.fill(0)
+            }
+        if (backup.value !is BackingUp.ConfirmRecovery) return
+        if (!right) {
+            backup.value = BackingUp.ConfirmRecovery(true)
+            return
+        }
+        putNewRecoveryCode(fingerprint, checkNotNull(made), authorizer)
+    }
+
+    /** The new recovery code typed back put again, after a put not known to have gone through. */
+    fun retryNewRecoveryCode(
+        fingerprint: String,
+        authorizer: Authorizer,
+    ) {
+        val made = newCode ?: return
+        if (backup.value is BackingUp.RecoveryNotSaved) putNewRecoveryCode(fingerprint, made, authorizer)
+    }
+
+    private fun putNewRecoveryCode(
+        fingerprint: String,
+        made: NewRecoveryCode,
+        authorizer: Authorizer,
+    ) = backingUp(fingerprint, authorizer, Backed.RecoveryCodeSaved, notSaved = BackingUp::RecoveryNotSaved) { seed, registrar ->
+        made.put(seed, registrar)
+        closeNewCode()
+    }
+
+    fun backupSeen() {
+        if (backup.value == BackingUp.Working) return
+        closeNewCode()
+        backup.value = BackingUp.Idle
+    }
+
+    private fun closeNewCode() {
+        newCode?.close()
+        newCode = null
+    }
+
+    /** [act] on [fingerprint]'s seed, opened behind [authorizer]'s prompt, at its registrar. */
+    private fun backingUp(
+        fingerprint: String,
+        authorizer: Authorizer,
+        done: Backed,
+        notSaved: (SetupProblem) -> BackingUp = BackingUp::Failed,
+        act: suspend (seed: ByteArray, registrar: String) -> Unit,
+    ) {
+        if (backup.value == BackingUp.Working) return
+        val was = backup.value
+        backup.value = BackingUp.Working
+        viewModelScope.launch {
+            backup.value =
+                keeping({ problem -> if (problem == SetupProblem.KeyLost) BackingUp.Failed(problem) else notSaved(problem) }) {
+                    val registrar =
+                        withContext(store) { identities.list().find { it.fingerprint == fingerprint } }?.registrar
+                            ?: return@keeping BackingUp.Failed(SetupProblem.NotARegistrar)
+                    held.use(fingerprint, authorizer) { seed -> act(seed, registrar) } ?: return@keeping was
+                    BackingUp.Done(done)
+                }
+        }
+    }
+
+    /** [step]'s state, or [failed] with what the step was refused for. */
+    private suspend fun <T> keeping(
+        failed: (SetupProblem) -> T,
+        step: suspend () -> T,
+    ): T =
+        try {
+            step()
+        } catch (_: HeldKeyLost) {
+            withContext(store) { demoteHeld() }
+            failed(SetupProblem.KeyLost)
+        } catch (e: CoreException) {
+            failed(setupProblem(e))
+        } catch (_: SecretUnavailable) {
+            failed(SetupProblem.NotKept)
+        } catch (_: IOException) {
+            failed(SetupProblem.NotKept)
+        } catch (_: GeneralSecurityException) {
+            failed(SetupProblem.NotKept)
+        } catch (_: ProviderException) {
+            failed(SetupProblem.NotKept)
+        }
 
     private val settingUp = MutableStateFlow<SettingUp>(SettingUp.Idle)
 
@@ -1015,7 +1272,7 @@ class ChatViewModel internal constructor(
 
     // Called on the store queue alone, so a slower read is never shown over a newer one.
     private fun publishIdentities() {
-        kept.value = identities.list()
+        kept.value = identities.list().map { if (held.isHeld(it.fingerprint)) it.held() else it }
     }
 
     private fun publishServers() {
@@ -1300,6 +1557,7 @@ class ChatViewModel internal constructor(
     // resumed, and let the core finish on its own threads.
     override fun onCleared() {
         closeSetup()
+        closeNewCode()
         connectivity.unregisterNetworkCallback(network)
         process.removeObserver(lifecycle)
         send(EnrollEvent.Closed)

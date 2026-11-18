@@ -3,13 +3,23 @@ package org.foggyden.hexline.identity
 import org.foggyden.hexline.core.HeldRestore
 import org.foggyden.hexline.core.HolderSetup
 import org.foggyden.hexline.core.HolderSetupInterface
+import org.foggyden.hexline.core.RecoveryCodeSetup
+import org.foggyden.hexline.core.RecoveryCodeSetupInterface
 import org.foggyden.hexline.core.SecretKind
+import org.foggyden.hexline.core.backupDelete
+import org.foggyden.hexline.core.backupPassphrase
 import org.foggyden.hexline.core.checkHolderRegistrar
+import org.foggyden.hexline.core.holderRenew
 import org.foggyden.hexline.core.restoreIdentityToHold
 
 /** A holder's setup the model drives (the core's, or a test's), closed to wipe it. */
 interface Setup :
     HolderSetupInterface,
+    AutoCloseable
+
+/** A new recovery code the model drives, closed to wipe it. */
+interface NewRecoveryCode :
+    RecoveryCodeSetupInterface,
     AutoCloseable
 
 /** Where holder setups and holding restores come from: the core, or a test standing in for it. */
@@ -40,6 +50,28 @@ interface HolderSetups {
         secret: String,
         deviceName: String,
     ): HeldRestore
+
+    /** A new certificate for this phone's device (the core's `holder_renew`). */
+    fun renew(
+        identitySeed: ByteArray,
+        card: ByteArray,
+        deviceSeed: ByteArray,
+        cert: ByteArray,
+    ): ByteArray
+
+    suspend fun putPassphrase(
+        identitySeed: ByteArray,
+        registrar: String,
+        passphrase: String,
+    )
+
+    suspend fun deleteBackup(
+        identitySeed: ByteArray,
+        registrar: String,
+        kind: SecretKind,
+    )
+
+    fun newRecoveryCode(): NewRecoveryCode
 }
 
 object CoreHolderSetups : HolderSetups {
@@ -67,6 +99,34 @@ object CoreHolderSetups : HolderSetups {
         secret: String,
         deviceName: String,
     ) = restoreIdentityToHold(registrar, handle, kind, secret, deviceName)
+
+    override fun renew(
+        identitySeed: ByteArray,
+        card: ByteArray,
+        deviceSeed: ByteArray,
+        cert: ByteArray,
+    ) = holderRenew(identitySeed, card, deviceSeed, cert)
+
+    override suspend fun putPassphrase(
+        identitySeed: ByteArray,
+        registrar: String,
+        passphrase: String,
+    ) = backupPassphrase(identitySeed, registrar, passphrase)
+
+    override suspend fun deleteBackup(
+        identitySeed: ByteArray,
+        registrar: String,
+        kind: SecretKind,
+    ) = backupDelete(identitySeed, registrar, kind)
+
+    override fun newRecoveryCode(): NewRecoveryCode = CoreRecoveryCode(RecoveryCodeSetup())
+}
+
+private class CoreRecoveryCode(
+    private val code: RecoveryCodeSetup,
+) : NewRecoveryCode,
+    RecoveryCodeSetupInterface by code {
+    override fun close() = code.close()
 }
 
 private class CoreSetup(

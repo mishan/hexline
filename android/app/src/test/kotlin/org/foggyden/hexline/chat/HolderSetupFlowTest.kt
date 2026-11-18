@@ -2,14 +2,21 @@ package org.foggyden.hexline.chat
 
 import androidx.lifecycle.ViewModelStore
 import org.foggyden.hexline.core.CoreException
+import org.foggyden.hexline.core.NewIdentity
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.newIdentity
+import org.foggyden.hexline.identity.Backed
+import org.foggyden.hexline.identity.BackingUp
 import org.foggyden.hexline.identity.HolderRefusal
+import org.foggyden.hexline.identity.Renewing
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
 import org.foggyden.hexline.identity.SettingUp
 import org.foggyden.hexline.identity.SetupProblem
 import org.foggyden.hexline.secrets.SecretUnavailable
+import org.foggyden.hexline.servers.Server
+import org.foggyden.hexline.servers.SignIn
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -399,5 +406,255 @@ class HolderSetupFlowTest : ViewModelHarness() {
         assertEquals(SettingUp.Done(setup.fingerprint()), vm.holderSetup.value)
         assertEquals("as the registrar took it", "carol", keptIdentities().single().handle)
         assertEquals(1, setup.commits.size)
+    }
+
+    /** An identity set up and held here, committed: its fingerprint. */
+    private fun heldHere(vm: ChatViewModel): String {
+        val setup = throughTheCodes(vm)
+        vm.holdSetup(stores.keys.authorizer())
+        settle()
+        return setup.fingerprint()
+    }
+
+    @Test
+    fun aHeldIdentitysDeviceIsRenewedBehindThePromptAndNotWithoutIt() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        assertTrue(
+            "listed as held",
+            vm.identityList.value
+                .single()
+                .held,
+        )
+        val cert = keptIdentities().single().cert
+        // A renewal through a mailbox tried before, and no holder there: what this one clears.
+        outside { identities.renewTried(fingerprint, cert, 1_000, noHolder = true) }
+        vm.renewHeld(fingerprint, stores.keys.authorizer { false })
+        settle()
+        assertEquals(Renewing.Idle, vm.renewing.value)
+        assertEquals(emptyList<Any>(), setups.renewals)
+        vm.renewHeld(fingerprint, stores.keys.authorizer())
+        settle()
+        assertEquals(Renewing.Done(fingerprint), vm.renewing.value)
+        assertArrayEquals("the certificate it renews", cert, setups.renewals.single().second)
+        val renewed = keptIdentities().single()
+        assertEquals("no renewal tried since", 0L, renewed.renewTried)
+        assertFalse(renewed.noHolder)
+        assertTrue(
+            "still held",
+            vm.identityList.value
+                .single()
+                .held,
+        )
+    }
+
+    @Test
+    fun aPassphraseBackupIsSavedAndRemovedBehindThePrompt() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        vm.backUpPassphrase(fingerprint, "  ", stores.keys.authorizer())
+        settle()
+        assertEquals(BackingUp.Failed(SetupProblem.BadPassphrase), vm.backingUp.value)
+        vm.backUpPassphrase(fingerprint, "correct horse", stores.keys.authorizer { false })
+        settle()
+        assertEquals("as it was before the prompt", BackingUp.Failed(SetupProblem.BadPassphrase), vm.backingUp.value)
+        assertEquals(emptyList<Any>(), setups.backups)
+        vm.backUpPassphrase(fingerprint, "correct horse", stores.keys.authorizer())
+        settle()
+        assertEquals(BackingUp.Done(Backed.PassphraseSaved), vm.backingUp.value)
+        vm.removePassphraseBackup(fingerprint, stores.keys.authorizer())
+        settle()
+        assertEquals(BackingUp.Done(Backed.PassphraseRemoved), vm.backingUp.value)
+        assertEquals(
+            listOf("passphrase correct horse" to "reg.example", "delete PASSPHRASE" to "reg.example"),
+            setups.backups,
+        )
+    }
+
+    @Test
+    fun aNewRecoveryCodeIsSavedOnceTypedBackBehindThePrompt() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        vm.newRecoveryCode()
+        val made = setups.newCodes.single()
+        assertEquals(BackingUp.Recovery(made.code), vm.backingUp.value)
+        vm.newRecoveryCodeWritten()
+        vm.confirmNewRecoveryCode(fingerprint, bytes("NEWRC-0DE00-00000-00003"), stores.keys.authorizer())
+        assertEquals(BackingUp.ConfirmRecovery(true), vm.backingUp.value)
+        val typed = bytes(made.code)
+        vm.confirmNewRecoveryCode(fingerprint, typed, stores.keys.authorizer())
+        settle()
+        assertEquals(BackingUp.Done(Backed.RecoveryCodeSaved), vm.backingUp.value)
+        assertEquals(listOf("recovery" to "reg.example"), setups.backups)
+        assertTrue("let go of", made.closed)
+        assertTrue("typed bytes wiped", typed.all { it == 0.toByte() })
+        assertTrue("every code handed out wiped", setups.codes.all { code -> code.all { it == 0.toByte() } })
+    }
+
+    @Test
+    fun aBackupOfAHeldIdentityWhoseKeyWentLetsItGoWithItsNotice() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        stores.keys.invalidate(stores.keys.aliases.single())
+        vm.backUpPassphrase(fingerprint, "correct horse", stores.keys.authorizer())
+        settle()
+        assertEquals(BackingUp.Failed(SetupProblem.KeyLost), vm.backingUp.value)
+        assertEquals(listOf(fingerprint), vm.heldLostNotices.value)
+        assertEquals(emptyList<Any>(), setups.backups)
+    }
+
+    @Test
+    fun anUnfinishedSetupRenewedIsStillToBeFinished() {
+        val vm = model()
+        settle()
+        val setup = throughTheCodes(vm)
+        setup.answers += CoreException.Connect("unreachable")
+        vm.holdSetup(stores.keys.authorizer())
+        settle()
+        vm.renewHeld(setup.fingerprint(), stores.keys.authorizer())
+        settle()
+        assertEquals(Renewing.Done(setup.fingerprint()), vm.renewing.value)
+        assertTrue("still to be finished", keptIdentities().single().unfinished)
+    }
+
+    @Test
+    fun aPassphraseTooShortIsRefusedBeforeTheKeyIsAskedFor() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        var asked = false
+        vm.backUpPassphrase(fingerprint, "nine char", stores.keys.authorizer { true.also { asked = true } })
+        settle()
+        assertEquals(BackingUp.Failed(SetupProblem.BadPassphrase), vm.backingUp.value)
+        assertFalse("the key not asked for", asked)
+    }
+
+    @Test
+    fun aNewRecoveryCodeNotSavedIsSaidToMaybeBeInEffectAndTriedAgain() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        vm.newRecoveryCode()
+        val made = setups.newCodes.single()
+        vm.newRecoveryCodeWritten()
+        setups.backupFails = CoreException.Connect("unreachable")
+        vm.confirmNewRecoveryCode(fingerprint, bytes(made.code), stores.keys.authorizer())
+        settle()
+        assertEquals(BackingUp.RecoveryNotSaved(SetupProblem.Unreachable), vm.backingUp.value)
+        vm.retryNewRecoveryCode(fingerprint, stores.keys.authorizer())
+        settle()
+        assertEquals(BackingUp.Done(Backed.RecoveryCodeSaved), vm.backingUp.value)
+        assertEquals(listOf("recovery" to "reg.example"), setups.backups)
+    }
+
+    @Test
+    fun aHeldDeviceAServerRevokedIsReplacedByANewOneAndNotRenewed() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val old = keptIdentities().single()
+        val server = Server("wss://a.example/ng", "", SignIn.Identity(fingerprint))
+        outside { servers.markRefused(server, old.info.device, "revoked") }
+        vm.newDeviceHeld(fingerprint, stores.keys.authorizer())
+        settle()
+        assertEquals(Renewing.Done(fingerprint), vm.renewing.value)
+        assertEquals("no renewal of the device it was", emptyList<Any>(), setups.renewals)
+        val now = keptIdentities().single()
+        assertFalse("another device", now.info.device.contentEquals(old.info.device))
+        assertEquals("pixel", "Pixel", now.info.name)
+        assertEquals("its refusal let go of", emptyMap<String, String>(), outside { servers.refusals() })
+    }
+
+    @Test
+    fun aHeldIdentityDeletedWhileItsNewDeviceWasAskedForStaysDeleted() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val puts = stores.secrets.puts.size
+        vm.newDeviceHeld(
+            fingerprint,
+            stores.keys.authorizer {
+                vm.deleteIdentity(fingerprint)
+                true
+            },
+        )
+        settle()
+        assertEquals(Renewing.Idle, vm.renewing.value)
+        assertEquals(emptyList<Any>(), keptIdentities())
+        assertEquals("no device seed kept for it", puts, stores.secrets.puts.size)
+    }
+
+    @Test
+    fun aSetupCommittedWhileItsNewDeviceWasAskedForStaysCommitted() {
+        setups.nextIdentity = NewIdentity(CAROL_SEED, CAROL_CARD, CAROL)
+        val vm = model()
+        settle()
+        val setup = throughTheCodes(vm)
+        setup.answers += CoreException.Connect("unreachable")
+        vm.holdSetup(stores.keys.authorizer())
+        settle()
+        val fingerprint = setup.fingerprint()
+        vm.newDeviceHeld(
+            fingerprint,
+            stores.keys.authorizer {
+                // The commit a retry made, landing while the prompt is up, with the card the registrar gave back.
+                outside { identities.committed(fingerprint, CAROL_COMMITTED, "carol2") }
+                true
+            },
+        )
+        settle()
+        assertEquals(Renewing.Done(fingerprint), vm.renewing.value)
+        val now = keptIdentities().single()
+        assertFalse("committed, not unfinished again", now.unfinished)
+        assertEquals("carol2", now.handle)
+        assertArrayEquals("the committed card", CAROL_COMMITTED, now.card)
+    }
+
+    private companion object {
+        // An identity and two cards of it, a commit's the later, made with hl-identity.
+        val CAROL_SEED = hex("0303030303030303030303030303030303030303030303030303030303030303")
+        const val CAROL = "prq8czx2ycxfwrpnttrp8bgp47am6c3r8tsaayw9fsrgj6dqcw4g"
+        val CAROL_CARD =
+            hex(
+                "a56176016373696758403ffc78c9c8e4fdb6a5af71d3ff062f5f506f9ca4b07e4b3d070d394200b59bcba28cf38a6a3f239a3bf1337f11e2ef35eb748ba808a797fac17e0e63f0c5cb09646e616d65654361726f6c67757064617465641a6b49d200686964656e746974795820ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+            )
+        val CAROL_COMMITTED =
+            hex(
+                "a5617601637369675840382b67d240417ae6a60bbc51bbba90d1ff501f0738c33e137406c1afa6ad55648e7627d49e3ec6adf348b3c09e070231ddbc63de0490a8af7a8132ff1fb7ac03646e616d65654361726f6c67757064617465641a6b49d264686964656e746974795820ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+            )
+    }
+
+    @Test
+    fun anUnfinishedSetupWhoseDeviceIsReplacedIsStillToBeFinished() {
+        val vm = model()
+        settle()
+        val setup = throughTheCodes(vm)
+        setup.answers += CoreException.Connect("unreachable")
+        vm.holdSetup(stores.keys.authorizer())
+        settle()
+        vm.newDeviceHeld(setup.fingerprint(), stores.keys.authorizer())
+        settle()
+        assertEquals(Renewing.Done(setup.fingerprint()), vm.renewing.value)
+        assertTrue("still to be finished", keptIdentities().single().unfinished)
+    }
+
+    @Test
+    fun anIdentityRestoredToHoldIsShownAsHeld() {
+        val identity = newIdentity("Dana")
+        setups.restores = identity
+        val vm = model()
+        settle()
+        vm.restore("reg.example", "dana", SecretKind.RECOVERY_CODE, "code", "Pixel", stores.keys.authorizer())
+        settle()
+        assertTrue(
+            "held",
+            vm.identityList.value
+                .single()
+                .held,
+        )
     }
 }

@@ -2,6 +2,7 @@
 //! signature: everything of the wire and of identity is here, and the app
 //! renders what this crate hands it.
 
+mod backup;
 mod connection;
 mod enroll;
 mod holder;
@@ -12,13 +13,16 @@ mod restore;
 #[cfg(target_os = "android")]
 mod tls;
 
+#[cfg(feature = "live-tests")]
+pub use backup::before_reserving;
+pub use backup::{backup_delete, backup_passphrase, min_passphrase, RecoveryCodeSetup};
 pub use connection::{
     ClassicLogin, CoreError, CoreUpdate, DeviceIdentity, LoginInfo, ServerConnection, UpdateSink,
 };
 pub use enroll::{card_name, enrollment_code, newer_card, renewal_due, Enrolled, Enrollee};
 pub use holder::{
-    check_device_name, check_holder_registrar, holder_mint, new_identity, HolderCommitted,
-    HolderMinted, HolderSetup, NewIdentity,
+    check_device_name, check_holder_registrar, held_renewal, holder_mint, holder_renew,
+    new_identity, HeldRenewal, HolderCommitted, HolderMinted, HolderSetup, NewIdentity,
 };
 pub use identity::{
     cert_for_device, cert_info, cert_time, new_device, CertInfo, CertTime, NewDevice,

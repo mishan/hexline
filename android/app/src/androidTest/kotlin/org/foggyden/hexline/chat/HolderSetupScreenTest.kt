@@ -30,10 +30,14 @@ import org.foggyden.hexline.core.HolderCommitted
 import org.foggyden.hexline.core.HolderSetup
 import org.foggyden.hexline.core.HolderSetupInterface
 import org.foggyden.hexline.core.SecretKind
+import org.foggyden.hexline.core.holderRenew
+import org.foggyden.hexline.identity.BackingUp
 import org.foggyden.hexline.identity.BiometricAuthorizer
 import org.foggyden.hexline.identity.HeldSeeds
 import org.foggyden.hexline.identity.HolderSetups
 import org.foggyden.hexline.identity.Identities
+import org.foggyden.hexline.identity.NewRecoveryCode
+import org.foggyden.hexline.identity.Renewing
 import org.foggyden.hexline.identity.SettingUp
 import org.foggyden.hexline.identity.Setup
 import org.foggyden.hexline.secrets.KeystoreHolderKeys
@@ -167,6 +171,27 @@ class HolderSetupScreenTest {
         rule.onNode(hasSetTextAction() and hasText(text(label))).performScrollTo().performTextInput(typed)
     }
 
+    /**
+     * The system's prompt answered with the PIN until [done]: typed only once
+     * the prompt has the focus, as keys sent before it is up go to nothing,
+     * or count as a wrong PIN.
+     */
+    private fun answer(done: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + 60_000
+        var typed = false
+        while (!done() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(1_000)
+            val focus = shell("dumpsys window").lineSequence().firstOrNull { "mCurrentFocus=" in it }.orEmpty()
+            if (!typed && "Window{" in focus && context.packageName !in focus) {
+                shell("input text $PIN")
+                shell("input keyevent KEYCODE_ENTER")
+                typed = true
+            } else if (context.packageName in focus) {
+                typed = false
+            }
+        }
+    }
+
     private fun secure(): Boolean {
         var flags = 0
         rule.runOnUiThread { flags = rule.activity.window.attributes.flags }
@@ -206,31 +231,52 @@ class HolderSetupScreenTest {
         rule.waitForIdle()
         assertFalse("no code on screen", secure())
         tap(R.string.holder_hold)
-        // Typed only into the system's own prompt, once it has the focus: keys sent
-        // before it is up go to nothing, or count as a wrong PIN.
-        val deadline = System.currentTimeMillis() + 60_000
-        var typed = false
-        while (vm.holderSetup.value !is SettingUp.Done && System.currentTimeMillis() < deadline) {
-            Thread.sleep(1_000)
-            val focus = shell("dumpsys window").lineSequence().firstOrNull { "mCurrentFocus=" in it }.orEmpty()
-            if (!typed && "Window{" in focus && context.packageName !in focus) {
-                shell("input text $PIN")
-                shell("input keyevent KEYCODE_ENTER")
-                typed = true
-            } else if (context.packageName in focus) {
-                typed = false
-            }
-        }
+        answer { vm.holderSetup.value is SettingUp.Done }
         val fingerprint = reached(vm, SettingUp.Done::class.java).fingerprint.also { made = it }
         val kept = identities.list().single { it.fingerprint == fingerprint }
         assertFalse("committed", kept.unfinished)
         assertEquals("carol", kept.handle)
         val seeds = checkNotNull(held)
         assertTrue(seeds.isHeld(fingerprint))
+        // This phone's certificate renewed by the key it holds, behind the prompt again.
+        var authorizer: BiometricAuthorizer? = null
+        rule.runOnUiThread { authorizer = BiometricAuthorizer(rule.activity, "Hexline", "Renew this phone") }
+        rule.runOnUiThread { vm.renewHeld(fingerprint, checkNotNull(authorizer)) }
+        answer { vm.renewing.value !is Renewing.Working }
+        assertEquals(Renewing.Done(fingerprint), vm.renewing.value)
         shell("locksettings clear --old $PIN")
         assertEquals(listOf(fingerprint), seeds.demoteLost(listOf(fingerprint)))
         assertFalse(seeds.isHeld(fingerprint))
         assertEquals(listOf(fingerprint), seeds.notices())
+    }
+
+    @Test
+    fun theBackupScreenIsKeptFromScreenshotsWhileItIsUp() {
+        val vm = model(softwareKeys = true)
+        rule.waitForIdle()
+        assertFalse(secure())
+        rule.runOnUiThread {
+            val activity = rule.activity
+            activity.setContentView(
+                ComposeView(activity).apply {
+                    setContent {
+                        MaterialTheme {
+                            BackupScreen(
+                                "fp",
+                                "carol",
+                                BackingUp.Idle,
+                                setupActions(vm, BiometricAuthorizer(activity, "Hexline", "Back up this identity")),
+                            ) {}
+                        }
+                    }
+                },
+            )
+        }
+        rule.waitForIdle()
+        assertTrue("a passphrase typed is kept off screenshots", secure())
+        rule.runOnUiThread { rule.activity.setContentView(android.view.View(rule.activity)) }
+        rule.waitForIdle()
+        assertFalse("and the window let go once the screen is", secure())
     }
 
     @Test
@@ -268,6 +314,27 @@ class HolderSetupScreenTest {
             secret: String,
             deviceName: String,
         ): HeldRestore = error("not restored here")
+
+        override fun renew(
+            identitySeed: ByteArray,
+            card: ByteArray,
+            deviceSeed: ByteArray,
+            cert: ByteArray,
+        ) = holderRenew(identitySeed, card, deviceSeed, cert)
+
+        override suspend fun putPassphrase(
+            identitySeed: ByteArray,
+            registrar: String,
+            passphrase: String,
+        ): Unit = error("no backups here")
+
+        override suspend fun deleteBackup(
+            identitySeed: ByteArray,
+            registrar: String,
+            kind: SecretKind,
+        ): Unit = error("no backups here")
+
+        override fun newRecoveryCode(): NewRecoveryCode = error("no backups here")
     }
 
     private class Offline(

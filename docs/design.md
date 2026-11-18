@@ -128,8 +128,9 @@ single tokio runtime lives in the core for the process.
 | **Enrolled device** | device keys only | Scan the QR an `hlid` (or another Hexline holder) draws, or type the code; the mailbox flow of `identity-enrollment.md` §5 | `prev`-renewal through the mailbox to a standing holder (`hlid agent`); `no_holder` falls back to a code, so without an agent expect a code a quarter |
 | **Envelope** | device keys only; seed for seconds | Handle + passphrase (or recovery code) → fetch envelope → unwrap → mint own cert → drop seed (`identity-registrar.md` §9.4) | Same: passphrase, unwrap, mint, drop. Needs a registrar that serves envelopes (§2.4) |
 
-When renewal is asked for: a holder self-mints silently once a third of
-the certificate's life is left. Envelope and enrolled devices need the
+When renewal is asked for: a holder is asked from a third of the
+certificate's life left, by a banner, and renews in one tap behind the
+prompt, since its key asks for the person at every use. Envelope and enrolled devices need the
 person (a passphrase, a code), so the app asks from 14 days before expiry
 (decided 2026-11-13), with a banner, and refuses identity sign-in itself
 once the certificate has expired.

@@ -1,6 +1,9 @@
 package org.foggyden.hexline.chat
 
 import org.foggyden.hexline.core.ClassicLogin
+import org.foggyden.hexline.core.HeldRenewal
+import org.foggyden.hexline.core.heldRenewal
+import org.foggyden.hexline.core.shortHash
 import org.foggyden.hexline.identity.StoredIdentity
 import org.foggyden.hexline.identity.standing
 import org.foggyden.hexline.identity.usable
@@ -96,4 +99,13 @@ data class ConnectForm(
             }
         return ConnectRequest(server, null, false, link)
     }
+}
+
+/** What Renew does for [kept], held here, by the core's reading of what servers said of its own device. */
+fun heldRenewal(
+    kept: StoredIdentity,
+    refusals: Map<String, String>,
+): HeldRenewal {
+    val device = "/" + shortHash(kept.info.device)
+    return heldRenewal(refusals.filterKeys { it.endsWith(device) }.values.toList())
 }

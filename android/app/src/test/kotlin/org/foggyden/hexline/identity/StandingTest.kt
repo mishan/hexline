@@ -9,12 +9,28 @@ class StandingTest {
     private fun kept(
         issued: Long,
         expires: Long,
+        held: Boolean = false,
     ) = StoredIdentity(
         null,
         byteArrayOf(),
         byteArrayOf(),
         CertInfo("fp", byteArrayOf(), byteArrayOf(), issued.toULong(), expires.toULong(), true, true, false, true, null),
-    )
+    ).let { if (held) it.held() else it }
+
+    @Test
+    fun anIdentityThisPhoneHoldsIsAskedToBeRenewedFromAThirdOfItsLifeLeft() {
+        val issued = 10 * DAY
+        val expires = 100 * DAY
+        val cases =
+            listOf(
+                expires - 30 * DAY - 1 to Standing.Good,
+                expires - 30 * DAY to Standing.Renew(30),
+                expires - 14 * DAY to Standing.Renew(14),
+                expires + 301 to Standing.Expired,
+            )
+        for ((now, want) in cases) assertEquals("at $now", want, standing(kept(issued, expires, held = true), now))
+        assertEquals("then it changes", expires - 30 * DAY, nextChange(kept(issued, expires, held = true), issued))
+    }
 
     @Test
     fun anIdentityIsAskedToBeRenewedFromTwoWeeksBeforeItExpiresAndRefusedOutsideItsTime() {

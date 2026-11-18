@@ -23,6 +23,12 @@ enum class SetupProblem {
 
     /** The device's name would make a certificate no server reads. */
     BadDeviceName,
+
+    /** A passphrase that is blank. */
+    BadPassphrase,
+
+    /** The registrar has not registered the identity, so keeps nothing of it. */
+    NotRegistered,
     InviteNeeded,
     InviteWrong,
 
@@ -50,6 +56,8 @@ fun setupProblem(e: CoreException): SetupProblem =
                 "handle_taken", "handle_held", "handle_reserved" -> SetupProblem.HandleTaken
                 "handle_invalid" -> SetupProblem.HandleInvalid
                 "bad_device_name" -> SetupProblem.BadDeviceName
+                "bad_passphrase" -> SetupProblem.BadPassphrase
+                "not_registered" -> SetupProblem.NotRegistered
                 "proof_required" -> SetupProblem.InviteNeeded
                 "proof_invalid" -> SetupProblem.InviteWrong
                 "registered_not_backed_up", "registered_as" -> SetupProblem.NotBackedUp
