@@ -153,6 +153,7 @@ async fn an_identity_is_refused_by_its_code() {
         key: mallory.key,
         cert: mallory.cert,
         card: alice.card.clone(),
+        rotation: None,
     };
     for (url, who, want) in [
         (&plain.url, &alice, "no_identity_sign_in"),
@@ -162,6 +163,51 @@ async fn an_identity_is_refused_by_its_code() {
             Err(Error::Refused(r)) => assert_eq!(r.error.code, want, "{}", r.error.text),
             other => panic!("{want}: {:?}", other.map(|_| ())),
         }
+    }
+}
+
+#[tokio::test]
+async fn a_successor_takes_its_predecessors_account_only_by_showing_the_rotation() {
+    use hl_identity::{Card, Rotation};
+    // Trusts no registrar: the anchor and the record are all it goes by.
+    let server = Server::with_guest_identity(&["alice"]).await;
+    let (k0, mut old) = device("Alice");
+    let (k1, mut new) = device("Alice");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let rotation = Rotation {
+        identity: k0.public(),
+        successor: k1.public(),
+        time: now,
+    };
+    let mut card = Card::new(&k0, "Alice", now);
+    card.successor = Some(rotation.commitment());
+    old.card = card.sign(&k0, Vec::new()).unwrap();
+    let outcome = |a: hxng_client::auth::Admitted| a.outcome.unwrap_or_default();
+
+    // Linked, the server anchors the commitment.
+    let linked = identity_token(&server.url, &old, false, Some(("alice", "pw-alice")), None)
+        .await
+        .unwrap();
+    assert_eq!(outcome(linked), "linked");
+    let without = identity_token(&server.url, &new, false, None, None)
+        .await
+        .unwrap();
+    assert_eq!(outcome(without), "unattested_guest");
+    new.rotation = Some(rotation.sign(&k0, &k1).unwrap());
+    let with = identity_token(&server.url, &new, false, None, None)
+        .await
+        .unwrap();
+    assert_eq!(outcome(with), "linked");
+    match identity_token(&server.url, &old, false, None, None).await {
+        Err(Error::Refused(r)) => {
+            assert_eq!(r.error.code, "rotated", "{}", r.error.text);
+            let k1 = hl_identity::Fingerprint::of(&k1.public()).to_string();
+            assert_eq!(r.error.rest.get("successor"), Some(&Value::from(k1)));
+        }
+        other => panic!("{:?}", other.map(|a| a.outcome)),
     }
 }
 
