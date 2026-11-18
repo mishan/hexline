@@ -252,7 +252,6 @@
         <item quantity="one">%d minute</item>
         <item quantity="other">%d minutes</item>
     </plurals>
-    <string name="devices_not_kept">This phone could not save its list of devices just now. It is shown from memory, and saved again when it next can.</string>
     <string name="certify_no_login">A device asked for a certificate that signs in nowhere, and was told no. Show a new code to try again.</string>
     <string name="certify_approve">Approve</string>
     <string name="certify_deny">Deny</string>
@@ -269,5 +268,7 @@
     <string name="revoke_lost">It was lost</string>
     <string name="revoke_stolen">It was stolen</string>
     <string name="revoke_retired">It is no longer used</string>
+    <string name="revoke_unconfirmed">The revocation was not confirmed by the registrar. Revoke it again.</string>
+    <string name="revoke_own_device">This phone\'s own device is not revoked here: it goes when the identity is deleted from the phone.</string>
     <string name="revoke_done">%1$s is revoked.</string>
 </resources>

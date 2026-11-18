@@ -160,7 +160,7 @@ class FakeSetups : HolderSetups {
     val revocations = mutableListOf<Revocation>()
 
     /** What the next revocation throws, if anything, the registrar's answer not had. */
-    var revokeFails: CoreException? = null
+    var revokeFails: Exception? = null
 
     /** Called as each revocation reaches the registrar. */
     var onRevoke: () -> Unit = {}
@@ -213,9 +213,6 @@ class FakeSetups : HolderSetups {
 
         /** Each send tried. */
         var sends = 0
-        private var maybeDelivered = false
-
-        override fun mayHaveDelivered() = delivered || maybeDelivered
 
         /** Completed when the request asked about can no longer be answered. */
         val ends = CompletableDeferred<Unit>()
@@ -270,15 +267,7 @@ class FakeSetups : HolderSetups {
             if (!certified) throw CoreException.Refused("nothing_certified", "")
             if (delivered) throw CoreException.Refused("used", "")
             sends++
-            deliverFails.removeFirstOrNull()?.let {
-                // As the core reckons it: all but the mailbox's refusals before it stores an answer,
-                // and a rate limit, may have arrived.
-                val beforeStored =
-                    (it is CoreException.Refused && it.code in setOf("expired", "bad_request", "request_too_large")) ||
-                        it is CoreException.RateLimited
-                if (!beforeStored) maybeDelivered = true
-                throw it
-            }
+            deliverFails.removeFirstOrNull()?.let { throw it }
             onDeliver()
             delivered = true
         }

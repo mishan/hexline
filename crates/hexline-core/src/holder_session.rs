@@ -65,8 +65,6 @@ pub struct HolderSession {
     spent: std::sync::atomic::AtomicBool,
     /// Held while an answer is made, so two answers make one.
     answering: tokio::sync::Mutex<()>,
-    /// A send of the certificate failed in a way that may have reached the mailbox.
-    maybe_delivered: std::sync::atomic::AtomicBool,
     canceled: tokio::sync::watch::Sender<bool>,
 }
 
@@ -319,28 +317,11 @@ impl HolderSession {
                 let _answering = self.answering.lock().await;
                 let asked = self.unanswered()?;
                 let bundle = asked.bundle.ok_or_else(|| refused("nothing_certified"))?;
-                let sent = self
-                    .answer(json!({ "id": asked.id, "bundle": b64(&bundle) }))
-                    .await;
-                if sent.as_ref().is_err_and(may_have_arrived) {
-                    self.maybe_delivered
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-                sent
+                self.answer(json!({ "id": asked.id, "bundle": b64(&bundle) }))
+                    .await
             })
             .await
             .unwrap_or_else(|_| Err(protocol("the session stopped")))
-    }
-
-    /// Whether a send of the certificate may have reached the mailbox,
-    /// whatever its answer said: one the mailbox took, or any whose answer
-    /// was not a refusal of its own. False while every send was refused
-    /// before it left here, or refused by the mailbox outright.
-    pub fn may_have_delivered(&self) -> bool {
-        self.spent.load(std::sync::atomic::Ordering::SeqCst)
-            || self
-                .maybe_delivered
-                .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Says no to the device asked about, giving `reason`. Refused `used`
@@ -465,7 +446,6 @@ impl HolderSession {
             asked: Mutex::new(None),
             spent: Default::default(),
             answering: Default::default(),
-            maybe_delivered: Default::default(),
             canceled: tokio::sync::watch::channel(false).0,
         }))
     }
@@ -734,22 +714,6 @@ impl HolderSession {
 fn request_left(received: Option<u64>, now: u64) -> u64 {
     let age = received.map_or(0, |at| now.saturating_sub(at).saturating_sub(SKEW));
     REQUEST_SECS.saturating_sub(age)
-}
-
-/// Whether a send that failed with `e` may have reached the mailbox: all
-/// but the refusals the mailbox makes before it stores an answer (its
-/// session or request gone, as [`HolderSession::answer`] reads `not_found`,
-/// or a request it cannot read) and a rate limit. Anything else, a proxy's
-/// error among it, may have followed an answer stored.
-fn may_have_arrived(e: &CoreError) -> bool {
-    match e {
-        CoreError::Refused { code, .. } => !matches!(
-            code.as_str(),
-            "expired" | "bad_request" | "request_too_large"
-        ),
-        CoreError::RateLimited { .. } => false,
-        _ => true,
-    }
 }
 
 /// A refusal of an answer as the app is to read it: the mailbox's
@@ -1097,38 +1061,13 @@ mod tests {
     }
 
     #[test]
-    fn a_send_may_have_arrived_unless_the_mailbox_refused_it() {
-        let refused = |code: &str| CoreError::Refused {
-            code: code.into(),
+    fn a_request_gone_at_the_mailbox_is_answered_as_expired() {
+        let gone = CoreError::Refused {
+            code: "not_found".into(),
             detail: String::new(),
         };
-        for (e, arrived) in [
-            (answer_refusal(refused("not_found")), false),
-            (refused("expired"), false),
-            (refused("bad_request"), false),
-            (refused("request_too_large"), false),
-            (refused("server_error"), true),
-            (refused("bad_gateway"), true),
-            (refused("not_available"), true),
-            (CoreError::RateLimited { retry_after: None }, false),
-            (
-                CoreError::Connect {
-                    detail: "lost".into(),
-                },
-                true,
-            ),
-            (
-                CoreError::Protocol {
-                    detail: "not JSON".into(),
-                },
-                true,
-            ),
-        ] {
-            assert_eq!(may_have_arrived(&e), arrived, "{e:?}");
-        }
         assert!(
-            matches!(answer_refusal(refused("not_found")), CoreError::Refused { code, .. } if code == "expired"),
-            "a request gone is shown as expired"
+            matches!(answer_refusal(gone), CoreError::Refused { code, .. } if code == "expired")
         );
     }
 

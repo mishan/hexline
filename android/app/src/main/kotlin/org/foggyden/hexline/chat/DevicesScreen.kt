@@ -187,10 +187,7 @@ fun DevicesScreen(
             }
         }
         when (revoking) {
-            is Revoking.Done -> {
-                Text(stringResource(R.string.revoke_done, revoking.device.name ?: revoking.device.fingerprint))
-                if (!revoking.kept) Problem(stringResource(R.string.devices_not_kept))
-            }
+            is Revoking.Done -> Text(stringResource(R.string.revoke_done, revoking.device.name ?: revoking.device.fingerprint))
             is Revoking.Failed -> Problem(describe(revoking.problem))
             is Revoking.Working -> Text(stringResource(R.string.holder_working))
             Revoking.Idle -> Unit

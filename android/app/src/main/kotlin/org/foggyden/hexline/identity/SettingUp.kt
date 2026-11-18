@@ -42,6 +42,12 @@ enum class SetupProblem {
 
     /** The phone could not keep the identity just now: try again. */
     NotKept,
+
+    /** A revocation the registrar may or may not hold: to be asked again. */
+    RevocationUnconfirmed,
+
+    /** This phone's own device, which goes with the identity rather than by revocation. */
+    OwnDevice,
     Other,
 }
 

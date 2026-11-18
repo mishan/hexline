@@ -351,6 +351,7 @@ class ChatViewModel internal constructor(
             val found =
                 withContext(store) {
                     publishIdentities()
+                    stored { identities.sweepOrphans() }
                     held.sweep()
                     demoteHeld()
                     publishRefusals()
@@ -915,7 +916,11 @@ class ChatViewModel internal constructor(
             } catch (_: IOException) {
                 emptyList<MintedDevice>() to true
             }
-        val merged = listed.filter { l -> pending.none { it.device.contentEquals(l.device) } } + pending
+        // A certificate past its time is dead whether or not it ever arrived; a revoked one stays,
+        // as it is what refuses its key a renewal.
+        val merged =
+            (listed.filter { l -> pending.none { it.device.contentEquals(l.device) } } + pending)
+                .filter { it.listed(now()) }
         return DeviceList(fingerprint, listOf(own) + merged, unreadable, identities.mintedUnreadable(fingerprint))
     }
 
@@ -929,9 +934,7 @@ class ChatViewModel internal constructor(
         held: Boolean = true,
     ): Boolean =
         try {
-            // An identity deleted meanwhile is not written back by an answer that outlived it.
-            if (identities.list().none { it.fingerprint == fingerprint }) return false
-            identities.minted(fingerprint, device)
+            identities.minted(fingerprint, device, now())
             // Written, it is the disk's to say from now on: an older state held here is not written over it.
             unkeep(fingerprint, device.device)
             true
@@ -1061,7 +1064,6 @@ class ChatViewModel internal constructor(
                             certified.canManage,
                         )
                     // A certificate this phone cannot list is not sent: nothing has left it.
-                    val before = withContext(store) { identities.minted(fingerprint).find { it.device.contentEquals(minted.device) } }
                     if (!withContext(store) { keep(fingerprint, minted, held = false) }) {
                         return@keeping Certifying.Failed(fingerprint, SetupProblem.NotKept)
                     }
@@ -1074,19 +1076,8 @@ class ChatViewModel internal constructor(
                             opened.deliver()
                         }
                     } catch (e: CoreException) {
-                        // No send that could have reached the mailbox, the answer never reached the
-                        // device: it is listed as it was before. One that may have, the core says,
-                        // leaves it listed, revocable.
-                        if (!opened.mayHaveDelivered()) {
-                            withContext(store) {
-                                if (before != null) {
-                                    keep(fingerprint, before)
-                                } else if (identities.list().any { it.fingerprint == fingerprint }) {
-                                    identities.unminted(fingerprint, minted.device)
-                                }
-                            }
-                            refreshDevices(fingerprint)
-                        }
+                        // Left listed and revocable whether or not it arrived: one that never did is
+                        // a stray entry, and losing one that did is worse.
                         return@keeping certifyEnded(fingerprint, e)
                     }
                     Certifying.Approved(fingerprint, minted)
@@ -1154,7 +1145,7 @@ class ChatViewModel internal constructor(
         if (revocation.value is Revoking.Working || certifying.value is Certifying.Answering) return
         // This phone's own goes with the identity: it is never in the list to mark.
         if (device.own) {
-            revocation.value = Revoking.Failed(fingerprint, SetupProblem.Other)
+            revocation.value = Revoking.Failed(fingerprint, SetupProblem.OwnDevice)
             return
         }
         revocation.value = Revoking.Working(fingerprint)
@@ -1180,9 +1171,12 @@ class ChatViewModel internal constructor(
                         return@keeping Revoking.Failed(fingerprint, SetupProblem.NotKept)
                     }
                     refreshDevices(fingerprint)
+                    // From when the registrar may have it: what fails before is the key's alone.
+                    var sent = false
                     val asked =
                         try {
                             held.use(fingerprint, authorizer) { seed ->
+                                sent = true
                                 setups.revoke(seed, registrar, device.device, reason, device.expires, kept.info.device)
                             }
                         } catch (e: CoreException) {
@@ -1195,10 +1189,22 @@ class ChatViewModel internal constructor(
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Exception) {
+                            // Failing once the registrar may have been asked, however it failed, it may hold
+                            // the revocation: the mark stays, for the revocation tried again.
+                            if (sent) return@keeping Revoking.Failed(fingerprint, SetupProblem.RevocationUnconfirmed)
                             // The key's own trouble, the registrar not asked: the device is as it was.
                             withContext(store) { keep(fingerprint, before) }
                             refreshDevices(fingerprint)
-                            throw e
+                            // What the key's handling knows of is told by it; anything else is said, not thrown.
+                            if (e is HeldKeyLost ||
+                                e is SecretUnavailable ||
+                                e is IOException ||
+                                e is GeneralSecurityException ||
+                                e is ProviderException
+                            ) {
+                                throw e
+                            }
+                            return@keeping Revoking.Failed(fingerprint, SetupProblem.Other)
                         }
                     if (asked == null) {
                         withContext(store) { keep(fingerprint, before) }
@@ -1206,13 +1212,13 @@ class ChatViewModel internal constructor(
                         return@keeping Revoking.Idle
                     }
                     val revoked = device.with(revoking = false, revoked = true)
-                    val marked = withContext(store) { keep(fingerprint, revoked) }
+                    withContext(store) { keep(fingerprint, revoked) }
                     refreshDevices(fingerprint)
                     // A request from it up meanwhile is shown revoked at once.
                     (certifying.value as? Certifying.Asked)
                         ?.takeIf { it.identity == fingerprint && it.request.device.contentEquals(device.device) }
                         ?.let { certifying.value = it.copy(revoked = Revoked.Yes) }
-                    Revoking.Done(fingerprint, device, marked)
+                    Revoking.Done(fingerprint, device)
                 }
         }
     }
