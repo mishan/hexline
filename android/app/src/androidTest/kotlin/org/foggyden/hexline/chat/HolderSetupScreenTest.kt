@@ -471,6 +471,8 @@ class HolderSetupScreenTest {
             delivered = true
         }
 
+        override fun mayHaveDelivered() = delivered
+
         override suspend fun deny(reason: String) = Unit
 
         var canceled = false

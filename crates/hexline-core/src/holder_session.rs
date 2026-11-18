@@ -65,6 +65,8 @@ pub struct HolderSession {
     spent: std::sync::atomic::AtomicBool,
     /// Held while an answer is made, so two answers make one.
     answering: tokio::sync::Mutex<()>,
+    /// A send of the certificate failed in a way that may have reached the mailbox.
+    maybe_delivered: std::sync::atomic::AtomicBool,
     canceled: tokio::sync::watch::Sender<bool>,
 }
 
@@ -317,11 +319,28 @@ impl HolderSession {
                 let _answering = self.answering.lock().await;
                 let asked = self.unanswered()?;
                 let bundle = asked.bundle.ok_or_else(|| refused("nothing_certified"))?;
-                self.answer(json!({ "id": asked.id, "bundle": b64(&bundle) }))
-                    .await
+                let sent = self
+                    .answer(json!({ "id": asked.id, "bundle": b64(&bundle) }))
+                    .await;
+                if sent.as_ref().is_err_and(may_have_arrived) {
+                    self.maybe_delivered
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                sent
             })
             .await
             .unwrap_or_else(|_| Err(protocol("the session stopped")))
+    }
+
+    /// Whether a send of the certificate may have reached the mailbox,
+    /// whatever its answer said: one the mailbox took, or any whose answer
+    /// was not a refusal of its own. False while every send was refused
+    /// before it left here, or refused by the mailbox outright.
+    pub fn may_have_delivered(&self) -> bool {
+        self.spent.load(std::sync::atomic::Ordering::SeqCst)
+            || self
+                .maybe_delivered
+                .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Says no to the device asked about, giving `reason`. Refused `used`
@@ -446,6 +465,7 @@ impl HolderSession {
             asked: Mutex::new(None),
             spent: Default::default(),
             answering: Default::default(),
+            maybe_delivered: Default::default(),
             canceled: tokio::sync::watch::channel(false).0,
         }))
     }
@@ -514,13 +534,13 @@ impl HolderSession {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
-            // Its age by the mailbox's own reckoning, which its lifetime is counted by.
-            let age = first
-                .get("received")
-                .and_then(Value::as_u64)
-                .map_or(0, |at| crate::restore::now().saturating_sub(at));
-            let request_deadline =
-                tokio::time::Instant::now() + Duration::from_secs(REQUEST_SECS.saturating_sub(age));
+            // Its time left from when the mailbox received it, by the mailbox's clock
+            // read against this phone's.
+            let left = request_left(
+                first.get("received").and_then(Value::as_u64),
+                crate::restore::now(),
+            );
+            let request_deadline = tokio::time::Instant::now() + Duration::from_secs(left);
             let request = first
                 .get("request")
                 .and_then(Value::as_str)
@@ -566,6 +586,9 @@ impl HolderSession {
             // Under the answer lock, so a wait alongside this one does not say no
             // to unasked what this one has shown, nor show what it said no to.
             let _answering = self.answering.lock().await;
+            if *self.canceled.borrow() {
+                return Err(refused("canceled"));
+            }
             if self.spent.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(refused("used"));
             }
@@ -669,7 +692,9 @@ impl HolderSession {
     /// given back, its slot at the mailbox freed for whoever drops it.
     async fn answer(&self, body: Value) -> Result<(), CoreError> {
         let url = format!("{}/{}/answers", self.sessions, *self.secret);
-        auth::post(&self.http, &url, Some(body)).await?;
+        auth::post(&self.http, &url, Some(body))
+            .await
+            .map_err(|e| answer_refusal(CoreError::from(e)))?;
         self.spent.store(true, std::sync::atomic::Ordering::SeqCst);
         // Given a moment, so a session opened next is not refused for this one's
         // place; no more, so a stalled DELETE does not hold up an answer made.
@@ -699,6 +724,41 @@ impl HolderSession {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Asked>> {
         self.asked.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Seconds left of a request the mailbox `received` (by its clock), at
+/// `now` (by this phone's): its age taken as up to `SKEW` less than the
+/// two clocks say, as a phone fast by that much would otherwise find every
+/// request expired as it is shown; a late answer is the mailbox's to refuse.
+fn request_left(received: Option<u64>, now: u64) -> u64 {
+    let age = received.map_or(0, |at| now.saturating_sub(at).saturating_sub(SKEW));
+    REQUEST_SECS.saturating_sub(age)
+}
+
+/// Whether a send that failed with `e` may have reached the mailbox: all
+/// but the refusals the mailbox makes before it stores an answer (its
+/// session or request gone, as [`HolderSession::answer`] reads `not_found`,
+/// or a request it cannot read) and a rate limit. Anything else, a proxy's
+/// error among it, may have followed an answer stored.
+fn may_have_arrived(e: &CoreError) -> bool {
+    match e {
+        CoreError::Refused { code, .. } => !matches!(
+            code.as_str(),
+            "expired" | "bad_request" | "request_too_large"
+        ),
+        CoreError::RateLimited { .. } => false,
+        _ => true,
+    }
+}
+
+/// A refusal of an answer as the app is to read it: the mailbox's
+/// `not_found` is the session or its request gone, which is the request
+/// expired.
+fn answer_refusal(e: CoreError) -> CoreError {
+    match e {
+        CoreError::Refused { code, .. } if code == "not_found" => refused("expired"),
+        e => e,
     }
 }
 
@@ -1018,6 +1078,58 @@ mod tests {
         );
         let kept = slot.lock().unwrap().clone().unwrap();
         assert_eq!((kept.id.as_str(), kept.bundle), ("7", Some(vec![1])));
+    }
+
+    #[test]
+    fn a_request_is_given_its_time_from_a_mailbox_whose_clock_differs() {
+        for (received, left) in [
+            (None, REQUEST_SECS),
+            (Some(NOW), REQUEST_SECS),
+            // This phone 300 s fast: the request is not taken for spent.
+            (Some(NOW - 300), REQUEST_SECS),
+            (Some(NOW - 500), 100),
+            (Some(NOW - 900), 0),
+            // This phone slow: no more than the request's whole time.
+            (Some(NOW + 600), REQUEST_SECS),
+        ] {
+            assert_eq!(request_left(received, NOW), left, "{received:?}");
+        }
+    }
+
+    #[test]
+    fn a_send_may_have_arrived_unless_the_mailbox_refused_it() {
+        let refused = |code: &str| CoreError::Refused {
+            code: code.into(),
+            detail: String::new(),
+        };
+        for (e, arrived) in [
+            (answer_refusal(refused("not_found")), false),
+            (refused("expired"), false),
+            (refused("bad_request"), false),
+            (refused("request_too_large"), false),
+            (refused("server_error"), true),
+            (refused("bad_gateway"), true),
+            (refused("not_available"), true),
+            (CoreError::RateLimited { retry_after: None }, false),
+            (
+                CoreError::Connect {
+                    detail: "lost".into(),
+                },
+                true,
+            ),
+            (
+                CoreError::Protocol {
+                    detail: "not JSON".into(),
+                },
+                true,
+            ),
+        ] {
+            assert_eq!(may_have_arrived(&e), arrived, "{e:?}");
+        }
+        assert!(
+            matches!(answer_refusal(refused("not_found")), CoreError::Refused { code, .. } if code == "expired"),
+            "a request gone is shown as expired"
+        );
     }
 
     #[test]

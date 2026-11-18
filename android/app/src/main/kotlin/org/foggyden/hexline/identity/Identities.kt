@@ -345,8 +345,9 @@ class Identities(
 
     /**
      * [device] certified by [fingerprint]'s key, in place of any it certified
-     * before for the same key. Read back once written: one the disk did not
-     * keep, whatever the write said, is an [java.io.IOException].
+     * before for the same key. Read back once written: one the list does not
+     * hold, whatever the write said (a rename that did not land), is an
+     * [java.io.IOException]. That says nothing of the data reaching the disk.
      */
     fun minted(
         fingerprint: String,

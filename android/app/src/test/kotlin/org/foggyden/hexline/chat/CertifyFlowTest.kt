@@ -379,6 +379,10 @@ class CertifyFlowTest : ViewModelHarness() {
         vm.openDevices(fingerprint)
         settle()
         assertEquals(DeviceList(fingerprint, listOf(own(vm))), vm.devices.value)
+        assertEquals(Certifying.Asked(fingerprint, tablet), vm.certify.value)
+        vm.approveDevice(fingerprint, manage = false, stores.keys.authorizer())
+        settle()
+        assertTrue(setups.sessions.last().delivered)
     }
 
     /** [work] with the identities' directory refusing writes, as a full disk would. */
@@ -483,6 +487,90 @@ class CertifyFlowTest : ViewModelHarness() {
     }
 
     @Test
+    fun aCertificateThatMayHaveArrivedStaysListedWhateverTheLaterSendSaid() {
+        for (fails in listOf(
+            listOf(CoreException.Connect("its answer lost"), CoreException.Refused("not_available", "")),
+            listOf(CoreException.Refused("server_error", "")),
+        )) {
+            fresh()
+            setups = FakeSetups()
+            val vm = model()
+            settle()
+            val fingerprint = heldHere(vm)
+            val session = shown(vm, fingerprint)
+            session.deliverFails += fails
+            asked(vm, fingerprint, session)
+            vm.approveDevice(fingerprint, manage = false, stores.keys.authorizer())
+            settle()
+            assertFalse(session.delivered)
+            assertEquals("$fails", listOf(tablet.fingerprint), onDisk(fingerprint).map { it.fingerprint })
+        }
+    }
+
+    @Test
+    fun aRequestThatEndsWhileItsPromptIsUpEndsOnceThePromptIsCanceled() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val session = shown(vm, fingerprint)
+        asked(vm, fingerprint, session)
+        vm.approveDevice(
+            fingerprint,
+            manage = false,
+            stores.keys.authorizer {
+                session.ends.complete(Unit)
+                false
+            },
+        )
+        settle()
+        assertEquals(Certifying.Ended(fingerprint, CertifyEnd.EXPIRED), vm.certify.value)
+    }
+
+    @Test
+    fun anIdentityDeletedWhileItsDeviceIsApprovedIsNotWrittenBackNorSentFor() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val session = shown(vm, fingerprint)
+        asked(vm, fingerprint, session)
+        // Deleted once the certificate is made, before it is listed.
+        session.onCertify = { vm.deleteIdentity(fingerprint) }
+        vm.approveDevice(fingerprint, manage = false, stores.keys.authorizer())
+        settle()
+        assertEquals(1, session.approvals.size)
+        assertFalse(session.delivered)
+        assertFalse("no list written back", minted(fingerprint).exists())
+    }
+
+    @Test
+    fun anIdentityDeletedOnceItsDeviceIsListedHasNothingSentFor() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val session = shown(vm, fingerprint)
+        asked(vm, fingerprint, session)
+        session.beforeDeliver = { vm.deleteIdentity(fingerprint) }
+        vm.approveDevice(fingerprint, manage = false, stores.keys.authorizer())
+        settle()
+        assertFalse(session.delivered)
+        assertFalse("no list written back", minted(fingerprint).exists())
+    }
+
+    @Test
+    fun aRevocationTheRegistrarMayHaveTakenKeepsItsMark() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        vm.openDevices(fingerprint)
+        certified(vm, fingerprint)
+        val device = devices(vm).single { !it.own }
+        setups.revokeFails = CoreException.Refused("server_error", "")
+        vm.revokeDevice(fingerprint, device, RevokeReason.LOST, stores.keys.authorizer())
+        settle()
+        assertEquals(listOf(device.with(revoking = true)), onDisk(fingerprint))
+    }
+
+    @Test
     fun aRequestUnansweredWhenTheMailboxLetsItGoEnds() {
         val vm = model()
         settle()
@@ -520,6 +608,22 @@ class CertifyFlowTest : ViewModelHarness() {
         settle()
         assertEquals(Revoking.Failed(fingerprint, SetupProblem.Unreachable), vm.revoking.value)
         assertEquals(listOf(device.with(revoking = true)), onDisk(fingerprint))
+        // Tried again and not done, by the person or by the registrar, the mark stands,
+        // whatever the copy of the device the screen held said.
+        val marked = device.with(revoking = true)
+        vm.revokingSeen()
+        vm.revokeDevice(fingerprint, device, RevokeReason.LOST, stores.keys.authorizer { false })
+        settle()
+        assertEquals(listOf(marked), onDisk(fingerprint))
+        vm.revokingSeen()
+        vm.revokeDevice(fingerprint, marked, RevokeReason.LOST, stores.keys.authorizer { false })
+        settle()
+        assertEquals(listOf(marked), onDisk(fingerprint))
+        setups.revokeFails = CoreException.Refused("bad_time", "")
+        vm.revokingSeen()
+        vm.revokeDevice(fingerprint, marked, RevokeReason.LOST, stores.keys.authorizer())
+        settle()
+        assertEquals(listOf(marked), onDisk(fingerprint))
         // As a process started again finds it.
         val again = model2()
         again.openDevices(fingerprint)

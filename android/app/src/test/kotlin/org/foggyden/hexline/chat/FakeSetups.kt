@@ -202,6 +202,9 @@ class FakeSetups : HolderSetups {
         private var asked: HolderRequest? = null
         private var certified = false
 
+        /** Called as the certificate is made. */
+        var onCertify: () -> Unit = {}
+
         /** Called as the certificate is sent. */
         var onDeliver: () -> Unit = {}
 
@@ -210,6 +213,9 @@ class FakeSetups : HolderSetups {
 
         /** Each send tried. */
         var sends = 0
+        private var maybeDelivered = false
+
+        override fun mayHaveDelivered() = delivered || maybeDelivered
 
         /** Completed when the request asked about can no longer be answered. */
         val ends = CompletableDeferred<Unit>()
@@ -249,17 +255,30 @@ class FakeSetups : HolderSetups {
             answerable()
             if (!device.contentEquals(checkNotNull(asked).device)) throw CoreException.Refused("not_asked", "")
             certified = true
+            onCertify()
             approvals += identitySeed to manage
             return Certified(device, checkNotNull(asked).name, manage, expires)
         }
 
+        /** Called as a send is begun, before anything is checked. */
+        var beforeDeliver: () -> Unit = {}
+
         override suspend fun deliver() {
+            beforeDeliver()
             yield()
             if (canceled) throw CoreException.Refused("canceled", "")
             if (!certified) throw CoreException.Refused("nothing_certified", "")
             if (delivered) throw CoreException.Refused("used", "")
             sends++
-            deliverFails.removeFirstOrNull()?.let { throw it }
+            deliverFails.removeFirstOrNull()?.let {
+                // As the core reckons it: all but the mailbox's refusals before it stores an answer,
+                // and a rate limit, may have arrived.
+                val beforeStored =
+                    (it is CoreException.Refused && it.code in setOf("expired", "bad_request", "request_too_large")) ||
+                        it is CoreException.RateLimited
+                if (!beforeStored) maybeDelivered = true
+                throw it
+            }
             onDeliver()
             delivered = true
         }

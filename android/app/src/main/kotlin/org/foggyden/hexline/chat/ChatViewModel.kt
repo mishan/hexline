@@ -20,6 +20,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -877,6 +878,16 @@ class ChatViewModel internal constructor(
         devicesFor = fingerprint
         if (mintedDevices.value?.identity != fingerprint) mintedDevices.value = null
         refreshDevices(fingerprint)
+        rejudge(fingerprint)
+    }
+
+    /** A request asked about for [fingerprint] judged again by the list as it reads now. */
+    private fun rejudge(fingerprint: String) {
+        viewModelScope.launch {
+            val asked = (certifying.value as? Certifying.Asked)?.takeIf { it.identity == fingerprint } ?: return@launch
+            val revoked = withContext(store) { revokedHere(fingerprint, asked.request.device) }
+            if (certifying.value == asked) certifying.value = asked.copy(revoked = revoked)
+        }
     }
 
     private fun refreshDevices(fingerprint: String) {
@@ -918,6 +929,8 @@ class ChatViewModel internal constructor(
         held: Boolean = true,
     ): Boolean =
         try {
+            // An identity deleted meanwhile is not written back by an answer that outlived it.
+            if (identities.list().none { it.fingerprint == fingerprint }) return false
             identities.minted(fingerprint, device)
             // Written, it is the disk's to say from now on: an older state held here is not written over it.
             unkeep(fingerprint, device.device)
@@ -993,6 +1006,8 @@ class ChatViewModel internal constructor(
             certifying.value = Certifying.Asked(fingerprint, asked, revoked)
             // Unanswered when the mailbox lets it go, it is over: a new code is the way on.
             opened.answerEnds()
+            // A prompt up as it ended is waited out: canceled, the request is over all the same.
+            certifying.first { it !is Certifying.Answering }
             if (number == sessions && certifying.value is Certifying.Asked) {
                 closeSession()
                 certifying.value = Certifying.Ended(fingerprint, CertifyEnd.EXPIRED)
@@ -1059,11 +1074,16 @@ class ChatViewModel internal constructor(
                             opened.deliver()
                         }
                     } catch (e: CoreException) {
-                        // Refused, the answer never reached the device: it is listed as it was before.
-                        // Any other trouble may have delivered it, and it stays listed, revocable.
-                        if (e is CoreException.Refused) {
+                        // No send that could have reached the mailbox, the answer never reached the
+                        // device: it is listed as it was before. One that may have, the core says,
+                        // leaves it listed, revocable.
+                        if (!opened.mayHaveDelivered()) {
                             withContext(store) {
-                                if (before != null) keep(fingerprint, before) else identities.unminted(fingerprint, minted.device)
+                                if (before != null) {
+                                    keep(fingerprint, before)
+                                } else if (identities.list().any { it.fingerprint == fingerprint }) {
+                                    identities.unminted(fingerprint, minted.device)
+                                }
                             }
                             refreshDevices(fingerprint)
                         }
@@ -1147,7 +1167,15 @@ class ChatViewModel internal constructor(
                     // Marked as being revoked before the registrar is asked, so a process ended
                     // before its answer lands still counts it revoked; not asked at all if the
                     // mark cannot be made.
-                    val unmarked = device.with(revoking = false)
+                    // As it stood before this try, as the list says: a mark an earlier one left stays.
+                    val before =
+                        withContext(store) {
+                            try {
+                                identities.minted(fingerprint).find { it.device.contentEquals(device.device) }
+                            } catch (_: IOException) {
+                                null
+                            }
+                        } ?: device
                     if (!withContext(store) { keep(fingerprint, device.with(revoking = true), held = false) }) {
                         return@keeping Revoking.Failed(fingerprint, SetupProblem.NotKept)
                     }
@@ -1158,14 +1186,15 @@ class ChatViewModel internal constructor(
                                 setups.revoke(seed, registrar, device.device, reason, device.expires, kept.info.device)
                             }
                         } catch (e: CoreException) {
-                            // Refused, the registrar has nothing of it and the mark goes. Any other
-                            // trouble may have reached it: the mark stays, for the revocation tried again.
-                            if (e is CoreException.Refused) withContext(store) { keep(fingerprint, unmarked) }
+                            // Refused, the registrar has nothing of this try: the device is as it was. Any
+                            // other trouble, a server error among them, may have reached it, and the
+                            // mark stays, for the revocation tried again.
+                            if (e is CoreException.Refused && e.code != "server_error") withContext(store) { keep(fingerprint, before) }
                             refreshDevices(fingerprint)
                             throw e
                         }
                     if (asked == null) {
-                        withContext(store) { keep(fingerprint, unmarked) }
+                        withContext(store) { keep(fingerprint, before) }
                         refreshDevices(fingerprint)
                         return@keeping Revoking.Idle
                     }
@@ -1190,9 +1219,7 @@ class ChatViewModel internal constructor(
         viewModelScope.launch {
             withContext(store) { stored { identities.discardUnread(fingerprint) } }
             refreshDevices(fingerprint)
-            val asked = (certifying.value as? Certifying.Asked)?.takeIf { it.identity == fingerprint } ?: return@launch
-            val revoked = withContext(store) { revokedHere(fingerprint, asked.request.device) }
-            if (certifying.value == asked) certifying.value = asked.copy(revoked = revoked)
+            rejudge(fingerprint)
         }
     }
 
@@ -1587,6 +1614,8 @@ class ChatViewModel internal constructor(
      * current connection if it is signed in as it.
      */
     fun deleteIdentity(fingerprint: String) {
+        // A code shown for it answers nothing more: a certificate made and not yet sent is not.
+        if (sessionFor == fingerprint) session?.cancel()
         val signedIn = SignIn.Identity(fingerprint)
         // A connect asked for after this reads the device after it, and finds none.
         letGo { it.signIn == signedIn }
