@@ -256,6 +256,17 @@ impl Turn {
     /// signs a later time, which the registrar keeps over this one
     /// whichever reaches it first.
     fn reserve(&self) -> Option<u64> {
+        #[cfg(feature = "live-tests")]
+        {
+            let hook = BEFORE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+                .and_then(|hooks| hooks.remove(&self.identity));
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let turns = TURNS.lock().unwrap_or_else(|e| e.into_inner());
         if turns.as_ref().and_then(|t| t.get(&self.identity)) != Some(&self.number) {
             return None;
@@ -264,6 +275,24 @@ impl Turn {
         BETWEEN.with(|hook| hook.borrow().as_ref().map(|hook| hook()));
         Some(signing_time())
     }
+}
+
+#[cfg(feature = "live-tests")]
+type Hooks = std::collections::HashMap<[u8; 32], Box<dyn FnOnce() + Send>>;
+
+#[cfg(feature = "live-tests")]
+static BEFORE: Mutex<Option<Hooks>> = Mutex::new(None);
+
+/// `hook` run by the next backup of the identity whose seed is
+/// `identity_seed`, once its turn has begun and before it reserves its time.
+#[cfg(feature = "live-tests")]
+pub fn before_reserving(identity_seed: &[u8], hook: impl FnOnce() + Send + 'static) {
+    let id = identity(identity_seed).expect("an identity's seed");
+    BEFORE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(id.public(), Box::new(hook));
 }
 
 #[cfg(test)]

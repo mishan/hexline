@@ -2239,16 +2239,27 @@ async fn a_backup_begun_after_another_supersedes_it_before_it_signs() {
     use hexline_core::{backup_passphrase, SecretKind::Passphrase};
     let server = Server::with_registrar(&[]).await;
     let (seed, ..) = held(&server, "una").await;
-    // Each begun in the order asked, the first still sealing as the second
-    // begins: begun as a task, the second could be begun before the first.
-    let first = backup_passphrase(seed.clone(), server.http.clone(), "first passphrase".into());
+    // The first held before it reserves its time until the second has begun.
+    let (arrive, arrived) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    hexline_core::before_reserving(&seed, move || {
+        arrive.send(()).unwrap();
+        released.recv().unwrap();
+    });
+    let first = tokio::spawn(backup_passphrase(
+        seed.clone(),
+        server.http.clone(),
+        "first passphrase".into(),
+    ));
+    tokio::task::spawn_blocking(move || arrived.recv().unwrap())
+        .await
+        .unwrap();
     let second = backup_passphrase(seed, server.http.clone(), "second passphrase".into());
-    tokio::pin!(first, second);
-    begun(&mut first).await;
+    tokio::pin!(second);
     begun(&mut second).await;
-    let (first, second) = tokio::join!(first, second);
-    assert_eq!(refused_as(&first.unwrap_err()), "superseded");
-    second.unwrap();
+    release.send(()).unwrap();
+    second.await.unwrap();
+    assert_eq!(refused_as(&first.await.unwrap().unwrap_err()), "superseded");
     assert!(
         restored_with(&server, "una", Passphrase, "second passphrase")
             .await

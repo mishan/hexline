@@ -684,20 +684,27 @@ class ChatViewModel internal constructor(
                             ?: return@keeping Renewing.Idle
                     try {
                         val at = servers.generation()
-                        withContext(store) {
-                            identities.save(
-                                minted.deviceSeed,
-                                minted.cert,
-                                kept.card,
-                                kept.handle,
-                                kept.registrar,
-                                kept.mailbox,
-                                unfinished = kept.unfinished,
-                            )
-                            servers.forgetRefusalsOf(kept.info.device, at)
-                            publishRefusals()
-                            publishIdentities()
-                        }
+                        val replaced =
+                            withContext(store) {
+                                // Only in place of the device it began from: an identity deleted
+                                // meanwhile stays deleted, and one renewed stands.
+                                identities.list().find { it.fingerprint == fingerprint }?.takeIf { it.cert.contentEquals(kept.cert) }
+                                    ?: return@withContext false
+                                identities.save(
+                                    minted.deviceSeed,
+                                    minted.cert,
+                                    kept.card,
+                                    kept.handle,
+                                    kept.registrar,
+                                    kept.mailbox,
+                                    unfinished = kept.unfinished,
+                                )
+                                servers.forgetRefusalsOf(kept.info.device, at)
+                                publishRefusals()
+                                publishIdentities()
+                                true
+                            }
+                        if (!replaced) return@keeping Renewing.Idle
                     } finally {
                         minted.deviceSeed.fill(0)
                     }

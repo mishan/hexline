@@ -569,6 +569,25 @@ class HolderSetupFlowTest : ViewModelHarness() {
     }
 
     @Test
+    fun aHeldIdentityDeletedWhileItsNewDeviceWasAskedForStaysDeleted() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val puts = stores.secrets.puts.size
+        vm.newDeviceHeld(
+            fingerprint,
+            stores.keys.authorizer {
+                vm.deleteIdentity(fingerprint)
+                true
+            },
+        )
+        settle()
+        assertEquals(Renewing.Idle, vm.renewing.value)
+        assertEquals(emptyList<Any>(), keptIdentities())
+        assertEquals("no device seed kept for it", puts, stores.secrets.puts.size)
+    }
+
+    @Test
     fun anUnfinishedSetupWhoseDeviceIsReplacedIsStillToBeFinished() {
         val vm = model()
         settle()

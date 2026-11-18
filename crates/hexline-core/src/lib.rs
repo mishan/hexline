@@ -13,6 +13,8 @@ mod restore;
 #[cfg(target_os = "android")]
 mod tls;
 
+#[cfg(feature = "live-tests")]
+pub use backup::before_reserving;
 pub use backup::{backup_delete, backup_passphrase, min_passphrase, RecoveryCodeSetup};
 pub use connection::{
     ClassicLogin, CoreError, CoreUpdate, DeviceIdentity, LoginInfo, ServerConnection, UpdateSink,
