@@ -370,7 +370,7 @@ class Identities(
                     )
                 } ?: given
             // A certificate past [now] is let go of as the list is written, a revoked one kept.
-            val live = minted(fingerprint).filter { it.revoked || it.revoking || it.expires > now }
+            val live = minted(fingerprint).filter { it.listed(now) }
             writeMinted(fingerprint, live.filter { !it.device.contentEquals(device.device) } + device)
             if (minted(fingerprint).none { it == device }) throw java.io.IOException("not kept")
         }
@@ -407,8 +407,9 @@ class Identities(
                     .filter { it.startsWith("identity-") }
                     .toSet()
             for (file in dir.listFiles().orEmpty()) {
-                val hash = file.name.removePrefix("minted-").substringBefore('.')
-                if (file.name.startsWith("minted-") && "identity-$hash" !in identities) file.delete()
+                // Only a name this store gives a list, or a copy of one set aside.
+                val hash = MINTED.matchEntire(file.name)?.groupValues?.get(1) ?: continue
+                if ("identity-$hash" !in identities) file.delete()
             }
         }
 
@@ -497,6 +498,8 @@ class Identities(
     private companion object {
         /** One for the process: AtomicFile is not safe for two writers of one name. */
         val LOCK = Any()
+
+        val MINTED = Regex("minted-([0-9a-f]{24})(\\.unread-[0-9]+)?(\\.bak|\\.new)?")
     }
 }
 

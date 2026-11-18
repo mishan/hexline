@@ -1,10 +1,12 @@
 package org.foggyden.hexline.identity
 
+import org.foggyden.hexline.core.CertTime
 import org.foggyden.hexline.core.CertifyEnd
 import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.HolderRequest
 import org.foggyden.hexline.core.HolderSessionInterface
 import org.foggyden.hexline.core.Qr
+import org.foggyden.hexline.core.certTime
 import org.foggyden.hexline.core.certifyEnd
 
 /** A session at a mailbox the model drives (the core's, or a test's), closed to let it go. */
@@ -151,6 +153,13 @@ class MintedDevice(
             revoked == other.revoked &&
             own == other.own &&
             revoking == other.revoking
+
+    /**
+     * Whether it is still listed at [now]: revoked or being revoked, as that
+     * is what refuses its key a renewal, or its certificate in its time as
+     * the core judges it, skew included.
+     */
+    fun listed(now: Long) = revoked || revoking || certTime(0uL, expires.toULong(), now.toULong()) != CertTime.EXPIRED
 
     override fun hashCode() = device.contentHashCode()
 

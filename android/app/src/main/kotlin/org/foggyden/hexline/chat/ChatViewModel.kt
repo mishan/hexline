@@ -920,7 +920,7 @@ class ChatViewModel internal constructor(
         // as it is what refuses its key a renewal.
         val merged =
             (listed.filter { l -> pending.none { it.device.contentEquals(l.device) } } + pending)
-                .filter { it.revoked || it.revoking || it.expires > now() }
+                .filter { it.listed(now()) }
         return DeviceList(fingerprint, listOf(own) + merged, unreadable, identities.mintedUnreadable(fingerprint))
     }
 
