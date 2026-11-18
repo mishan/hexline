@@ -588,6 +588,31 @@ class HolderSetupFlowTest : ViewModelHarness() {
     }
 
     @Test
+    fun aSetupCommittedWhileItsNewDeviceWasAskedForStaysCommitted() {
+        val vm = model()
+        settle()
+        val setup = throughTheCodes(vm)
+        setup.answers += CoreException.Connect("unreachable")
+        vm.holdSetup(stores.keys.authorizer())
+        settle()
+        val fingerprint = setup.fingerprint()
+        val card = keptIdentities().single().card
+        vm.newDeviceHeld(
+            fingerprint,
+            stores.keys.authorizer {
+                // The commit a retry made, landing while the prompt is up.
+                outside { identities.committed(fingerprint, card, "carol2") }
+                true
+            },
+        )
+        settle()
+        assertEquals(Renewing.Done(fingerprint), vm.renewing.value)
+        val now = keptIdentities().single()
+        assertFalse("committed, not unfinished again", now.unfinished)
+        assertEquals("carol2", now.handle)
+    }
+
+    @Test
     fun anUnfinishedSetupWhoseDeviceIsReplacedIsStillToBeFinished() {
         val vm = model()
         settle()

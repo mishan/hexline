@@ -687,17 +687,20 @@ class ChatViewModel internal constructor(
                         val replaced =
                             withContext(store) {
                                 // Only in place of the device it began from: an identity deleted
-                                // meanwhile stays deleted, and one renewed stands.
-                                identities.list().find { it.fingerprint == fingerprint }?.takeIf { it.cert.contentEquals(kept.cert) }
-                                    ?: return@withContext false
+                                // meanwhile stays deleted, and one renewed stands. All else as it
+                                // is now, a commit made meanwhile included: the certificate is the
+                                // identity's whichever of its cards it is kept beside.
+                                val now =
+                                    identities.list().find { it.fingerprint == fingerprint }?.takeIf { it.cert.contentEquals(kept.cert) }
+                                        ?: return@withContext false
                                 identities.save(
                                     minted.deviceSeed,
                                     minted.cert,
-                                    kept.card,
-                                    kept.handle,
-                                    kept.registrar,
-                                    kept.mailbox,
-                                    unfinished = kept.unfinished,
+                                    now.card,
+                                    now.handle,
+                                    now.registrar,
+                                    now.mailbox,
+                                    unfinished = now.unfinished,
                                 )
                                 servers.forgetRefusalsOf(kept.info.device, at)
                                 publishRefusals()
