@@ -132,6 +132,8 @@ interface SetupActions {
     )
 
     fun revokingSeen()
+
+    fun discardUnreadable(fingerprint: String)
 }
 
 /**

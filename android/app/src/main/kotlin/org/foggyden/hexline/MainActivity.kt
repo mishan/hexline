@@ -120,6 +120,8 @@ fun setupActions(
     ) = chat.revokeDevice(fingerprint, device, reason, authorizer)
 
     override fun revokingSeen() = chat.revokingSeen()
+
+    override fun discardUnreadable(fingerprint: String) = chat.discardUnreadable(fingerprint)
 }
 
 @Composable

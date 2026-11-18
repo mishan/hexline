@@ -317,6 +317,9 @@ class Identities(
             }
         }
 
+    /** [fingerprint]'s lists of devices kept aside as unread, let go of. */
+    fun discardUnread(fingerprint: String): Unit = synchronized(LOCK) { unread(fingerprint).forEach { it.delete() } }
+
     /** Whether a list of [fingerprint]'s devices did not read and was kept aside: what it said is not known here. */
     fun mintedUnreadable(fingerprint: String): Boolean = synchronized(LOCK) { unread(fingerprint).isNotEmpty() }
 

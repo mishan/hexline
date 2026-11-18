@@ -311,6 +311,7 @@ class CertifyFlowTest : ViewModelHarness() {
         asked(vm, fingerprint, again)
         vm.revokeDevice(fingerprint, device, RevokeReason.LOST, stores.keys.authorizer())
         settle()
+        assertEquals("shown revoked once it is", Certifying.Asked(fingerprint, tablet, Revoked.Yes), vm.certify.value)
         vm.approveDevice(fingerprint, manage = false, stores.keys.authorizer())
         settle()
         assertEquals(Certifying.Asked(fingerprint, tablet, Revoked.Yes), vm.certify.value)
@@ -318,7 +319,7 @@ class CertifyFlowTest : ViewModelHarness() {
     }
 
     @Test
-    fun aListOfDevicesThatDoesNotReadIsKeptAsideAndMakesWhatWasRevokedUnknown() {
+    fun aListOfDevicesThatDoesNotReadIsKeptAsideAndBlocksApprovalUntilDiscarded() {
         val vm = model()
         settle()
         val fingerprint = heldHere(vm)
@@ -336,6 +337,20 @@ class CertifyFlowTest : ViewModelHarness() {
         asked(vm, fingerprint, session, Revoked.Unknown)
         vm.approveDevice(fingerprint, manage = false, stores.keys.authorizer())
         settle()
+        assertEquals("not while it cannot tell", emptyList<Any>(), session.approvals)
+        vm.discardUnreadable(fingerprint)
+        settle()
+        assertFalse(checkNotNull(vm.devices.value).unreadable)
+        assertEquals(
+            emptyList<String>(),
+            stores.identityDir
+                .list()
+                .orEmpty()
+                .filter { it.contains(".unread-") },
+        )
+        assertEquals(Certifying.Asked(fingerprint, tablet), vm.certify.value)
+        vm.approveDevice(fingerprint, manage = false, stores.keys.authorizer())
+        settle()
         assertEquals(listOf(tablet.fingerprint), onDisk(fingerprint).map { it.fingerprint })
     }
 
@@ -348,51 +363,88 @@ class CertifyFlowTest : ViewModelHarness() {
         list.writeText("[]")
         list.setReadable(false)
         try {
+            assertFalse("a file's permissions hold, as they do not for root", list.canRead())
             vm.openDevices(fingerprint)
             settle()
             assertEquals(DeviceList(fingerprint, listOf(own(vm)), unreadable = true), vm.devices.value)
             val session = shown(vm, fingerprint)
             asked(vm, fingerprint, session, Revoked.Unknown)
+            vm.approveDevice(fingerprint, manage = false, stores.keys.authorizer())
+            settle()
+            assertEquals(emptyList<Any>(), session.approvals)
         } finally {
             list.setReadable(true)
         }
     }
 
+    /** [work] with the identities' directory refusing writes, as a full disk would. */
+    private fun <T> unwritable(work: () -> T): T {
+        val dir = stores.identityDir
+        dir.setWritable(false)
+        try {
+            assertFalse("a directory's permissions hold, as they do not for root", dir.canWrite())
+            return work()
+        } finally {
+            dir.setWritable(true)
+        }
+    }
+
     @Test
-    fun aDeviceCertifiedOrRevokedWhileTheDiskWillNotTakeItIsListedFromMemoryAndWrittenLater() {
+    fun aDeviceThisPhoneCannotListIsNotSent() {
         val vm = model()
         settle()
         val fingerprint = heldHere(vm)
         vm.openDevices(fingerprint)
         settle()
-        val dir = stores.identityDir
-        dir.setWritable(false)
-        val session =
-            try {
-                certified(vm, fingerprint)
-            } finally {
-                dir.setWritable(true)
-            }
-        val certified = MintedDevice(session.device, tablet.fingerprint, "Tablet", session.expires.toLong(), canManage = false)
-        assertEquals(Certifying.Approved(fingerprint, certified, kept = false), vm.certify.value)
-        assertTrue("sent all the same", session.delivered)
-        assertEquals("revocable from memory", listOf(own(vm), certified), devices(vm))
+        val session = unwritable { certified(vm, fingerprint) }
+        assertEquals(Certifying.Failed(fingerprint, SetupProblem.NotKept), vm.certify.value)
+        assertFalse("nothing left the phone", session.delivered)
+        assertTrue(session.canceled && session.closed)
         vm.openDevices(fingerprint)
         settle()
-        assertEquals("written at the next read", listOf(certified), onDisk(fingerprint))
-        dir.setWritable(false)
-        try {
-            vm.revokeDevice(fingerprint, certified, RevokeReason.LOST, stores.keys.authorizer())
+        assertEquals("nor is it listed later", listOf(own(vm)), devices(vm))
+        assertEquals(emptyList<MintedDevice>(), onDisk(fingerprint))
+    }
+
+    @Test
+    fun aRevocationTheDiskWillNotMarkIsMarkedFromMemoryAndWrittenLater() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        vm.openDevices(fingerprint)
+        certified(vm, fingerprint)
+        val device = devices(vm).single { !it.own }
+        unwritable {
+            vm.revokeDevice(fingerprint, device, RevokeReason.LOST, stores.keys.authorizer())
             settle()
-        } finally {
-            dir.setWritable(true)
         }
-        assertEquals(Revoking.Done(fingerprint, certified, kept = false), vm.revoking.value)
-        assertEquals(listOf(own(vm), revoked(certified)), devices(vm))
+        assertEquals(Revoking.Done(fingerprint, device, kept = false), vm.revoking.value)
+        assertEquals(listOf(own(vm), revoked(device)), devices(vm))
         vm.openDevices(fingerprint)
         settle()
-        assertEquals(listOf(revoked(certified)), onDisk(fingerprint))
+        assertEquals(listOf(revoked(device)), onDisk(fingerprint))
         assertEquals("the registrar asked once", 1, setups.revocations.size)
+    }
+
+    @Test
+    fun aCertificateWhoseSendingDropsIsSentAgainOnce() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val first = shown(vm, fingerprint)
+        first.deliverFails += CoreException.Connect("dropped")
+        asked(vm, fingerprint, first)
+        vm.approveDevice(fingerprint, manage = false, stores.keys.authorizer())
+        settle()
+        assertTrue(vm.certify.value is Certifying.Approved)
+        assertTrue(first.delivered)
+        val second = shown(vm, fingerprint)
+        repeat(2) { second.deliverFails += CoreException.Connect("dropped") }
+        asked(vm, fingerprint, second)
+        vm.approveDevice(fingerprint, manage = false, stores.keys.authorizer())
+        settle()
+        assertEquals(Certifying.Failed(fingerprint, SetupProblem.Unreachable), vm.certify.value)
+        assertFalse(second.delivered)
     }
 
     @Test

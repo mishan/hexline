@@ -53,11 +53,9 @@ sealed interface Certifying {
         override val identity: String,
     ) : Certifying
 
-    /** Certified: [kept] false while this phone's list of its devices could not take it, and it is listed from memory. */
     data class Approved(
         override val identity: String,
         val device: MintedDevice,
-        val kept: Boolean = true,
     ) : Certifying
 
     data class Denied(

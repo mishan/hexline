@@ -129,9 +129,9 @@ fun ConnectFlow(
     // Open while the view model has a run under way: it holds the device.
     val backing = backupFor?.let { fp -> identities.find { it.fingerprint == fp } }
     val certifier = devicesFor?.let { fp -> identities.find { it.fingerprint == fp && it.held } }
-    // Once the list read says it is held here no longer, its Devices screen is not to come back by itself.
+    // Held here no longer, its Devices screen is not to come back by itself.
     LaunchedEffect(identities, devicesFor) {
-        if (identities.isNotEmpty() && devicesFor != null && certifier == null) devicesFor = null
+        if (identities.any { it.fingerprint == devicesFor && !it.held }) devicesFor = null
     }
     if (setup != null && (setupOpen || settingUp !is SettingUp.Idle && settingUp !is SettingUp.Done)) {
         HolderSetupScreen(settingUp, setup) { setupOpen = false }
@@ -195,7 +195,10 @@ fun ConnectFlow(
                 onRestoreSeen()
                 onEnrollSeen()
             },
-            onDelete = onDelete,
+            onDelete = { fingerprint ->
+                if (fingerprint == devicesFor) devicesFor = null
+                onDelete(fingerprint)
+            },
             onTryAgain = onTryAgain,
             heldLost = heldLost,
             onHeldLostSeen = onHeldLostSeen,

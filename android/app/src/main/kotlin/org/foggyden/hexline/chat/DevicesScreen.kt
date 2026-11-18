@@ -74,6 +74,8 @@ fun DevicesScreen(
         onDispose { actions.cancelCertifying() }
     }
     // Another identity's, under way or done, is not this screen's to show.
+    // While any identity's answer or revocation is under way, no other is started.
+    val elsewhere = certifying is Certifying.Answering || revoking is Revoking.Working
     val certifying = certifying.takeIf { it.identity == fingerprint } ?: Certifying.Idle
     val revoking = revoking.takeIf { it.identity == fingerprint } ?: Revoking.Idle
     val devices = devices?.takeIf { it.identity == fingerprint }
@@ -147,17 +149,18 @@ fun DevicesScreen(
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (certifying.revoked != Revoked.Yes) {
-                        Button({ actions.approveDevice(fingerprint, manage) }) { Text(stringResource(R.string.certify_approve)) }
+                        Button(
+                            { actions.approveDevice(fingerprint, manage) },
+                            enabled = certifying.revoked == Revoked.No && !elsewhere,
+                        ) { Text(stringResource(R.string.certify_approve)) }
                     }
                     TextButton({ actions.denyDevice(fingerprint) }) { Text(stringResource(R.string.certify_deny)) }
                 }
             }
             else -> {
                 when (certifying) {
-                    is Certifying.Approved -> {
+                    is Certifying.Approved ->
                         Text(stringResource(R.string.certify_approved, certifying.device.name ?: certifying.device.fingerprint))
-                        if (!certifying.kept) Problem(stringResource(R.string.devices_not_kept))
-                    }
                     is Certifying.Denied -> Text(stringResource(R.string.certify_denied))
                     is Certifying.Ended -> Problem(describe(certifying.why))
                     is Certifying.Failed -> Problem(describe(certifying.problem))
@@ -187,7 +190,10 @@ fun DevicesScreen(
         }
         Text(stringResource(R.string.devices_certified), style = MaterialTheme.typography.titleMedium)
         if (devices == null) Text(stringResource(R.string.devices_loading))
-        if (devices?.unreadable == true) Problem(stringResource(R.string.devices_unreadable))
+        if (devices?.unreadable == true) {
+            Problem(stringResource(R.string.devices_unreadable))
+            TextButton({ actions.discardUnreadable(fingerprint) }) { Text(stringResource(R.string.devices_discard_unreadable)) }
+        }
         for (device in devices?.devices.orEmpty()) {
             Column {
                 Text(device.name ?: stringResource(R.string.device_unnamed), style = MaterialTheme.typography.bodyLarge)
@@ -201,7 +207,7 @@ fun DevicesScreen(
                     Text(about, style = MaterialTheme.typography.bodySmall)
                 }
                 if (!device.own && !device.revoked) {
-                    TextButton({ revokingDevice = device }, enabled = !busy) { Text(stringResource(R.string.revoke)) }
+                    TextButton({ revokingDevice = device }, enabled = !busy && !elsewhere) { Text(stringResource(R.string.revoke)) }
                 }
             }
         }

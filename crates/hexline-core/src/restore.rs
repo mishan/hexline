@@ -454,8 +454,12 @@ pub(crate) fn retry_after(body: &[u8]) -> Option<u64> {
 
 /// Now, less the clock skew a server allows: a phone's clock ahead of the
 /// server's must not make the certificate not yet valid there.
+/// How far back a certificate's issue time is set, for a verifier whose
+/// clock is behind this one's.
+pub(crate) const BACKDATE: u64 = 300;
+
 pub(crate) fn issued() -> u64 {
-    now().saturating_sub(300)
+    now().saturating_sub(BACKDATE)
 }
 
 pub(crate) fn derive(secret: &Secret<'_>, kdf: Kdf) -> Result<Keys, CoreError> {

@@ -909,11 +909,21 @@ class ChatViewModel internal constructor(
     ): Boolean =
         try {
             identities.minted(fingerprint, device)
+            // Written, it is the disk's to say from now on: an older state held here is not written over it.
+            unkeep(fingerprint, device.device)
             true
         } catch (_: IOException) {
             unkept[fingerprint] = unkept[fingerprint].orEmpty().filter { !it.device.contentEquals(device.device) } + device
             false
         }
+
+    private fun unkeep(
+        fingerprint: String,
+        device: ByteArray,
+    ) {
+        val left = unkept[fingerprint].orEmpty().filter { !it.device.contentEquals(device) }
+        if (left.isEmpty()) unkept.remove(fingerprint) else unkept[fingerprint] = left
+    }
 
     /** Whether [device] was revoked here, as [fingerprint]'s list says now. */
     private fun revokedHere(
@@ -990,7 +1000,8 @@ class ChatViewModel internal constructor(
         manage: Boolean,
         authorizer: Authorizer,
     ) {
-        val asked = (certifying.value as? Certifying.Asked)?.takeIf { it.revoked != Revoked.Yes } ?: return
+        // One this phone cannot say was not revoked here is not approved: the list is discarded first.
+        val asked = (certifying.value as? Certifying.Asked)?.takeIf { it.revoked == Revoked.No } ?: return
         val opened = session?.takeIf { sessionFor == fingerprint } ?: return
         if (revocation.value is Revoking.Working) return
         certifying.value = Certifying.Answering(fingerprint)
@@ -1003,7 +1014,7 @@ class ChatViewModel internal constructor(
                         try {
                             held.use(fingerprint, authorizer) { seed ->
                                 // Read again with the prompt answered: a revocation made meanwhile stands.
-                                if (revokedNow() == Revoked.Yes) null else opened.certify(seed, manage, device)
+                                if (revokedNow() != Revoked.No) null else opened.certify(seed, manage, device)
                             } ?: return@keeping asked.copy(revoked = revokedNow())
                         } catch (e: CoreException) {
                             return@keeping certifyEnded(fingerprint, e)
@@ -1016,14 +1027,23 @@ class ChatViewModel internal constructor(
                             certified.expires.toLong(),
                             certified.canManage,
                         )
-                    val kept = withContext(store) { keep(fingerprint, minted) }
+                    // A certificate this phone cannot list is not sent: nothing has left it.
+                    if (!withContext(store) { keep(fingerprint, minted) }) {
+                        withContext(store) { unkeep(fingerprint, minted.device) }
+                        return@keeping Certifying.Failed(fingerprint, SetupProblem.NotKept)
+                    }
                     refreshDevices(fingerprint)
                     try {
-                        opened.deliver()
+                        try {
+                            opened.deliver()
+                        } catch (_: CoreException.Connect) {
+                            // Once more: the session keeps the certificate, and a dropped connection is passing.
+                            opened.deliver()
+                        }
                     } catch (e: CoreException) {
                         return@keeping certifyEnded(fingerprint, e)
                     }
-                    Certifying.Approved(fingerprint, minted, kept)
+                    Certifying.Approved(fingerprint, minted)
                 }
             if (certifying.value !is Certifying.Asked) closeSession()
         }
@@ -1100,8 +1120,27 @@ class ChatViewModel internal constructor(
                         MintedDevice(device.device, device.fingerprint, device.name, device.expires, device.canManage, revoked = true)
                     val marked = withContext(store) { keep(fingerprint, revoked) }
                     refreshDevices(fingerprint)
+                    // A request from it up meanwhile is shown revoked at once.
+                    (certifying.value as? Certifying.Asked)
+                        ?.takeIf { it.identity == fingerprint && it.request.device.contentEquals(device.device) }
+                        ?.let { certifying.value = it.copy(revoked = Revoked.Yes) }
                     Revoking.Done(fingerprint, device, marked)
                 }
+        }
+    }
+
+    /**
+     * Discards [fingerprint]'s lists of devices that did not read, kept aside:
+     * what they said is let go of, and a request asked about is judged by
+     * the list as it reads now.
+     */
+    fun discardUnreadable(fingerprint: String) {
+        viewModelScope.launch {
+            withContext(store) { stored { identities.discardUnread(fingerprint) } }
+            refreshDevices(fingerprint)
+            val asked = (certifying.value as? Certifying.Asked)?.takeIf { it.identity == fingerprint } ?: return@launch
+            val revoked = withContext(store) { revokedHere(fingerprint, asked.request.device) }
+            if (certifying.value == asked) certifying.value = asked.copy(revoked = revoked)
         }
     }
 

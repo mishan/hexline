@@ -328,7 +328,11 @@ impl HolderSession {
     pub fn cancel(self: Arc<Self>) {
         // Kept for a wait begun after it, as well as told to one under way.
         self.canceled.send_replace(true);
-        self.release();
+        // Given back after an answer under way, which the DELETE would otherwise beat.
+        crate::connection::RUNTIME.spawn(async move {
+            let _answering = self.answering.lock().await;
+            let _ = self.release().await;
+        });
     }
 }
 
@@ -528,14 +532,16 @@ impl HolderSession {
                 may_manage: decided.may_manage,
                 gets_days: decided.lifetime / DAY,
             };
-            *self.lock() = Some(Asked {
-                id,
-                request,
-                decided,
-                shown: asked.clone(),
-                bundle: None,
-            });
-            return Ok(asked);
+            return Ok(settle(
+                &self.asked,
+                Asked {
+                    id,
+                    request,
+                    decided,
+                    shown: asked,
+                    bundle: None,
+                },
+            ));
         }
     }
 
@@ -639,6 +645,13 @@ impl HolderSession {
     }
 }
 
+/// `asked` kept in `slot` and what it shows, unless a wait alongside this
+/// one kept one first: then that, and what was shown of it, stand.
+fn settle(slot: &Mutex<Option<Asked>>, asked: Asked) -> HolderRequest {
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    slot.get_or_insert(asked).shown.clone()
+}
+
 /// What `request` may be certified for by `identity`, at `now`: logging
 /// in and messaging, managing where the holder says so, never vouching,
 /// nothing it did not ask for, and for no longer than it asked or than
@@ -661,9 +674,10 @@ fn decide(
     };
     let prev = prev.filter(|prev| {
         let life = prev.expires.saturating_sub(prev.issued);
-        // Too short to outlast the backdating of a new certificate's issue
-        // time, a renewal would be due as it was made.
-        life > 2 * SKEW
+        // A renewal for no longer than `prev`, issued backdated, must not be
+        // due to be renewed again as it is made.
+        let issued = now.saturating_sub(crate::restore::BACKDATE);
+        !crate::enroll::renewal_due(issued, issued.saturating_add(life), now)
             && prev.expires > now
             && request
                 .caps
@@ -740,11 +754,11 @@ fn qr_of(url: &str) -> Result<Qr, CoreError> {
 
 /// A device's revocation (registrar §4.4), signed by the identity whose
 /// seed is `identity_seed` and posted to `registrar`'s records: `device`, a
-/// device's public key this phone certified, for `reason`, the latest certificate this phone knows of for it
-/// ending at `until`; for at least two years, as it may have been renewed
-/// elsewhere. Refused
-/// `own_device` for `this_device`, this phone's own: that is the
-/// identity's to revoke, or to delete from the phone.
+/// device's public key this phone certified, for `reason`, the latest
+/// certificate this phone knows of for it ending at `until`; for at least
+/// two years, as it may have been renewed elsewhere. Refused `own_device`
+/// for `this_device`, this phone's own: that is the identity's to revoke,
+/// or to delete from the phone.
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn revoke_device(
     identity_seed: Vec<u8>,
@@ -886,8 +900,10 @@ mod tests {
             // Asking for more than it had: enrolled afresh.
             (NOW - DAY, month, caps::LOGIN, Some(LM), None, false, LM, 90),
             (NOW - DAY, month, LM, None, Some(60), false, LM, 60),
-            // Too short to renew: its renewal would be due as it was made.
+            // Too short to renew: its renewal, backdated, would be due as it was made.
             (NOW - 30, 60, LM, None, None, false, LM, 90),
+            (NOW - 30, 450, LM, None, None, false, LM, 90),
+            (NOW - 30, 460, LM, None, None, true, LM, 0),
         ] {
             let (mut r, device) = request(asked, days);
             r.prev = Some(prev(&device, issued, life, had));
@@ -902,6 +918,42 @@ mod tests {
         let (mut r, _) = request(None, None);
         r.prev = Some(prev(&DeviceKey::generate(), NOW - DAY, month, LM));
         assert!(!decide(&r, &id.public(), NOW).unwrap().renewal);
+    }
+
+    #[test]
+    fn a_request_asked_about_stays_as_it_was_shown_whatever_a_later_wait_decides() {
+        let id = IdentityKey::generate();
+        let asked = |days| {
+            let (request, _) = request(None, Some(days));
+            let decided = decide(&request, &id.public(), NOW).unwrap();
+            let shown = HolderRequest {
+                device: request.device.to_vec(),
+                fingerprint: String::new(),
+                name: None,
+                scanned: false,
+                renewal: false,
+                asks: None,
+                asks_days: Some(days),
+                gets: Caps::of(decided.caps),
+                may_manage: decided.may_manage,
+                gets_days: decided.lifetime / DAY,
+            };
+            Asked {
+                id: days.to_string(),
+                request,
+                decided,
+                shown,
+                bundle: None,
+            }
+        };
+        let slot = Mutex::new(None);
+        assert_eq!(settle(&slot, asked(7)).gets_days, 7);
+        let mut certified = slot.lock().unwrap().clone().unwrap();
+        certified.bundle = Some(vec![1]);
+        *slot.lock().unwrap() = Some(certified);
+        assert_eq!(settle(&slot, asked(30)).gets_days, 7, "what was shown");
+        let kept = slot.lock().unwrap().clone().unwrap();
+        assert_eq!((kept.id.as_str(), kept.bundle), ("7", Some(vec![1])));
     }
 
     #[test]

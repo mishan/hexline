@@ -159,9 +159,6 @@ class FakeSetups : HolderSetups {
 
     val revocations = mutableListOf<Revocation>()
 
-    /** Called as each revocation is made, the registrar having it. */
-    var onRevoke: () -> Unit = {}
-
     override suspend fun revoke(
         identitySeed: ByteArray,
         registrar: String,
@@ -173,7 +170,6 @@ class FakeSetups : HolderSetups {
         yield()
         if (device.contentEquals(thisDevice)) throw CoreException.Refused("own_device", "")
         revocations += Revocation(identitySeed, registrar, device, reason, until)
-        onRevoke()
     }
 
     override fun deviceFingerprint(device: ByteArray) = deviceFingerprintOf(device)
@@ -197,6 +193,9 @@ class FakeSetups : HolderSetups {
 
         /** Called as the certificate is sent. */
         var onDeliver: () -> Unit = {}
+
+        /** What the next sends throw, in turn, before one goes through. */
+        val deliverFails = ArrayDeque<CoreException>()
 
         /** The device certified: its key and when its certificate ends. */
         val device = ByteArray(32) { 7 }
@@ -238,7 +237,9 @@ class FakeSetups : HolderSetups {
         override suspend fun deliver() {
             yield()
             if (canceled) throw CoreException.Refused("canceled", "")
-            if (!certified || delivered) throw CoreException.Refused("used", "")
+            if (!certified) throw CoreException.Refused("nothing_certified", "")
+            if (delivered) throw CoreException.Refused("used", "")
+            deliverFails.removeFirstOrNull()?.let { throw it }
             onDeliver()
             delivered = true
         }
