@@ -473,7 +473,15 @@ pub fn device(name: &str) -> (hl_identity::IdentityKey, crate::auth::Device) {
         .unwrap()
         .sign(&id);
     let card = Card::new(&id, name, now).sign(&id, Vec::new()).unwrap();
-    (id, crate::auth::Device { key, cert, card })
+    (
+        id,
+        crate::auth::Device {
+            key,
+            cert,
+            card,
+            rotation: None,
+        },
+    )
 }
 
 /// Pass a link on both ways, keeping what the client sends. Its first

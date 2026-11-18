@@ -20,11 +20,16 @@ use crate::{ErrorReply, Token};
 pub const CLOCK_SKEW: u64 = 300;
 
 /// A device as it proves itself: its key, the certificate the identity
-/// signed for it, and the identity's card.
+/// signed for it, and the identity's card, with the rotation record that
+/// made the identity its predecessor's successor, if one did: shown, a
+/// server that anchored the predecessor moves its account to this
+/// identity, whether or not it trusts a registrar (hotline-ng-identity.md
+/// section 5.1).
 pub struct Device {
     pub key: DeviceKey,
     pub cert: Vec<u8>,
     pub card: Vec<u8>,
+    pub rotation: Option<Vec<u8>>,
 }
 
 /// Prove `device` to the server whose ng endpoint is `url`, and hand back
@@ -71,6 +76,9 @@ pub async fn identity_token(
         "downstream": if base.starts_with("http:") && !loopback(&host) { "cleartext" } else { "local" },
         "create": create,
     });
+    if let Some(rotation) = &device.rotation {
+        body["rotation"] = Value::from(URL_SAFE_NO_PAD.encode(rotation));
+    }
     if let Some((login, password)) = classic {
         // Credentials already imply it (section 5.3); said anyway, so a
         // server that read them otherwise makes no account in place of
@@ -280,7 +288,15 @@ async fn send(req: reqwest::RequestBuilder, body: Option<Value>) -> Result<Value
             .unwrap_or(&text)
             .to_owned(),
         retry_after: reply.get("retry_after").and_then(Value::as_u64),
-        rest: Default::default(),
+        rest: match reply {
+            Value::Object(mut rest) => {
+                for known in ["error", "text", "retry_after"] {
+                    rest.remove(known);
+                }
+                rest
+            }
+            _ => Default::default(),
+        },
     };
     // A server's own page, not a reason, if it is long: kept short.
     refusal.text = refusal.text.chars().take(200).collect();

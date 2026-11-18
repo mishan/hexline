@@ -640,6 +640,7 @@ async fn put_card(
         key: DeviceKey::from_seed(&device.0),
         cert: device.1.clone(),
         card: card.to_vec(),
+        rotation: None,
     };
     let admitted = auth::identity_token(&ws, &device, false, None, None).await?;
     let resp = http

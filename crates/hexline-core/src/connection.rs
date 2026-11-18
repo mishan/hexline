@@ -865,6 +865,7 @@ impl DeviceIdentity {
             key: hl_identity::DeviceKey::from_seed(seed),
             cert: self.cert,
             card: self.card,
+            rotation: None,
         };
         Ok((device, fingerprint))
     }
