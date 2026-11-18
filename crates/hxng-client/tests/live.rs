@@ -200,11 +200,20 @@ async fn a_successor_takes_its_predecessors_account_only_by_showing_the_rotation
     let with = identity_token(&server.url, &new, false, None, None)
         .await
         .unwrap();
-    assert_eq!(outcome(with), "linked");
+    assert_eq!(with.outcome.as_deref(), Some("linked"));
+    let anyone = Start::Login(LoginParams::default());
+    let (_client, answer, _heard) = connect_with(&server.url, &anyone, None, Some(&with.token))
+        .await
+        .unwrap();
+    let Output::LoggedIn(ok) = answer else {
+        panic!("{answer:?}")
+    };
+    let k1 = hl_identity::Fingerprint::of(&k1.public()).to_string();
+    assert_eq!(ok.self_user["identity"]["fingerprint"], k1);
+    assert_eq!(ok.self_user["identity"]["account"], "alice");
     match identity_token(&server.url, &old, false, None, None).await {
         Err(Error::Refused(r)) => {
             assert_eq!(r.error.code, "rotated", "{}", r.error.text);
-            let k1 = hl_identity::Fingerprint::of(&k1.public()).to_string();
             assert_eq!(r.error.rest.get("successor"), Some(&Value::from(k1)));
         }
         other => panic!("{:?}", other.map(|a| a.outcome)),
