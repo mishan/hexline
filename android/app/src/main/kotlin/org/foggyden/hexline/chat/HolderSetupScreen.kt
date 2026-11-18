@@ -36,8 +36,10 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import org.foggyden.hexline.R
+import org.foggyden.hexline.core.RevokeReason
 import org.foggyden.hexline.core.minPassphrase
 import org.foggyden.hexline.identity.HolderRefusal
+import org.foggyden.hexline.identity.MintedDevice
 import org.foggyden.hexline.identity.SettingUp
 import org.foggyden.hexline.identity.SetupProblem
 
@@ -104,6 +106,34 @@ interface SetupActions {
     )
 
     fun backupSeen()
+
+    fun openDevices(fingerprint: String)
+
+    fun startCertifying(
+        fingerprint: String,
+        mailbox: String,
+    )
+
+    fun approveDevice(
+        fingerprint: String,
+        manage: Boolean,
+    )
+
+    fun denyDevice(fingerprint: String)
+
+    fun cancelCertifying()
+
+    fun certifySeen()
+
+    fun revokeDevice(
+        fingerprint: String,
+        device: MintedDevice,
+        reason: RevokeReason,
+    )
+
+    fun revokingSeen()
+
+    fun discardUnreadable(fingerprint: String)
 }
 
 /**

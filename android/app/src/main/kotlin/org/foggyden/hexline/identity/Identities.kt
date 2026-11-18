@@ -6,11 +6,13 @@ import android.util.Base64
 import org.foggyden.hexline.core.CertInfo
 import org.foggyden.hexline.core.certForDevice
 import org.foggyden.hexline.core.certInfo
+import org.foggyden.hexline.core.deviceFingerprintOf
 import org.foggyden.hexline.core.shortHash
 import org.foggyden.hexline.secrets.SecretStore
 import org.foggyden.hexline.secrets.SecretUnavailable
 import org.foggyden.hexline.secrets.SecretUnreadable
 import org.foggyden.hexline.secrets.Secrets
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileNotFoundException
@@ -71,6 +73,8 @@ class Identities(
     context: Context,
     private val secrets: Secrets = SecretStore(context),
     private val dir: File = File(context.filesDir, "identities"),
+    /** How a file is written whole: a test's may say it wrote what the disk did not keep. */
+    private val commit: (File, ByteArray) -> Unit = ::writeAtomically,
 ) {
     init {
         dir.mkdirs()
@@ -126,7 +130,7 @@ class Identities(
                 .listFiles()
                 .orEmpty()
                 .map { it.name.removeSuffix(".bak") }
-                .filter { !it.contains('.') }
+                .filter { it.startsWith("identity-") && !it.contains('.') }
                 .distinct()
                 // In one order whatever the file system lists them in.
                 .sorted()
@@ -275,10 +279,135 @@ class Identities(
             StoredIdentity(handle, stored.cert, card, info, stored.registrar, stored.mailbox).also { write(file, it) }
         }
 
+    /**
+     * The devices [fingerprint]'s key certified on this phone, as it keeps
+     * them, its own device apart: public keys and names, nothing secret. A
+     * list that does not read is moved aside, kept for whoever can make
+     * sense of it, rather than written over, and [mintedUnreadable] says so
+     * from then on. Throws an [java.io.IOException] the disk gives.
+     */
+    fun minted(fingerprint: String): List<MintedDevice> =
+        synchronized(LOCK) {
+            val file = mintedFile(fingerprint)
+            val bytes =
+                try {
+                    AtomicFile(file).readFully()
+                } catch (e: FileNotFoundException) {
+                    // One that is there and will not open is the disk's trouble, not an empty list.
+                    if (file.exists()) throw e
+                    return emptyList()
+                }
+            try {
+                val list = JSONArray(String(bytes))
+                (0 until list.length()).map { i ->
+                    val json = list.getJSONObject(i)
+                    val device = unb64(json.getString("device"))
+                    MintedDevice(
+                        device,
+                        deviceFingerprintOf(device),
+                        json.optString("name").ifEmpty { null },
+                        json.getLong("expires"),
+                        json.optBoolean("manage"),
+                        json.optBoolean("revoked"),
+                        revoking = json.optBoolean("revoking"),
+                    )
+                }
+            } catch (e: Exception) {
+                // What was read did not parse: the disk's own trouble is the caller's.
+                if (e is java.io.IOException) throw e
+                aside(file, bytes)
+                emptyList()
+            }
+        }
+
+    /** [fingerprint]'s lists of devices kept aside as unread, let go of. */
+    fun discardUnread(fingerprint: String): Unit = synchronized(LOCK) { unread(fingerprint).forEach { it.delete() } }
+
+    /** Whether a list of [fingerprint]'s devices did not read and was kept aside: what it said is not known here. */
+    fun mintedUnreadable(fingerprint: String): Boolean = synchronized(LOCK) { unread(fingerprint).isNotEmpty() }
+
+    /** [bytes], [file]'s, under a name of their own beside any kept before, and then [file] gone. */
+    private fun aside(
+        file: File,
+        bytes: ByteArray,
+    ) {
+        var n = 0
+        while (File(dir, "${file.name}.unread-$n").exists()) n++
+        val copy = File(dir, "${file.name}.unread-$n")
+        commit(copy, bytes)
+        // The original goes only once its copy is known to be there.
+        if (!AtomicFile(copy).readFully().contentEquals(bytes)) throw java.io.IOException("not set aside")
+        AtomicFile(file).delete()
+    }
+
+    private fun unread(fingerprint: String) =
+        dir.listFiles().orEmpty().filter { it.name.startsWith(mintedFile(fingerprint).name + ".unread-") }
+
+    /**
+     * [device] certified by [fingerprint]'s key, in place of any it certified
+     * before for the same key. Read back once written: one the list does not
+     * hold, whatever the write said (a rename that did not land), is an
+     * [java.io.IOException]. That says nothing of the data reaching the disk.
+     */
+    fun minted(
+        fingerprint: String,
+        given: MintedDevice,
+    ): Unit =
+        synchronized(LOCK) {
+            // An empty name kept as none, as it reads back.
+            val device =
+                given.name?.takeIf { it.isEmpty() }?.let {
+                    MintedDevice(
+                        given.device,
+                        given.fingerprint,
+                        null,
+                        given.expires,
+                        given.canManage,
+                        given.revoked,
+                        given.own,
+                        given.revoking,
+                    )
+                } ?: given
+            writeMinted(fingerprint, minted(fingerprint).filter { !it.device.contentEquals(device.device) } + device)
+            if (minted(fingerprint).none { it == device }) throw java.io.IOException("not kept")
+        }
+
+    /** The device [device] taken off [fingerprint]'s list: it was never certified after all. */
+    fun unminted(
+        fingerprint: String,
+        device: ByteArray,
+    ): Unit =
+        synchronized(LOCK) {
+            writeMinted(fingerprint, minted(fingerprint).filter { !it.device.contentEquals(device) })
+        }
+
+    private fun writeMinted(
+        fingerprint: String,
+        devices: List<MintedDevice>,
+    ) {
+        val list = JSONArray()
+        for (d in devices) {
+            list.put(
+                JSONObject()
+                    .put("device", b64(d.device))
+                    .put("expires", d.expires)
+                    .apply {
+                        d.name?.let { put("name", it) }
+                        if (d.canManage) put("manage", true)
+                        if (d.revoked) put("revoked", true)
+                        if (d.revoking) put("revoking", true)
+                    },
+            )
+        }
+        commit(mintedFile(fingerprint), list.toString().toByteArray())
+    }
+
     fun delete(fingerprint: String): Unit =
         synchronized(LOCK) {
             val file = file(fingerprint)
             val stored = load(file)
+            AtomicFile(mintedFile(fingerprint)).delete()
+            unread(fingerprint).forEach { it.delete() }
             AtomicFile(file).delete()
             stored?.let { secrets.delete(secretName(it.fingerprint, it.info.device)) }
         }
@@ -338,19 +467,13 @@ class Identities(
                     if (stored.unfinished) put("unfinished", true)
                     if (stored.unrecoverable) put("unrecoverable", true)
                 }
-        val atomic = AtomicFile(file)
-        val out = atomic.startWrite()
-        try {
-            out.write(json.toString().toByteArray())
-            atomic.finishWrite(out)
-        } catch (e: Exception) {
-            atomic.failWrite(out)
-            throw e
-        }
+        commit(file, json.toString().toByteArray())
     }
 
     /** Names from the identity, and the device: never anything typed. */
     private fun file(fingerprint: String) = File(dir, "identity-" + shortHash(fingerprint.toByteArray()))
+
+    private fun mintedFile(fingerprint: String) = File(dir, "minted-" + shortHash(fingerprint.toByteArray()))
 
     private fun secretName(
         fingerprint: String,
@@ -364,5 +487,21 @@ class Identities(
     private companion object {
         /** One for the process: AtomicFile is not safe for two writers of one name. */
         val LOCK = Any()
+    }
+}
+
+/** [bytes] written as [file] whole, or not at all, as [AtomicFile] writes. */
+fun writeAtomically(
+    file: File,
+    bytes: ByteArray,
+) {
+    val atomic = AtomicFile(file)
+    val out = atomic.startWrite()
+    try {
+        out.write(bytes)
+        atomic.finishWrite(out)
+    } catch (e: Exception) {
+        atomic.failWrite(out)
+        throw e
     }
 }

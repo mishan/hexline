@@ -20,10 +20,12 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.foggyden.hexline.BuildConfig
+import org.foggyden.hexline.core.CertifyEnd
 import org.foggyden.hexline.core.ClassicLogin
 import org.foggyden.hexline.core.Connection
 import org.foggyden.hexline.core.CoreException
@@ -32,6 +34,7 @@ import org.foggyden.hexline.core.DeviceIdentity
 import org.foggyden.hexline.core.Enrollment
 import org.foggyden.hexline.core.LoginInfo
 import org.foggyden.hexline.core.Restored
+import org.foggyden.hexline.core.RevokeReason
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.UpdateSink
 import org.foggyden.hexline.core.cardName
@@ -44,22 +47,29 @@ import org.foggyden.hexline.core.refusalLasts
 import org.foggyden.hexline.core.restoreIdentity
 import org.foggyden.hexline.identity.Backed
 import org.foggyden.hexline.identity.BackingUp
+import org.foggyden.hexline.identity.CertifySession
+import org.foggyden.hexline.identity.Certifying
 import org.foggyden.hexline.identity.CoreHolderSetups
+import org.foggyden.hexline.identity.DeviceList
 import org.foggyden.hexline.identity.EnrollProblem
 import org.foggyden.hexline.identity.Enrolling
 import org.foggyden.hexline.identity.HeldSeeds
 import org.foggyden.hexline.identity.HolderRefusal
 import org.foggyden.hexline.identity.HolderSetups
 import org.foggyden.hexline.identity.Identities
+import org.foggyden.hexline.identity.MintedDevice
 import org.foggyden.hexline.identity.NewRecoveryCode
 import org.foggyden.hexline.identity.Renewing
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
+import org.foggyden.hexline.identity.Revoked
+import org.foggyden.hexline.identity.Revoking
 import org.foggyden.hexline.identity.SettingUp
 import org.foggyden.hexline.identity.Setup
 import org.foggyden.hexline.identity.SetupProblem
 import org.foggyden.hexline.identity.Standing
 import org.foggyden.hexline.identity.StoredIdentity
+import org.foggyden.hexline.identity.certifyEnd
 import org.foggyden.hexline.identity.enrollProblem
 import org.foggyden.hexline.identity.restoreProblem
 import org.foggyden.hexline.identity.setupProblem
@@ -165,6 +175,11 @@ class ChatViewModel internal constructor(
 
     /** The identities this phone is a device of. */
     val identityList: StateFlow<List<StoredIdentity>> = kept
+
+    private val keptRead = MutableStateFlow(false)
+
+    /** Whether [identityList] has been read from the store yet: empty until it has. */
+    val identitiesRead: StateFlow<Boolean> = keptRead
 
     private val heldLost = MutableStateFlow<List<String>>(emptyList())
 
@@ -827,6 +842,398 @@ class ChatViewModel internal constructor(
         newCode = null
     }
 
+    private val certifying = MutableStateFlow<Certifying>(Certifying.Idle)
+
+    /** Another device being certified by a held identity's key. */
+    val certify: StateFlow<Certifying> = certifying
+
+    private val mintedDevices = MutableStateFlow<DeviceList?>(null)
+
+    /** The devices of the identity whose devices were last opened; null until they are read. */
+    val devices: StateFlow<DeviceList?> = mintedDevices
+
+    private val revocation = MutableStateFlow<Revoking>(Revoking.Idle)
+
+    /** Revoking a device a held identity certified here. */
+    val revoking: StateFlow<Revoking> = revocation
+
+    /** The session shown, the identity it certifies for, and each opened's number: on the main thread alone. */
+    private var session: CertifySession? = null
+    private var sessionFor: String? = null
+    private var sessions = 0
+
+    /** The identity whose devices were last opened: on the main thread alone. */
+    private var devicesFor: String? = null
+
+    /**
+     * Devices certified or revoked here that the list on disk could not take,
+     * by identity: shown from here, and written again at each read. On the
+     * store queue alone.
+     */
+    private val unkept = HashMap<String, List<MintedDevice>>()
+
+    /** Lists the devices [fingerprint]'s key certified here; a code shown for another identity is put away. */
+    fun openDevices(fingerprint: String) {
+        if (sessionFor != null && sessionFor != fingerprint) cancelCertifying()
+        devicesFor = fingerprint
+        if (mintedDevices.value?.identity != fingerprint) mintedDevices.value = null
+        refreshDevices(fingerprint)
+        rejudge(fingerprint)
+    }
+
+    /** A request asked about for [fingerprint] judged again by the list as it reads now. */
+    private fun rejudge(fingerprint: String) {
+        viewModelScope.launch {
+            val asked = (certifying.value as? Certifying.Asked)?.takeIf { it.identity == fingerprint } ?: return@launch
+            val revoked = withContext(store) { revokedHere(fingerprint, asked.request.device) }
+            if (certifying.value == asked) certifying.value = asked.copy(revoked = revoked)
+        }
+    }
+
+    private fun refreshDevices(fingerprint: String) {
+        viewModelScope.launch {
+            val list = withContext(store) { devicesOf(fingerprint) }
+            // One read for an identity opened since is dropped.
+            if (devicesFor == fingerprint) mintedDevices.value = list
+        }
+    }
+
+    /** [fingerprint]'s devices, the disk's trouble reading them told as a list that did not read. */
+    private fun devicesOf(fingerprint: String): DeviceList? {
+        val kept = identities.list().find { it.fingerprint == fingerprint } ?: return null
+        val info = kept.info
+        val own =
+            MintedDevice(info.device, setups.deviceFingerprint(info.device), info.name, info.expires.toLong(), info.canManage, own = true)
+        val pending =
+            unkept[fingerprint]
+                .orEmpty()
+                .filter { device -> !keep(fingerprint, device) }
+                .also { if (it.isEmpty()) unkept.remove(fingerprint) else unkept[fingerprint] = it }
+        val (listed, unreadable) =
+            try {
+                identities.minted(fingerprint) to false
+            } catch (_: IOException) {
+                emptyList<MintedDevice>() to true
+            }
+        val merged = listed.filter { l -> pending.none { it.device.contentEquals(l.device) } } + pending
+        return DeviceList(fingerprint, listOf(own) + merged, unreadable, identities.mintedUnreadable(fingerprint))
+    }
+
+    /**
+     * [device] written to [fingerprint]'s list; if the disk will not take it
+     * now, kept in memory to be with [held], and false either way.
+     */
+    private fun keep(
+        fingerprint: String,
+        device: MintedDevice,
+        held: Boolean = true,
+    ): Boolean =
+        try {
+            // An identity deleted meanwhile is not written back by an answer that outlived it.
+            if (identities.list().none { it.fingerprint == fingerprint }) return false
+            identities.minted(fingerprint, device)
+            // Written, it is the disk's to say from now on: an older state held here is not written over it.
+            unkeep(fingerprint, device.device)
+            true
+        } catch (_: IOException) {
+            if (held) unkept[fingerprint] = unkept[fingerprint].orEmpty().filter { !it.device.contentEquals(device.device) } + device
+            false
+        }
+
+    private fun unkeep(
+        fingerprint: String,
+        device: ByteArray,
+    ) {
+        val left = unkept[fingerprint].orEmpty().filter { !it.device.contentEquals(device) }
+        if (left.isEmpty()) unkept.remove(fingerprint) else unkept[fingerprint] = left
+    }
+
+    /** Whether [device] was revoked here, as [fingerprint]'s list says now. */
+    private fun revokedHere(
+        fingerprint: String,
+        device: ByteArray,
+    ): Revoked {
+        val list = devicesOf(fingerprint) ?: return Revoked.Unknown
+        return when {
+            // One being revoked counts as revoked: the registrar may have it already.
+            list.devices.any { (it.revoked || it.revoking) && it.device.contentEquals(device) } -> Revoked.Yes
+            list.unreadable || list.setAside -> Revoked.Unknown
+            else -> Revoked.No
+        }
+    }
+
+    /**
+     * Shows a code at [mailbox] for another device to ask [fingerprint]'s
+     * key to certify it by, and waits for its request.
+     */
+    fun startCertifying(
+        fingerprint: String,
+        mailbox: String,
+    ) {
+        if (certifying.value is Certifying.Answering) return
+        closeSession()
+        val number = ++sessions
+        certifying.value = Certifying.Opening(fingerprint)
+        viewModelScope.launch {
+            val card = withContext(store) { identities.list().find { it.fingerprint == fingerprint } }?.card
+            val opened =
+                try {
+                    card?.let { setups.openSession(mailbox, it) }
+                } catch (e: CoreException) {
+                    if (number == sessions) certifying.value = certifyEnded(fingerprint, e)
+                    return@launch
+                }
+            if (number != sessions || opened == null) {
+                opened?.let(::letGoOf)
+                if (number == sessions) certifying.value = Certifying.Idle
+                return@launch
+            }
+            session = opened
+            sessionFor = fingerprint
+            certifying.value =
+                Certifying.Showing(fingerprint, opened.identity(), opened.code(), opened.host(), opened.expiresIn().toLong(), opened.qr())
+            val asked =
+                try {
+                    opened.nextRequest()
+                } catch (e: CoreException) {
+                    if (number != sessions) return@launch
+                    closeSession()
+                    certifying.value = certifyEnded(fingerprint, e)
+                    return@launch
+                }
+            val revoked = withContext(store) { revokedHere(fingerprint, asked.device) }
+            if (number != sessions) return@launch
+            certifying.value = Certifying.Asked(fingerprint, asked, revoked)
+            // Unanswered when the mailbox lets it go, it is over: a new code is the way on.
+            opened.answerEnds()
+            // A prompt up as it ended is waited out: canceled, the request is over all the same.
+            certifying.first { it !is Certifying.Answering }
+            if (number == sessions && certifying.value is Certifying.Asked) {
+                closeSession()
+                certifying.value = Certifying.Ended(fingerprint, CertifyEnd.EXPIRED)
+            }
+        }
+    }
+
+    private fun certifyEnded(
+        fingerprint: String,
+        e: CoreException,
+    ) = certifyEnd(e)?.let { Certifying.Ended(fingerprint, it) } ?: Certifying.Failed(fingerprint, setupProblem(e))
+
+    /**
+     * Certifies the device asked about for [fingerprint], letting it manage
+     * the account with [manage], behind [authorizer]'s prompt. A prompt
+     * refused leaves it asked; so does a revocation of it made here
+     * meanwhile, which is then shown. The device is listed before its
+     * certificate is sent, so one that may be out in the world is one that
+     * can be revoked.
+     */
+    fun approveDevice(
+        fingerprint: String,
+        manage: Boolean,
+        authorizer: Authorizer,
+    ) {
+        // One this phone cannot say was not revoked here is not approved: the list is discarded first.
+        val asked = (certifying.value as? Certifying.Asked)?.takeIf { it.revoked == Revoked.No } ?: return
+        val opened = session?.takeIf { sessionFor == fingerprint } ?: return
+        if (revocation.value is Revoking.Working) return
+        certifying.value = Certifying.Answering(fingerprint)
+        viewModelScope.launch {
+            val device = asked.request.device
+            val revokedNow: suspend () -> Revoked = { withContext(store) { revokedHere(fingerprint, device) } }
+            certifying.value =
+                keeping({ Certifying.Failed(fingerprint, it) }) {
+                    val certified =
+                        try {
+                            held.use(fingerprint, authorizer) { seed ->
+                                // Read again with the prompt answered: a revocation made meanwhile stands.
+                                if (revokedNow() != Revoked.No) null else opened.certify(seed, manage, device)
+                            } ?: return@keeping asked.copy(revoked = revokedNow())
+                        } catch (e: CoreException) {
+                            return@keeping certifyEnded(fingerprint, e)
+                        }
+                    val minted =
+                        MintedDevice(
+                            certified.device,
+                            setups.deviceFingerprint(certified.device),
+                            certified.name,
+                            certified.expires.toLong(),
+                            certified.canManage,
+                        )
+                    // A certificate this phone cannot list is not sent: nothing has left it.
+                    val before = withContext(store) { identities.minted(fingerprint).find { it.device.contentEquals(minted.device) } }
+                    if (!withContext(store) { keep(fingerprint, minted, held = false) }) {
+                        return@keeping Certifying.Failed(fingerprint, SetupProblem.NotKept)
+                    }
+                    refreshDevices(fingerprint)
+                    try {
+                        try {
+                            opened.deliver()
+                        } catch (_: CoreException.Connect) {
+                            // Once more: the session keeps the certificate, and a dropped connection is passing.
+                            opened.deliver()
+                        }
+                    } catch (e: CoreException) {
+                        // No send that could have reached the mailbox, the answer never reached the
+                        // device: it is listed as it was before. One that may have, the core says,
+                        // leaves it listed, revocable.
+                        if (!opened.mayHaveDelivered()) {
+                            withContext(store) {
+                                if (before != null) {
+                                    keep(fingerprint, before)
+                                } else if (identities.list().any { it.fingerprint == fingerprint }) {
+                                    identities.unminted(fingerprint, minted.device)
+                                }
+                            }
+                            refreshDevices(fingerprint)
+                        }
+                        return@keeping certifyEnded(fingerprint, e)
+                    }
+                    Certifying.Approved(fingerprint, minted)
+                }
+            if (certifying.value !is Certifying.Asked) closeSession()
+        }
+    }
+
+    /** Says no to the device asked about for [fingerprint]. */
+    fun denyDevice(fingerprint: String) {
+        if ((certifying.value as? Certifying.Asked)?.identity != fingerprint) return
+        val opened = session?.takeIf { sessionFor == fingerprint } ?: return
+        certifying.value = Certifying.Answering(fingerprint)
+        viewModelScope.launch {
+            certifying.value =
+                try {
+                    opened.deny(DENIED)
+                    Certifying.Denied(fingerprint)
+                } catch (e: CoreException) {
+                    certifyEnded(fingerprint, e)
+                }
+            closeSession()
+        }
+    }
+
+    /** Stops showing the code: it admits nobody from now on. */
+    fun cancelCertifying() {
+        if (certifying.value is Certifying.Answering) return
+        sessions++
+        closeSession()
+        certifying.value = Certifying.Idle
+    }
+
+    fun certifySeen() {
+        when (certifying.value) {
+            is Certifying.Approved, is Certifying.Denied, is Certifying.Ended, is Certifying.Failed -> certifying.value = Certifying.Idle
+            else -> Unit
+        }
+    }
+
+    private fun closeSession() {
+        session?.let(::letGoOf)
+        session = null
+        sessionFor = null
+    }
+
+    private fun letGoOf(opened: CertifySession) {
+        opened.cancel()
+        opened.close()
+    }
+
+    /**
+     * Revokes [device], which [fingerprint]'s key certified here, at its
+     * registrar for [reason], behind [authorizer]'s prompt. Once the
+     * registrar has it, it is marked revoked here, in memory if the list on
+     * disk will not take the mark now: it is not asked of the registrar
+     * again.
+     */
+    fun revokeDevice(
+        fingerprint: String,
+        device: MintedDevice,
+        reason: RevokeReason,
+        authorizer: Authorizer,
+    ) {
+        if (revocation.value is Revoking.Working || certifying.value is Certifying.Answering) return
+        // This phone's own goes with the identity: it is never in the list to mark.
+        if (device.own) {
+            revocation.value = Revoking.Failed(fingerprint, SetupProblem.Other)
+            return
+        }
+        revocation.value = Revoking.Working(fingerprint)
+        viewModelScope.launch {
+            revocation.value =
+                keeping({ Revoking.Failed(fingerprint, it) }) {
+                    val kept =
+                        withContext(store) { identities.list().find { it.fingerprint == fingerprint } } ?: return@keeping Revoking.Idle
+                    val registrar = kept.registrar ?: return@keeping Revoking.Failed(fingerprint, SetupProblem.NotARegistrar)
+                    // Marked as being revoked before the registrar is asked, so a process ended
+                    // before its answer lands still counts it revoked; not asked at all if the
+                    // mark cannot be made.
+                    // As it stood before this try, as the list says: a mark an earlier one left stays.
+                    val before =
+                        withContext(store) {
+                            try {
+                                identities.minted(fingerprint).find { it.device.contentEquals(device.device) }
+                            } catch (_: IOException) {
+                                null
+                            }
+                        } ?: device
+                    if (!withContext(store) { keep(fingerprint, device.with(revoking = true), held = false) }) {
+                        return@keeping Revoking.Failed(fingerprint, SetupProblem.NotKept)
+                    }
+                    refreshDevices(fingerprint)
+                    val asked =
+                        try {
+                            held.use(fingerprint, authorizer) { seed ->
+                                setups.revoke(seed, registrar, device.device, reason, device.expires, kept.info.device)
+                            }
+                        } catch (e: CoreException) {
+                            // Refused, the registrar has nothing of this try: the device is as it was. Any
+                            // other trouble, a server error among them, may have reached it, and the
+                            // mark stays, for the revocation tried again.
+                            if (e is CoreException.Refused && e.code != "server_error") withContext(store) { keep(fingerprint, before) }
+                            refreshDevices(fingerprint)
+                            throw e
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            // The key's own trouble, the registrar not asked: the device is as it was.
+                            withContext(store) { keep(fingerprint, before) }
+                            refreshDevices(fingerprint)
+                            throw e
+                        }
+                    if (asked == null) {
+                        withContext(store) { keep(fingerprint, before) }
+                        refreshDevices(fingerprint)
+                        return@keeping Revoking.Idle
+                    }
+                    val revoked = device.with(revoking = false, revoked = true)
+                    val marked = withContext(store) { keep(fingerprint, revoked) }
+                    refreshDevices(fingerprint)
+                    // A request from it up meanwhile is shown revoked at once.
+                    (certifying.value as? Certifying.Asked)
+                        ?.takeIf { it.identity == fingerprint && it.request.device.contentEquals(device.device) }
+                        ?.let { certifying.value = it.copy(revoked = Revoked.Yes) }
+                    Revoking.Done(fingerprint, device, marked)
+                }
+        }
+    }
+
+    /**
+     * Discards [fingerprint]'s lists of devices that did not read, kept aside:
+     * what they said is let go of, and a request asked about is judged by
+     * the list as it reads now.
+     */
+    fun discardUnreadable(fingerprint: String) {
+        viewModelScope.launch {
+            withContext(store) { stored { identities.discardUnread(fingerprint) } }
+            refreshDevices(fingerprint)
+            rejudge(fingerprint)
+        }
+    }
+
+    fun revokingSeen() {
+        if (revocation.value !is Revoking.Working) revocation.value = Revoking.Idle
+    }
+
     /** [act] on [fingerprint]'s seed, opened behind [authorizer]'s prompt, at its registrar. */
     private fun backingUp(
         fingerprint: String,
@@ -1214,6 +1621,8 @@ class ChatViewModel internal constructor(
      * current connection if it is signed in as it.
      */
     fun deleteIdentity(fingerprint: String) {
+        // A code shown for it answers nothing more: a certificate made and not yet sent is not.
+        if (sessionFor == fingerprint) session?.cancel()
         val signedIn = SignIn.Identity(fingerprint)
         // A connect asked for after this reads the device after it, and finds none.
         letGo { it.signIn == signedIn }
@@ -1230,6 +1639,7 @@ class ChatViewModel internal constructor(
             held.forget(fingerprint)
             held.dismiss(fingerprint)
             identities.delete(fingerprint)
+            unkept.remove(fingerprint)
             heldLost.value = held.notices()
             publishIdentities()
             for (s in servers.all().filter { it.signIn == signedIn }) servers.forgetSession(s, since)
@@ -1273,6 +1683,7 @@ class ChatViewModel internal constructor(
     // Called on the store queue alone, so a slower read is never shown over a newer one.
     private fun publishIdentities() {
         kept.value = identities.list().map { if (held.isHeld(it.fingerprint)) it.held() else it }
+        keptRead.value = true
     }
 
     private fun publishServers() {
@@ -1558,6 +1969,7 @@ class ChatViewModel internal constructor(
     override fun onCleared() {
         closeSetup()
         closeNewCode()
+        closeSession()
         connectivity.unregisterNetworkCallback(network)
         process.removeObserver(lifecycle)
         send(EnrollEvent.Closed)
@@ -1587,5 +1999,8 @@ class ChatViewModel internal constructor(
         const val FILL_PAGE = 200u
         const val FILL_PAGES = 5
         const val FILL_WAIT = 2_000L
+
+        /** What a device said no to is told, on its own screen. */
+        const val DENIED = "declined on the holder's phone"
     }
 }

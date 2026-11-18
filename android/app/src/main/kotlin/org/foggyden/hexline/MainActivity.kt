@@ -14,7 +14,9 @@ import org.foggyden.hexline.chat.ChatViewModel
 import org.foggyden.hexline.chat.ConnectFlow
 import org.foggyden.hexline.chat.Link
 import org.foggyden.hexline.chat.SetupActions
+import org.foggyden.hexline.core.RevokeReason
 import org.foggyden.hexline.identity.BiometricAuthorizer
+import org.foggyden.hexline.identity.MintedDevice
 import org.foggyden.hexline.secrets.Authorizer
 
 /** A FragmentActivity, as the prompt an identity's key asks by needs one. */
@@ -92,6 +94,34 @@ fun setupActions(
     ) = chat.confirmNewRecoveryCode(fingerprint, typed, authorizer)
 
     override fun backupSeen() = chat.backupSeen()
+
+    override fun openDevices(fingerprint: String) = chat.openDevices(fingerprint)
+
+    override fun startCertifying(
+        fingerprint: String,
+        mailbox: String,
+    ) = chat.startCertifying(fingerprint, mailbox)
+
+    override fun approveDevice(
+        fingerprint: String,
+        manage: Boolean,
+    ) = chat.approveDevice(fingerprint, manage, authorizer)
+
+    override fun denyDevice(fingerprint: String) = chat.denyDevice(fingerprint)
+
+    override fun cancelCertifying() = chat.cancelCertifying()
+
+    override fun certifySeen() = chat.certifySeen()
+
+    override fun revokeDevice(
+        fingerprint: String,
+        device: MintedDevice,
+        reason: RevokeReason,
+    ) = chat.revokeDevice(fingerprint, device, reason, authorizer)
+
+    override fun revokingSeen() = chat.revokingSeen()
+
+    override fun discardUnreadable(fingerprint: String) = chat.discardUnreadable(fingerprint)
 }
 
 @Composable
@@ -109,6 +139,10 @@ fun Hexline(
     val settingUp by chat.holderSetup.collectAsStateWithLifecycle()
     val renewing by chat.renewing.collectAsStateWithLifecycle()
     val backingUp by chat.backingUp.collectAsStateWithLifecycle()
+    val certifying by chat.certify.collectAsStateWithLifecycle()
+    val devices by chat.devices.collectAsStateWithLifecycle()
+    val identitiesRead by chat.identitiesRead.collectAsStateWithLifecycle()
+    val revoking by chat.revoking.collectAsStateWithLifecycle()
     when (val link = state.link) {
         Link.Live, is Link.Reconnecting -> ChatScreen(state, chat::send, chat::loadEarlier, chat::disconnect)
         else ->
@@ -138,6 +172,10 @@ fun Hexline(
                 settingUp = settingUp,
                 renewing = renewing,
                 backingUp = backingUp,
+                certifying = certifying,
+                devices = devices,
+                identitiesRead = identitiesRead,
+                revoking = revoking,
                 setup = setupActions(chat, authorizer),
             )
     }

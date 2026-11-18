@@ -500,7 +500,7 @@ impl HolderSetup {
         let id = IdentityKey::from_seed(&seed);
         let http = auth::http_client(base.as_str(), None)?;
         let reg = discovered(&http, &base).await?;
-        let envelopes = endpoint(&base, &reg.envelopes)?;
+        let envelopes = endpoint(&base, reg.envelopes()?)?;
         let card = if registered {
             card
         } else {
@@ -613,7 +613,7 @@ pub async fn check_holder_registrar(registrar: String) -> Result<(), CoreError> 
             let base = registrar_base(&registrar)?;
             let http = auth::http_client(base.as_str(), None)?;
             let reg = discovered(&http, &base).await?;
-            endpoint(&base, &reg.envelopes)?;
+            endpoint(&base, reg.envelopes()?)?;
             endpoint(&base, &reg.register).map(drop)
         })
         .await

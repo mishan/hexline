@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The foreground in one color, for themed icons. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M39.16,32.93 L49.98,39.18 L49.98,51.68 L39.16,57.93 L28.33,51.68 L28.33,39.18 Z M68.84,32.93 L79.67,39.18 L79.67,51.68 L68.84,57.93 L58.02,51.68 L58.02,39.18 Z M54.00,58.65 L64.82,64.90 L64.82,77.40 L54.00,83.65 L43.18,77.40 L43.18,64.90 Z M48.20,42.98 L59.80,42.98 L59.80,47.89 L48.20,47.89 Z M66.45,54.50 L60.64,64.54 L56.39,62.08 L62.20,52.04 Z M45.80,52.04 L51.61,62.08 L47.36,64.54 L41.55,54.50 Z" />
+</vector>

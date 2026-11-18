@@ -23,16 +23,27 @@ import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.viewmodel.CreationExtras
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import org.foggyden.hexline.R
+import org.foggyden.hexline.core.Caps
+import org.foggyden.hexline.core.Certified
 import org.foggyden.hexline.core.HeldRestore
 import org.foggyden.hexline.core.HolderCommitted
+import org.foggyden.hexline.core.HolderRequest
 import org.foggyden.hexline.core.HolderSetup
 import org.foggyden.hexline.core.HolderSetupInterface
+import org.foggyden.hexline.core.Qr
+import org.foggyden.hexline.core.RevokeReason
 import org.foggyden.hexline.core.SecretKind
+import org.foggyden.hexline.core.certForDevice
+import org.foggyden.hexline.core.deviceFingerprintOf
+import org.foggyden.hexline.core.holderMint
 import org.foggyden.hexline.core.holderRenew
 import org.foggyden.hexline.identity.BackingUp
 import org.foggyden.hexline.identity.BiometricAuthorizer
+import org.foggyden.hexline.identity.CertifySession
+import org.foggyden.hexline.identity.Certifying
 import org.foggyden.hexline.identity.HeldSeeds
 import org.foggyden.hexline.identity.HolderSetups
 import org.foggyden.hexline.identity.Identities
@@ -46,6 +57,7 @@ import org.foggyden.hexline.servers.SavedServers
 import org.foggyden.hexline.servers.StoreQueue
 import org.foggyden.hexline.setupActions
 import org.junit.After
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -212,7 +224,7 @@ class HolderSetupScreenTest {
     }
 
     @Test
-    fun anIdentityIsSetUpOnTheScreenHeldBehindThePromptAndGoesWithTheScreenLock() {
+    fun anIdentityIsSetUpOnTheScreenHeldBehindThePromptCertifiesAnotherDeviceAndGoesWithTheScreenLock() {
         val vm = model(softwareKeys = true)
         rule.waitForIdle()
         assertFalse("nothing secret on screen yet", secure())
@@ -244,10 +256,70 @@ class HolderSetupScreenTest {
         rule.runOnUiThread { vm.renewHeld(fingerprint, checkNotNull(authorizer)) }
         answer { vm.renewing.value !is Renewing.Working }
         assertEquals(Renewing.Done(fingerprint), vm.renewing.value)
+        // Another device certified by the key, approved on the devices screen behind the prompt.
+        devicesScreen(vm, fingerprint)
+        tap(R.string.certify_start)
+        rule.waitUntil(15_000) { vm.certify.value is Certifying.Showing }
+        val lm = Caps(login = true, message = true, manage = false, vouch = false)
+        val asked = HolderRequest(ByteArray(32) { 7 }, "b283bthc", "Tablet", false, false, null, null, lm, true, 90uL * 86_400uL)
+        OfflineSetups.session.next.complete(asked)
+        rule.waitUntil(15_000) { vm.certify.value is Certifying.Asked }
+        rule.onNode(hasText("b283bthc")).assertExists()
+        tap(R.string.certify_approve)
+        answer { vm.certify.value is Certifying.Approved }
+        val approved = (vm.certify.value as Certifying.Approved).device
+        assertEquals("certified by the identity's own key", fingerprint, OfflineSetups.session.certifiedBy)
+        // The key the screen handed the core to certify, not the subject of a certificate:
+        // this mailbox makes none for it.
+        assertArrayEquals("the device asked about, as passed to certify", asked.device, approved.device)
+        assertTrue(OfflineSetups.session.delivered)
+        rule.waitUntil(15_000) {
+            vm.devices.value
+                ?.devices
+                .orEmpty()
+                .any { it.device.contentEquals(asked.device) }
+        }
+        // A code shown when the screen goes admits nobody.
+        tap(R.string.certify_start)
+        rule.waitUntil(15_000) { vm.certify.value is Certifying.Showing }
+        val shown = OfflineSetups.session
+        rule.runOnUiThread { rule.activity.setContentView(android.view.View(rule.activity)) }
+        rule.waitForIdle()
+        assertTrue("given back with the screen", shown.canceled)
         shell("locksettings clear --old $PIN")
         assertEquals(listOf(fingerprint), seeds.demoteLost(listOf(fingerprint)))
         assertFalse(seeds.isHeld(fingerprint))
         assertEquals(listOf(fingerprint), seeds.notices())
+    }
+
+    private fun devicesScreen(
+        vm: ChatViewModel,
+        fingerprint: String,
+    ) {
+        rule.runOnUiThread {
+            val activity = rule.activity
+            activity.setContentView(
+                ComposeView(activity).apply {
+                    setContent {
+                        MaterialTheme {
+                            val certifying by vm.certify.collectAsState()
+                            val devices by vm.devices.collectAsState()
+                            val revoking by vm.revoking.collectAsState()
+                            DevicesScreen(
+                                fingerprint,
+                                "carol",
+                                "mail.example",
+                                devices,
+                                certifying,
+                                revoking,
+                                setupActions(vm, BiometricAuthorizer(activity, "Hexline", "Certify a device")),
+                            ) {}
+                        }
+                    }
+                },
+            )
+        }
+        rule.waitForIdle()
     }
 
     @Test
@@ -335,6 +407,81 @@ class HolderSetupScreenTest {
         ): Unit = error("no backups here")
 
         override fun newRecoveryCode(): NewRecoveryCode = error("no backups here")
+
+        lateinit var session: Mailbox
+
+        override suspend fun openSession(
+            mailbox: String,
+            card: ByteArray,
+        ): CertifySession = Mailbox(mailbox, card).also { session = it }
+
+        override suspend fun revoke(
+            identitySeed: ByteArray,
+            registrar: String,
+            device: ByteArray,
+            reason: RevokeReason,
+            until: Long,
+            thisDevice: ByteArray,
+        ): Unit = error("no registrar here")
+
+        override fun deviceFingerprint(device: ByteArray) = deviceFingerprintOf(device)
+    }
+
+    /** A mailbox that hands over the request the test makes, and certifies with the seed it is handed. */
+    private class Mailbox(
+        private val host: String,
+        private val card: ByteArray,
+    ) : CertifySession {
+        val next = CompletableDeferred<HolderRequest>()
+
+        /** The identity whose key certified the device: the seed the approval was handed signs for it. */
+        var certifiedBy: String? = null
+
+        override fun code() = "K7PM-QX2D"
+
+        override fun identity() = "3f2a8c1d"
+
+        override fun host() = host
+
+        override fun expiresIn() = 600uL
+
+        override fun qr(): Qr? = null
+
+        override suspend fun nextRequest() = next.await()
+
+        override suspend fun answerEnds() = CompletableDeferred<Unit>().await()
+
+        var delivered = false
+
+        override suspend fun certify(
+            identitySeed: ByteArray,
+            manage: Boolean,
+            device: ByteArray,
+        ): Certified {
+            val asked = next.await()
+            check(device.contentEquals(asked.device)) { "certified a device not asked about" }
+            // A certificate the seed it was handed makes: which identity's it is says whose seed that was.
+            val minted = holderMint(identitySeed, card, "Tablet")
+            val info = certForDevice(minted.cert, card, minted.deviceSeed)
+            certifiedBy = info.fingerprint
+            return Certified(device, asked.name, manage, info.expires)
+        }
+
+        override suspend fun deliver() {
+            delivered = true
+        }
+
+        override fun mayHaveDelivered() = delivered
+
+        override suspend fun deny(reason: String) = Unit
+
+        var canceled = false
+
+        override fun cancel() {
+            canceled = true
+        }
+
+        override fun close() = Unit
     }
 
     private class Offline(

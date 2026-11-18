@@ -1,16 +1,22 @@
 package org.foggyden.hexline.identity
 
 import org.foggyden.hexline.core.HeldRestore
+import org.foggyden.hexline.core.HolderSession
+import org.foggyden.hexline.core.HolderSessionInterface
 import org.foggyden.hexline.core.HolderSetup
 import org.foggyden.hexline.core.HolderSetupInterface
 import org.foggyden.hexline.core.RecoveryCodeSetup
 import org.foggyden.hexline.core.RecoveryCodeSetupInterface
+import org.foggyden.hexline.core.RevokeReason
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.backupDelete
 import org.foggyden.hexline.core.backupPassphrase
 import org.foggyden.hexline.core.checkHolderRegistrar
+import org.foggyden.hexline.core.deviceFingerprintOf
 import org.foggyden.hexline.core.holderRenew
+import org.foggyden.hexline.core.openHolderSession
 import org.foggyden.hexline.core.restoreIdentityToHold
+import org.foggyden.hexline.core.revokeDevice
 
 /** A holder's setup the model drives (the core's, or a test's), closed to wipe it. */
 interface Setup :
@@ -72,6 +78,25 @@ interface HolderSetups {
     )
 
     fun newRecoveryCode(): NewRecoveryCode
+
+    /** A session at [mailbox] to certify another device for the identity whose card is [card]. */
+    suspend fun openSession(
+        mailbox: String,
+        card: ByteArray,
+    ): CertifySession
+
+    /** [device] revoked at [registrar] by the identity's key, for [reason], its certificate ending at [until]. */
+    suspend fun revoke(
+        identitySeed: ByteArray,
+        registrar: String,
+        device: ByteArray,
+        reason: RevokeReason,
+        until: Long,
+        thisDevice: ByteArray,
+    )
+
+    /** [device]'s key as a holder's prompt shows it. */
+    fun deviceFingerprint(device: ByteArray): String
 }
 
 object CoreHolderSetups : HolderSetups {
@@ -120,6 +145,29 @@ object CoreHolderSetups : HolderSetups {
     ) = backupDelete(identitySeed, registrar, kind)
 
     override fun newRecoveryCode(): NewRecoveryCode = CoreRecoveryCode(RecoveryCodeSetup())
+
+    override suspend fun openSession(
+        mailbox: String,
+        card: ByteArray,
+    ): CertifySession = CoreSession(openHolderSession(mailbox, card))
+
+    override suspend fun revoke(
+        identitySeed: ByteArray,
+        registrar: String,
+        device: ByteArray,
+        reason: RevokeReason,
+        until: Long,
+        thisDevice: ByteArray,
+    ) = revokeDevice(identitySeed, registrar, device, reason, until.toULong(), thisDevice)
+
+    override fun deviceFingerprint(device: ByteArray) = deviceFingerprintOf(device)
+}
+
+private class CoreSession(
+    private val session: HolderSession,
+) : CertifySession,
+    HolderSessionInterface by session {
+    override fun close() = session.close()
 }
 
 private class CoreRecoveryCode(
