@@ -32,7 +32,11 @@ class FakeSetups : HolderSetups {
     /** Every identity seed handed out, as handed: each the model's to wipe. */
     val handed = mutableListOf<ByteArray>()
 
-    override fun new(name: String) = FakeSetup(newIdentity(name), resumed = null).also { made += it }
+    /** The identity the next setup makes, in place of a new one. */
+    var nextIdentity: NewIdentity? = null
+
+    override fun new(name: String) =
+        FakeSetup(nextIdentity?.also { nextIdentity = null } ?: newIdentity(name), resumed = null).also { made += it }
 
     override fun resume(
         identitySeed: ByteArray,

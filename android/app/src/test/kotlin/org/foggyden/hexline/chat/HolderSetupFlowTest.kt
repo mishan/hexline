@@ -2,6 +2,7 @@ package org.foggyden.hexline.chat
 
 import androidx.lifecycle.ViewModelStore
 import org.foggyden.hexline.core.CoreException
+import org.foggyden.hexline.core.NewIdentity
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.newIdentity
 import org.foggyden.hexline.identity.Backed
@@ -589,6 +590,7 @@ class HolderSetupFlowTest : ViewModelHarness() {
 
     @Test
     fun aSetupCommittedWhileItsNewDeviceWasAskedForStaysCommitted() {
+        setups.nextIdentity = NewIdentity(CAROL_SEED, CAROL_CARD, CAROL)
         val vm = model()
         settle()
         val setup = throughTheCodes(vm)
@@ -596,12 +598,11 @@ class HolderSetupFlowTest : ViewModelHarness() {
         vm.holdSetup(stores.keys.authorizer())
         settle()
         val fingerprint = setup.fingerprint()
-        val card = keptIdentities().single().card
         vm.newDeviceHeld(
             fingerprint,
             stores.keys.authorizer {
-                // The commit a retry made, landing while the prompt is up.
-                outside { identities.committed(fingerprint, card, "carol2") }
+                // The commit a retry made, landing while the prompt is up, with the card the registrar gave back.
+                outside { identities.committed(fingerprint, CAROL_COMMITTED, "carol2") }
                 true
             },
         )
@@ -610,6 +611,21 @@ class HolderSetupFlowTest : ViewModelHarness() {
         val now = keptIdentities().single()
         assertFalse("committed, not unfinished again", now.unfinished)
         assertEquals("carol2", now.handle)
+        assertArrayEquals("the committed card", CAROL_COMMITTED, now.card)
+    }
+
+    private companion object {
+        // An identity and two cards of it, a commit's the later, made with hl-identity.
+        val CAROL_SEED = hex("0303030303030303030303030303030303030303030303030303030303030303")
+        const val CAROL = "prq8czx2ycxfwrpnttrp8bgp47am6c3r8tsaayw9fsrgj6dqcw4g"
+        val CAROL_CARD =
+            hex(
+                "a56176016373696758403ffc78c9c8e4fdb6a5af71d3ff062f5f506f9ca4b07e4b3d070d394200b59bcba28cf38a6a3f239a3bf1337f11e2ef35eb748ba808a797fac17e0e63f0c5cb09646e616d65654361726f6c67757064617465641a6b49d200686964656e746974795820ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+            )
+        val CAROL_COMMITTED =
+            hex(
+                "a5617601637369675840382b67d240417ae6a60bbc51bbba90d1ff501f0738c33e137406c1afa6ad55648e7627d49e3ec6adf348b3c09e070231ddbc63de0490a8af7a8132ff1fb7ac03646e616d65654361726f6c67757064617465641a6b49d264686964656e746974795820ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+            )
     }
 
     @Test
