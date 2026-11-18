@@ -620,7 +620,7 @@ impl Mailbox for Http {
 /// `cleartext_mailbox` elsewhere: over it anyone on the path could see the
 /// code and swap the request or the answer, leaving both bindings to the
 /// person's comparison alone (design §9).
-fn mailbox_base(mailbox: &str) -> Result<Url, CoreError> {
+pub(crate) fn mailbox_base(mailbox: &str) -> Result<Url, CoreError> {
     let text = mailbox.trim();
     let text = if text.contains("://") {
         text.to_owned()

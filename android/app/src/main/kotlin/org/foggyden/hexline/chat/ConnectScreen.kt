@@ -2,6 +2,7 @@ package org.foggyden.hexline.chat
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -52,12 +53,15 @@ import org.foggyden.hexline.core.HeldRenewal
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.coreVersion
 import org.foggyden.hexline.identity.BackingUp
+import org.foggyden.hexline.identity.Certifying
 import org.foggyden.hexline.identity.EnrollProblem
 import org.foggyden.hexline.identity.Enrolling
 import org.foggyden.hexline.identity.HolderRefusal
+import org.foggyden.hexline.identity.MintedDevice
 import org.foggyden.hexline.identity.Renewing
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
+import org.foggyden.hexline.identity.Revoking
 import org.foggyden.hexline.identity.SettingUp
 import org.foggyden.hexline.identity.Standing
 import org.foggyden.hexline.identity.StoredIdentity
@@ -102,8 +106,12 @@ fun ConnectFlow(
     setup: SetupActions? = null,
     renewing: Renewing = Renewing.Idle,
     backingUp: BackingUp = BackingUp.Idle,
+    certifying: Certifying = Certifying.Idle,
+    devices: List<MintedDevice> = emptyList(),
+    revoking: Revoking = Revoking.Idle,
 ) {
     var backupFor by rememberSaveable { mutableStateOf<String?>(null) }
+    var devicesFor by rememberSaveable { mutableStateOf<String?>(null) }
     val form = rememberSaveable(stateSaver = FormSaver) { mutableStateOf(ConnectForm()) }
     var setupOpen by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(settingUp) {
@@ -120,10 +128,21 @@ fun ConnectFlow(
     val opened = restoreFor
     // Open while the view model has a run under way: it holds the device.
     val backing = backupFor?.let { fp -> identities.find { it.fingerprint == fp } }
+    val certifier = devicesFor?.let { fp -> identities.find { it.fingerprint == fp && it.held } }
     if (setup != null && (setupOpen || settingUp !is SettingUp.Idle && settingUp !is SettingUp.Done)) {
         HolderSetupScreen(settingUp, setup) { setupOpen = false }
     } else if (setup != null && backing != null) {
         BackupScreen(backing.fingerprint, named(backing), backingUp, setup) { backupFor = null }
+    } else if (setup != null && certifier != null) {
+        DevicesScreen(
+            certifier.fingerprint,
+            named(certifier),
+            form.value.url.ifBlank { certifier.registrar.orEmpty() },
+            devices,
+            certifying,
+            revoking,
+            setup,
+        ) { devicesFor = null }
     } else if (enrolling.open) {
         val renewing = enrolling.renewing?.let { fp -> identities.find { it.fingerprint == fp } }
         EnrollScreen(
@@ -179,6 +198,7 @@ fun ConnectFlow(
             onSetup = setup?.let { { setupOpen = true } },
             onFinishSetup = setup?.let { s -> { fingerprint: String -> s.finish(fingerprint) } },
             onBackup = setup?.let { { fingerprint: String -> backupFor = fingerprint } },
+            onDevices = setup?.let { { fingerprint: String -> devicesFor = fingerprint } },
             renewing = renewing,
             onRenewSeen = { setup?.renewSeen() },
         )
@@ -206,6 +226,7 @@ private fun ConnectScreen(
     onSetup: (() -> Unit)?,
     onFinishSetup: ((fingerprint: String) -> Unit)?,
     onBackup: ((fingerprint: String) -> Unit)?,
+    onDevices: ((fingerprint: String) -> Unit)?,
     renewing: Renewing,
     onRenewSeen: () -> Unit,
 ) {
@@ -337,7 +358,8 @@ private fun ConnectScreen(
                         )
                         TextButton({ onFinishSetup(kept.fingerprint) }) { Text(stringResource(R.string.holder_finish)) }
                     }
-                    Row {
+                    // Wrapped, as a held identity's buttons are wider than a small phone.
+                    FlowRow {
                         // Offered whatever a server said: a new device is the way back.
                         if ((standing != Standing.Good || refusedHere != null) &&
                             (!kept.held || heldRenewal(kept, refusals) != HeldRenewal.NOTHING)
@@ -352,6 +374,9 @@ private fun ConnectScreen(
                         }
                         if (kept.held && onBackup != null) {
                             TextButton({ onBackup(kept.fingerprint) }) { Text(stringResource(R.string.backup)) }
+                        }
+                        if (kept.held && onDevices != null) {
+                            TextButton({ onDevices(kept.fingerprint) }) { Text(stringResource(R.string.devices)) }
                         }
                         TextButton({ deleting = kept }) { Text(stringResource(R.string.delete)) }
                     }
@@ -539,7 +564,7 @@ internal fun PasswordField(
 }
 
 @Composable
-private fun Checked(
+internal fun Checked(
     checked: Boolean,
     onChange: (Boolean) -> Unit,
     label: String,
@@ -817,7 +842,7 @@ private fun describe(failed: Enrolling.Failed): String =
     }
 
 /** A certificate's end, as a date the person reads. */
-private fun expiry(expires: ULong): String =
+internal fun expiry(expires: ULong): String =
     java.text.DateFormat
         .getDateInstance(java.text.DateFormat.MEDIUM)
         .format(java.util.Date(expires.toLong() * 1000))

@@ -94,38 +94,52 @@ impl Server {
 
     /// As [`Server::start`], with detached sessions kept `grace` seconds.
     pub async fn with_grace(accounts: &[&str], grace: u64) -> Server {
-        Server::launch(accounts, grace, None, None).await
+        Server::launch(accounts, grace, None, None, None).await
     }
 
     /// As [`Server::with_grace`], taking identity logins at the host it
     /// listens on and its proxy's: from any identity, registrar or none,
     /// made an account of its own when the client asks for one.
     pub async fn with_identity(accounts: &[&str], grace: u64) -> Server {
-        Server::launch(accounts, grace, Some(("allow", "create")), None).await
+        Server::launch(accounts, grace, Some(("allow", "create")), None, None).await
     }
 
     /// As [`Server::with_identity`], and a registrar at host `127.0.0.1`
     /// that anyone may register a handle at and that keeps envelopes.
     pub async fn with_registrar(accounts: &[&str]) -> Server {
-        Server::launch(accounts, 300, Some(("allow", "create")), Some(&[])).await
+        Server::launch(accounts, 300, Some(("allow", "create")), Some(&[]), None).await
+    }
+
+    /// As [`Server::with_registrar`], and a web client, on the server's own
+    /// origin with `own_origin`, a holder draws its QR code for only there
+    /// (enrollment §5.6).
+    pub async fn with_registrar_and_web(own_origin: bool) -> Server {
+        Server::launch(
+            &[],
+            300,
+            Some(("allow", "create")),
+            Some(&[]),
+            Some(own_origin),
+        )
+        .await
     }
 
     /// As [`Server::with_registrar`], its registrar taking a registration
     /// only with one of `invites`.
     pub async fn with_registrar_invites(invites: &[&str]) -> Server {
-        Server::launch(&[], 300, Some(("allow", "create")), Some(invites)).await
+        Server::launch(&[], 300, Some(("allow", "create")), Some(invites), None).await
     }
 
     /// As [`Server::with_registrar`], under the default policy for an
     /// identity no registrar vouches for: a guest.
     pub async fn with_registrar_vouching(accounts: &[&str]) -> Server {
-        Server::launch(accounts, 300, Some(("guest", "create")), Some(&[])).await
+        Server::launch(accounts, 300, Some(("guest", "create")), Some(&[]), None).await
     }
 
     /// As [`Server::with_identity`], under the default policy: an identity
     /// no registrar vouches for, or one with no account, logs in as a guest.
     pub async fn with_guest_identity(accounts: &[&str]) -> Server {
-        Server::launch(accounts, 300, Some(("guest", "guest")), None).await
+        Server::launch(accounts, 300, Some(("guest", "guest")), None, None).await
     }
 
     /// `identity` is the `unattested` and `new_accounts` policies.
@@ -134,13 +148,15 @@ impl Server {
         grace: u64,
         identity: Option<(&str, &str)>,
         registrar: Option<&[&str]>,
+        web: Option<bool>,
     ) -> Server {
         // A port found free is free only until it is bound: another test's
         // server may take it first. Each try is on fresh ports, and taken
         // only once the server there is this one.
         for _ in 0..5 {
             let ng = free_port();
-            if let Some(server) = Server::try_launch(accounts, grace, identity, registrar, ng).await
+            if let Some(server) =
+                Server::try_launch(accounts, grace, identity, registrar, web, ng).await
             {
                 return server;
             }
@@ -152,7 +168,7 @@ impl Server {
     /// another test may have taken the same port: none if this one's hxd
     /// is not the one that answers there.
     pub async fn try_on(ng: u16) -> Option<Server> {
-        Server::try_launch(&[], 300, None, None, ng).await
+        Server::try_launch(&[], 300, None, None, None, ng).await
     }
 
     async fn try_launch(
@@ -161,6 +177,7 @@ impl Server {
         identity: Option<(&str, &str)>,
         // The invites it takes; none, and it takes anyone.
         registrar: Option<&[&str]>,
+        web: Option<bool>,
         ng: u16,
     ) -> Option<Server> {
         let bin = std::env::var("HXD_BIN").expect(
@@ -195,13 +212,21 @@ impl Server {
                 match identity {
                     Some((unattested, new_accounts)) => format!(
                         "[identity]\nhosts = [\"127.0.0.1:{ng}\", \"127.0.0.1:{proxy_port}\"]\n\
-                         unattested = \"{unattested}\"\nnew_accounts = \"{new_accounts}\"\n{}",
+                         unattested = \"{unattested}\"\nnew_accounts = \"{new_accounts}\"\n{}{}",
+                        match web {
+                            Some(true) => format!("web = \"http://127.0.0.1:{ng}/app/\"\n"),
+                            Some(false) => "web = \"https://web.example/app/\"\n".into(),
+                            None => String::new(),
+                        },
                         // Its own registrar's attestations, on the key that
-                        // registrar publishes, fetched where it listens.
+                        // registrar publishes, fetched where it listens, and
+                        // its records fetched again a second on, so a test
+                        // sees a revocation without waiting an hour.
                         if registrar.is_some() {
                             format!(
                                 "trusted_registrars = [\"127.0.0.1\"]\n\
-                                 registrar_urls = {{ \"127.0.0.1\" = \"http://127.0.0.1:{ng}\" }}\n"
+                                 registrar_urls = {{ \"127.0.0.1\" = \"http://127.0.0.1:{ng}\" }}\n\
+                                 revocation_max_age = 1\n"
                             )
                         } else {
                             String::new()

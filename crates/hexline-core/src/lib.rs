@@ -6,6 +6,7 @@ mod backup;
 mod connection;
 mod enroll;
 mod holder;
+mod holder_session;
 mod identity;
 mod model;
 mod names;
@@ -23,6 +24,10 @@ pub use enroll::{card_name, enrollment_code, newer_card, renewal_due, Enrolled, 
 pub use holder::{
     check_device_name, check_holder_registrar, held_renewal, holder_mint, holder_renew,
     new_identity, HeldRenewal, HolderCommitted, HolderMinted, HolderSetup, NewIdentity,
+};
+pub use holder_session::{
+    device_fingerprint_of, open_holder_session, revoke_device, Certified, HolderRequest,
+    HolderSession, Qr,
 };
 pub use identity::{
     cert_for_device, cert_info, cert_time, new_device, CertInfo, CertTime, NewDevice,

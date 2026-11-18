@@ -1,18 +1,24 @@
 package org.foggyden.hexline.chat
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.yield
+import org.foggyden.hexline.core.Certified
 import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.HeldRestore
 import org.foggyden.hexline.core.HolderCommitted
+import org.foggyden.hexline.core.HolderRequest
 import org.foggyden.hexline.core.NewIdentity
 import org.foggyden.hexline.core.Restored
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.certForDevice
+import org.foggyden.hexline.core.deviceFingerprintOf
 import org.foggyden.hexline.core.holderMint
 import org.foggyden.hexline.core.holderRenew
 import org.foggyden.hexline.core.newIdentity
+import org.foggyden.hexline.identity.CertifySession
 import org.foggyden.hexline.identity.HolderSetups
 import org.foggyden.hexline.identity.NewRecoveryCode
+import org.foggyden.hexline.identity.RevokeReason
 import org.foggyden.hexline.identity.Setup
 
 /**
@@ -122,6 +128,107 @@ class FakeSetups : HolderSetups {
     val newCodes = mutableListOf<FakeRecoveryCode>()
 
     override fun newRecoveryCode() = FakeRecoveryCode().also { newCodes += it }
+
+    val sessions = mutableListOf<FakeSession>()
+
+    /** What the next session's opening throws, if anything. */
+    var openFails: CoreException? = null
+
+    override suspend fun openSession(
+        mailbox: String,
+        card: ByteArray,
+    ): CertifySession {
+        openFails?.let {
+            openFails = null
+            throw it
+        }
+        return FakeSession(mailbox, card).also { sessions += it }
+    }
+
+    class Revocation(
+        val seed: ByteArray,
+        val registrar: String,
+        val device: ByteArray,
+        val reason: RevokeReason,
+        val until: Long,
+    )
+
+    val revocations = mutableListOf<Revocation>()
+
+    override suspend fun revoke(
+        identitySeed: ByteArray,
+        registrar: String,
+        device: ByteArray,
+        reason: RevokeReason,
+        until: Long,
+        thisDevice: ByteArray,
+    ) {
+        yield()
+        if (device.contentEquals(thisDevice)) throw CoreException.Refused("own_device", "")
+        revocations += Revocation(identitySeed, registrar, device, reason, until)
+    }
+
+    override fun deviceFingerprint(device: ByteArray) = deviceFingerprintOf(device)
+
+    /** A session at a mailbox: what a device asks it, and how it ends, the test's. */
+    inner class FakeSession(
+        val mailbox: String,
+        val card: ByteArray,
+    ) : CertifySession {
+        /** The request a device makes, or what the mailbox ends the wait with. */
+        val next = CompletableDeferred<HolderRequest>()
+
+        /** Each approval's seed, as handed (the model's to wipe), and whether it lets the device manage. */
+        val approvals = mutableListOf<Pair<ByteArray, Boolean>>()
+        val denials = mutableListOf<String>()
+        var canceled = false
+        var closed = false
+        private var asked: HolderRequest? = null
+
+        /** The device certified: its key and when its certificate ends. */
+        val device = ByteArray(32) { 7 }
+        val expires = 2_000_000_000uL
+
+        override fun code() = "K7PM-QX2D"
+
+        override fun identity() = "3f2a8c1d"
+
+        override fun host() = mailbox
+
+        override fun expiresIn() = 600uL
+
+        override fun qr() = null
+
+        override suspend fun nextRequest(): HolderRequest {
+            check(!closed) { "a closed session called" }
+            return next.await().also { asked = it }
+        }
+
+        override suspend fun approve(
+            identitySeed: ByteArray,
+            manage: Boolean,
+            device: ByteArray,
+        ): Certified {
+            yield()
+            if (!device.contentEquals(checkNotNull(asked).device)) throw CoreException.Refused("not_asked", "")
+            approvals += identitySeed to manage
+            return Certified(device, checkNotNull(asked).name, manage, expires)
+        }
+
+        override suspend fun deny(reason: String) {
+            yield()
+            denials += reason
+        }
+
+        override fun cancel() {
+            canceled = true
+            if (!next.isCompleted) next.completeExceptionally(CoreException.Refused("canceled", ""))
+        }
+
+        override fun close() {
+            closed = true
+        }
+    }
 
     inner class FakeRecoveryCode : NewRecoveryCode {
         val code = "NEWRC-0DE00-00000-00002"

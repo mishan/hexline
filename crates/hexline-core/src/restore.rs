@@ -122,7 +122,7 @@ async fn restore(
     };
     let http = auth::http_client(base.as_str(), None)?;
     let reg = discovered(&http, &base).await?;
-    let envelopes = endpoint(&base, &reg.envelopes)?;
+    let envelopes = endpoint(&base, reg.envelopes()?)?;
     let register = endpoint(&base, &reg.register)?;
 
     // The salt first: the registrar answers every handle with one.
@@ -271,8 +271,18 @@ pub(crate) struct Registrar {
     pub(crate) host: String,
     /// Its key, and any it is retiring: what an attestation may be signed by.
     pub(crate) keys: Vec<[u8; 32]>,
-    pub(crate) envelopes: String,
+    /// None where it keeps no envelopes: refused `no_envelopes` by [`Registrar::envelopes`].
+    envelopes: Option<String>,
     pub(crate) register: String,
+    pub(crate) records: String,
+}
+
+impl Registrar {
+    pub(crate) fn envelopes(&self) -> Result<&str, CoreError> {
+        self.envelopes
+            .as_deref()
+            .ok_or_else(|| refused("no_envelopes"))
+    }
 }
 
 /// The registrar, from its discovery document.
@@ -323,10 +333,11 @@ fn registrar_of(doc: &Value, base: &Url) -> Result<Registrar, CoreError> {
         host: text(block.get("host"))
             .filter(|host| *host == base.host_str().unwrap_or_default())
             .ok_or_else(|| refused("not_a_registrar"))?,
-        envelopes: text(endpoints.and_then(|e| e.get("envelopes")))
-            .ok_or_else(|| refused("no_envelopes"))?,
+        envelopes: text(endpoints.and_then(|e| e.get("envelopes"))),
         register: text(endpoints.and_then(|e| e.get("register")))
             .ok_or_else(|| refused("not_a_registrar"))?,
+        records: text(endpoints.and_then(|e| e.get("records")))
+            .unwrap_or_else(|| "/registrar/records".into()),
         keys,
     })
 }
@@ -467,6 +478,13 @@ pub(crate) fn bytes(reply: &Value, key: &str) -> Result<Vec<u8>, CoreError> {
         .ok_or_else(|| protocol(&format!("the reply's {key} does not read")))
 }
 
+pub(crate) fn unb64(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s)
+        .ok()
+}
+
 pub(crate) fn b64(b: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
@@ -550,6 +568,19 @@ mod tests {
             let got = registrar_of(&doc(named), &Url::parse(reached).unwrap());
             assert_eq!(got.is_ok(), ours, "{named} at {reached}");
         }
+    }
+
+    #[test]
+    fn a_registrar_keeping_no_envelopes_takes_records_and_refuses_backups() {
+        let doc = json!({ "registrar": {
+            "host": "reg.example",
+            "endpoints": { "register": "/registrar/register" },
+        } });
+        let reg = registrar_of(&doc, &Url::parse("https://reg.example").unwrap()).unwrap();
+        assert_eq!(reg.records, "/registrar/records");
+        assert!(
+            matches!(reg.envelopes(), Err(CoreError::Refused { code, .. }) if code == "no_envelopes")
+        );
     }
 
     #[test]

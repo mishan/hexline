@@ -6,11 +6,13 @@ import android.util.Base64
 import org.foggyden.hexline.core.CertInfo
 import org.foggyden.hexline.core.certForDevice
 import org.foggyden.hexline.core.certInfo
+import org.foggyden.hexline.core.deviceFingerprintOf
 import org.foggyden.hexline.core.shortHash
 import org.foggyden.hexline.secrets.SecretStore
 import org.foggyden.hexline.secrets.SecretUnavailable
 import org.foggyden.hexline.secrets.SecretUnreadable
 import org.foggyden.hexline.secrets.Secrets
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileNotFoundException
@@ -275,10 +277,94 @@ class Identities(
             StoredIdentity(handle, stored.cert, card, info, stored.registrar, stored.mailbox).also { write(file, it) }
         }
 
+    /**
+     * The devices [fingerprint]'s key certified on this phone, as it keeps
+     * them, its own device apart: public keys and names, nothing secret. A
+     * list that does not read is moved aside, kept for whoever can make
+     * sense of it, rather than written over.
+     */
+    fun minted(fingerprint: String): List<MintedDevice> =
+        synchronized(LOCK) {
+            val file = mintedFile(fingerprint)
+            val bytes =
+                try {
+                    AtomicFile(file).readFully()
+                } catch (_: FileNotFoundException) {
+                    return emptyList()
+                }
+            try {
+                val list = JSONArray(String(bytes))
+                (0 until list.length()).map { i ->
+                    val json = list.getJSONObject(i)
+                    val device = unb64(json.getString("device"))
+                    MintedDevice(
+                        device,
+                        deviceFingerprintOf(device),
+                        json.optString("name").ifEmpty { null },
+                        json.getLong("expires"),
+                        json.optBoolean("manage"),
+                        json.optBoolean("revoked"),
+                    )
+                }
+            } catch (_: Exception) {
+                File(dir, file.name + ".unread").writeBytes(bytes)
+                AtomicFile(file).delete()
+                emptyList()
+            }
+        }
+
+    /** [device] certified by [fingerprint]'s key, in place of any it certified before for the same key. */
+    fun minted(
+        fingerprint: String,
+        device: MintedDevice,
+    ): Unit =
+        synchronized(LOCK) {
+            writeMinted(fingerprint, minted(fingerprint).filter { !it.device.contentEquals(device.device) } + device)
+        }
+
+    /** [device], certified by [fingerprint]'s key, revoked at its registrar. */
+    fun revokedMinted(
+        fingerprint: String,
+        device: ByteArray,
+    ): Unit =
+        synchronized(LOCK) {
+            writeMinted(
+                fingerprint,
+                minted(fingerprint).map {
+                    if (it.device.contentEquals(device)) {
+                        MintedDevice(it.device, it.fingerprint, it.name, it.expires, it.canManage, revoked = true)
+                    } else {
+                        it
+                    }
+                },
+            )
+        }
+
+    private fun writeMinted(
+        fingerprint: String,
+        devices: List<MintedDevice>,
+    ) {
+        val list = JSONArray()
+        for (d in devices) {
+            list.put(
+                JSONObject()
+                    .put("device", b64(d.device))
+                    .put("expires", d.expires)
+                    .apply {
+                        d.name?.let { put("name", it) }
+                        if (d.canManage) put("manage", true)
+                        if (d.revoked) put("revoked", true)
+                    },
+            )
+        }
+        writeAtomically(mintedFile(fingerprint), list.toString().toByteArray())
+    }
+
     fun delete(fingerprint: String): Unit =
         synchronized(LOCK) {
             val file = file(fingerprint)
             val stored = load(file)
+            AtomicFile(mintedFile(fingerprint)).delete()
             AtomicFile(file).delete()
             stored?.let { secrets.delete(secretName(it.fingerprint, it.info.device)) }
         }
@@ -338,10 +424,17 @@ class Identities(
                     if (stored.unfinished) put("unfinished", true)
                     if (stored.unrecoverable) put("unrecoverable", true)
                 }
+        writeAtomically(file, json.toString().toByteArray())
+    }
+
+    private fun writeAtomically(
+        file: File,
+        bytes: ByteArray,
+    ) {
         val atomic = AtomicFile(file)
         val out = atomic.startWrite()
         try {
-            out.write(json.toString().toByteArray())
+            out.write(bytes)
             atomic.finishWrite(out)
         } catch (e: Exception) {
             atomic.failWrite(out)
@@ -351,6 +444,8 @@ class Identities(
 
     /** Names from the identity, and the device: never anything typed. */
     private fun file(fingerprint: String) = File(dir, "identity-" + shortHash(fingerprint.toByteArray()))
+
+    private fun mintedFile(fingerprint: String) = File(dir, "minted-" + shortHash(fingerprint.toByteArray()))
 
     private fun secretName(
         fingerprint: String,
