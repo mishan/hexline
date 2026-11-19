@@ -286,7 +286,7 @@ class ChatViewModel internal constructor(
             val wasConnecting = before?.link == Link.Connecting
             val kept = updates.any { it is CoreUpdate.SessionKept }
             // A login after a lapse, refused by the server.
-            val refused = updates.firstNotNullOfOrNull { (it as? CoreUpdate.Refused)?.code }
+            val refused = updates.firstNotNullOfOrNull { it as? CoreUpdate.Refused }
             // Kicked, replaced, refused after a lapse, or a new login made by
             // the core that will not survive one: nothing will resume it.
             // Forgotten from here, so a screen that goes before the main
@@ -301,7 +301,7 @@ class ChatViewModel internal constructor(
                 later { servers.forgetSession(server, at) }
             }
             viewModelScope.launch {
-                if (refused != null) markRefused(server, device, refused, since)
+                if (refused != null) markRefused(server, device, refused.code, since, refused.successor)
                 if (sink !== this@Sink) return@launch
                 if (kept) save()
                 // The first page waits for the roster that makes the link live.
@@ -350,6 +350,12 @@ class ChatViewModel internal constructor(
         viewModelScope.launch {
             val found =
                 withContext(store) {
+                    stored {
+                        for ((from, successor) in identities.unsentRotations()) {
+                            held.forget(successor)
+                            identities.discardRotation(from, successor)
+                        }
+                    }
                     publishIdentities()
                     stored { identities.sweepOrphans() }
                     held.sweep()
@@ -1678,7 +1684,8 @@ class ChatViewModel internal constructor(
 
     /** Lets go of each held identity whose key went with the screen lock; on the store queue. */
     private fun demoteHeld() {
-        val kept = identities.list()
+        // A successor whose key went mid-rotation is held again from its code, not demoted.
+        val kept = identities.list().filter { it.rotatingFrom == null }
         val lost = held.demoteLost(kept.map { it.fingerprint })
         // Its key gone before it was committed, a setup has nothing left to finish or recover.
         for (identity in kept) if (identity.unfinished && identity.fingerprint in lost) identities.unrecoverable(identity.fingerprint)
@@ -1688,7 +1695,7 @@ class ChatViewModel internal constructor(
 
     // Called on the store queue alone, so a slower read is never shown over a newer one.
     private fun publishIdentities() {
-        kept.value = identities.list().map { if (held.isHeld(it.fingerprint)) it.held() else it }
+        kept.value = identities.list().filter { it.rotatingFrom == null }.map { if (held.isHeld(it.fingerprint)) it.held() else it }
         keptRead.value = true
     }
 
@@ -1703,17 +1710,18 @@ class ChatViewModel internal constructor(
     /**
      * Keeps [server]'s refusal of [device] when only a new device answers
      * it: that device is not offered to sign in there again, and is
-     * everywhere else.
+     * everywhere else, with the [successor] a `rotated` one named.
      */
     private fun markRefused(
         server: Server,
         device: ByteArray?,
         code: String,
         since: Long,
+        successor: String?,
     ) {
         if (server.signIn !is SignIn.Identity || device == null || !refusalLasts(code)) return
         later {
-            servers.markRefused(server, device, code, since)
+            servers.markRefused(server, device, code, since, successor)
             publishRefusals()
         }
     }
@@ -1756,7 +1764,7 @@ class ChatViewModel internal constructor(
             // and its connection, closed, would take no call.
             if (!ask.live) throw CancellationException("let go of")
             proving(stored.info.device)
-            return conn.loginIdentity(DeviceIdentity(mine, stored.cert, stored.card), create, link, saved)
+            return conn.loginIdentity(DeviceIdentity(mine, stored.cert, stored.card, stored.rotation), create, link, saved)
         } finally {
             seed?.fill(0)
         }
@@ -1831,11 +1839,12 @@ class ChatViewModel internal constructor(
                 if (!ask.live || sink !== mine) return@launch
                 state.update { it.copy(link = Link.Ended(Why.KeyLocked)) }
             } catch (e: CoreException) {
-                val code = (e as? CoreException.Refused)?.code
+                val refusal = e as? CoreException.Refused
+                val code = refusal?.code
                 // Kept whether or not this is still the connection: the
                 // server said it of this device, and a forget since is
                 // honored by the generation.
-                if (code != null) markRefused(to, mine.device, code, since)
+                if (refusal != null) markRefused(to, mine.device, refusal.code, since, refusal.successor)
                 if (!ask.live) return@launch
                 later {
                     // Refused for good: the saved session is not coming back.

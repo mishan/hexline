@@ -44,7 +44,7 @@ class HolderSetupKeptTest {
             }
         }
 
-    private fun identities() = Identities(app, secrets, dir)
+    private fun identities() = Identities(app, secrets, dir, syncDir = {})
 
     /** A holder's device kept as a setup leaves it before its commit. */
     private fun keptUnfinished(): Pair<NewIdentity, StoredIdentity> {

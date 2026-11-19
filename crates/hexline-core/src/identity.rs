@@ -156,10 +156,12 @@ pub(crate) fn in_time(cert: &[u8]) -> Result<(), CoreError> {
         CertTime::Expired => Err(CoreError::Refused {
             code: "cert_expired".into(),
             detail: "this device's certificate has expired".into(),
+            successor: None,
         }),
         CertTime::NotYetValid => Err(CoreError::Refused {
             code: "cert_not_yet_valid".into(),
             detail: "this device's certificate is not valid yet: check the phone's clock".into(),
+            successor: None,
         }),
     }
 }

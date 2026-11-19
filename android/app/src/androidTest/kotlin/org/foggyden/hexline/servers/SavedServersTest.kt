@@ -161,6 +161,54 @@ class SavedServersTest {
     }
 
     @Test
+    fun aRotatedRefusalKeepsTheKeyItNamedBesideItsCode() {
+        val a = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
+        val (device, other) = ByteArray(32) { 1 } to ByteArray(32) { 2 }
+        servers().remember(a, null)
+        servers().markRefused(a, device, "rotated", successor = "fp-y")
+        servers().markRefused(a, other, "revoked")
+        assertEquals(listOf("rotated", "revoked"), listOf(servers().refused(a, device), servers().refused(a, other)))
+        assertEquals(listOf("fp-y", null), listOf(servers().successor(a, device), servers().successor(a, other)))
+        assertEquals(setOf("rotated", "revoked"), servers().refusals().values.toSet())
+    }
+
+    @Test
+    fun aServerAlreadySignedInToAsTheSuccessorIsListedOnce() {
+        val old = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
+        val new = old.copy(signIn = SignIn.Identity("fp-y"))
+        servers().remember(old, null)
+        servers().remember(new, null)
+        servers().repoint("fp-x", "fp-y")
+        assertEquals(listOf(new), servers().all())
+    }
+
+    @Test
+    fun aRotatedIdentitysServersSignInAsItsSuccessorInTheirPlaceAndForgetWhatTheyKept() {
+        val a = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
+        val b = Server("wss://b.example/ng", "bob")
+        val c = Server("wss://c.example/ng", null, SignIn.Identity("fp-x"))
+        val d = Server("wss://d.example/ng", null, SignIn.Identity("fp-z"))
+        val device = ByteArray(32) { 1 }
+        for (s in listOf(d, c, b, a)) {
+            servers().remember(s, null)
+            servers().keepSession(s, byteArrayOf(1))
+            servers().markRefused(s, device, "rotated", successor = "fp-y")
+        }
+        servers().askedToLink(a, true)
+        val since = servers().generation()
+        servers().repoint("fp-x", "fp-y")
+        val moved = { s: Server -> s.copy(signIn = SignIn.Identity("fp-y")) }
+        assertEquals(listOf(moved(a), b, moved(c), d), servers().all())
+        assertEquals("their sessions", listOf(null, null), listOf(servers().session(a), servers().session(c)))
+        assertEquals("their refusals", listOf(null, null), listOf(servers().refused(a, device), servers().refused(c, device)))
+        assertFalse("their link asked", servers().linkAsked(a))
+        assertEquals("the rest", listOf("rotated", "rotated"), listOf(servers().refused(b, device), servers().refused(d, device)))
+        assertArrayEquals(byteArrayOf(1), servers().session(d))
+        assertFalse("a login begun before is not kept", servers().keepSession(a, byteArrayOf(2), since))
+        assertFalse("nor its server brought back", servers().remember(a, null, since))
+    }
+
+    @Test
     fun aDevicesRefusalsGoWithItAndAnotherDevicesStay() {
         val a = Server("wss://a.example/ng", null, SignIn.Identity("fp-x"))
         val b = Server("wss://b.example/ng", null, SignIn.Identity("fp-x"))

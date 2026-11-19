@@ -92,7 +92,7 @@ class HolderSetupFlowTest : ViewModelHarness() {
 
     @Test
     fun aRegistrarThatCannotKeepTheRecoveryCodeIsToldBeforeAnyCodeIsMade() {
-        setups.checkFails = CoreException.Refused("no_envelopes", "")
+        setups.checkFails = CoreException.Refused("no_envelopes", "", null)
         val vm = model()
         settle()
         vm.startHolderSetup("reg.example", "carol", null, "Pixel")
@@ -119,7 +119,7 @@ class HolderSetupFlowTest : ViewModelHarness() {
         val vm = model()
         settle()
         val setup = throughTheCodes(vm)
-        setup.answers += CoreException.Refused("handle_taken", "")
+        setup.answers += CoreException.Refused("handle_taken", "", null)
         vm.holdSetup(stores.keys.authorizer())
         settle()
         assertEquals(SettingUp.Failed(SetupProblem.HandleTaken, "carol", fixed = false), vm.holderSetup.value)
@@ -136,7 +136,7 @@ class HolderSetupFlowTest : ViewModelHarness() {
         val vm = model()
         settle()
         val setup = throughTheCodes(vm)
-        setup.answers += CoreException.Refused("registered_not_backed_up", "")
+        setup.answers += CoreException.Refused("registered_not_backed_up", "", null)
         vm.holdSetup(stores.keys.authorizer())
         settle()
         assertEquals(SettingUp.Failed(SetupProblem.NotBackedUp, "carol", fixed = true), vm.holderSetup.value)
@@ -334,7 +334,7 @@ class HolderSetupFlowTest : ViewModelHarness() {
         vm.finishSetup(first.fingerprint(), stores.keys.authorizer())
         settle()
         val resumed = setups.made.last()
-        resumed.answers += CoreException.Refused("handle_taken", "")
+        resumed.answers += CoreException.Refused("handle_taken", "", null)
         vm.recoveryWritten()
         vm.confirmRecovery(bytes(resumed.recovery))
         settle()

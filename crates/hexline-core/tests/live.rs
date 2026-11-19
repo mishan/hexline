@@ -733,6 +733,7 @@ fn identity(name: &str) -> (DeviceIdentity, String) {
             device_seed: d.key.seed().to_vec(),
             cert: d.cert,
             card: d.card,
+            rotation: None,
         },
         fingerprint,
     )
@@ -827,6 +828,7 @@ async fn a_certificate_outside_its_time_is_refused_before_anything_is_sent() {
             device_seed: key.seed().to_vec(),
             cert,
             card,
+            rotation: None,
         };
         let refused = alice.login_identity(device, true, None, None).await;
         assert!(
@@ -846,6 +848,7 @@ async fn a_saved_session_is_not_resumed_with_a_certificate_past_its_time() {
         device_seed: d.key.seed().to_vec(),
         cert: d.cert.clone(),
         card: d.card.clone(),
+        rotation: None,
     };
     alice
         .login_identity(device, true, None, None)
@@ -870,6 +873,7 @@ async fn a_saved_session_is_not_resumed_with_a_certificate_past_its_time() {
         device_seed: key.seed().to_vec(),
         cert: lapsed,
         card: d.card.clone(),
+        rotation: None,
     };
     let refused = again.login_identity(device, true, None, Some(saved)).await;
     assert!(
@@ -890,6 +894,7 @@ async fn a_device_revoked_while_its_link_was_down_is_refused_and_not_tried_again
         device_seed: d.key.seed().to_vec(),
         cert: d.cert.clone(),
         card: d.card.clone(),
+        rotation: None,
     };
     alice
         .login_identity(again(), true, None, None)
@@ -918,7 +923,7 @@ async fn a_device_revoked_while_its_link_was_down_is_refused_and_not_tried_again
     sink.heard_within(
         10,
         "the refusal",
-        |u| matches!(u, CoreUpdate::Refused { code } if code == "revoked"),
+        |u| matches!(u, CoreUpdate::Refused { code, .. } if code == "revoked"),
     )
     .await;
     sink.heard("the end", |u| matches!(u, CoreUpdate::Closed { .. }))
@@ -975,6 +980,7 @@ async fn an_identity_given_an_accounts_password_is_linked_to_it_and_lands_on_it_
         device_seed: d.key.seed().to_vec(),
         cert: d.cert.clone(),
         card: d.card.clone(),
+        rotation: None,
     };
     let link = |password: &str| ClassicLogin {
         login: "bob".into(),
@@ -1216,6 +1222,7 @@ async fn an_identity_kept_at_a_registrar_is_restored_to_a_device_that_logs_in() 
             device_seed: restored.seed,
             cert: restored.cert,
             card: restored.card,
+            rotation: None,
         };
         let login = conn.login_identity(device, true, None, None).await.unwrap();
         assert_eq!(login.fingerprint, Some(fingerprint));
@@ -1311,6 +1318,7 @@ async fn a_restored_device_is_vouched_for_where_unattested_identities_are_guests
         device_seed: restored.seed,
         cert: restored.cert,
         card: restored.card,
+        rotation: None,
     };
     let info = conn.login_identity(device, true, None, None).await.unwrap();
     assert_eq!(info.outcome.as_deref(), Some("created"), "{info:?}");
@@ -1359,6 +1367,7 @@ async fn a_device_a_holder_certifies_by_its_code_logs_in_as_the_identity() {
         device_seed: phone.seed(),
         cert: enrolled.cert,
         card: enrolled.card,
+        rotation: None,
     };
     let login = conn.login_identity(device, true, None, None).await.unwrap();
     assert_eq!(login.fingerprint, Some(fingerprint.to_string()));
@@ -1380,7 +1389,7 @@ async fn a_holders_no_and_a_wrong_code_are_told_apart() {
     let asked = holder.asked(&session).await;
     holder.deny(&session, &asked, "not_mine").await;
     match asking.await.unwrap().unwrap_err() {
-        CoreError::Refused { code, detail } => {
+        CoreError::Refused { code, detail, .. } => {
             assert_eq!((code.as_str(), detail.as_str()), ("denied", "not_mine"))
         }
         other => panic!("{other:?}"),
@@ -1757,6 +1766,7 @@ async fn a_holder_made_on_the_phone_logs_in_attested_and_is_restored_by_its_reco
         device_seed: minted.device_seed,
         cert: minted.cert,
         card: committed.card,
+        rotation: None,
     };
     let login = conn.login_identity(device, true, None, None).await.unwrap();
     assert_eq!(login.fingerprint, Some(fingerprint));
@@ -2216,6 +2226,7 @@ async fn a_holders_renewed_certificate_logs_its_device_in() {
         device_seed: minted.device_seed,
         cert,
         card,
+        rotation: None,
     };
     assert!(conn
         .login_identity(device, true, None, None)
@@ -2353,6 +2364,7 @@ async fn a_phone_holding_its_identity_enrolls_another_device_by_its_code() {
         device_seed: phone.seed(),
         cert: enrolled.cert,
         card: enrolled.card,
+        rotation: None,
     };
     assert!(conn
         .login_identity(device, true, None, None)
@@ -2376,7 +2388,7 @@ async fn a_device_the_holder_says_no_to_is_told_why() {
     let (session, _, asking) = asked_by(&server, &card, &phone).await;
     session.deny("not mine".into()).await.unwrap();
     match asking.await.unwrap() {
-        Err(CoreError::Refused { code, detail }) => {
+        Err(CoreError::Refused { code, detail, .. }) => {
             assert_eq!(code, "denied");
             assert!(detail.contains("not mine"), "{detail}");
         }
@@ -2425,6 +2437,7 @@ async fn a_device_this_phone_certified_is_revoked_and_its_login_refused() {
         device_seed: phone.seed(),
         cert: enrolled.cert.clone(),
         card: enrolled.card.clone(),
+        rotation: None,
     };
     // Admitted before the revocation, its records fetched and held.
     let before = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));

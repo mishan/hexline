@@ -158,11 +158,11 @@ class ChatViewModelInterleavingTest : ViewModelHarness() {
             /** The core's own refusals: an answer out of its time, and a renewal's from another identity or due again. */
             override fun refuses(got: Enrolled): CoreException? {
                 if (now + SKEW < got.info.issued.toLong() || now > got.info.expires.toLong() + SKEW) {
-                    return CoreException.Refused("cert_expired", "")
+                    return CoreException.Refused("cert_expired", "", null)
                 }
                 val prev = renewing?.second ?: return null
-                if (identityOf(prev) != got.fingerprint) return CoreException.Refused("wrong_identity", "")
-                if (renewalDue(got.info.issued, got.info.expires, now.toULong())) return CoreException.Refused("short_renewal", "")
+                if (identityOf(prev) != got.fingerprint) return CoreException.Refused("wrong_identity", "", null)
+                if (renewalDue(got.info.issued, got.info.expires, now.toULong())) return CoreException.Refused("short_renewal", "", null)
                 return null
             }
         }
@@ -281,7 +281,7 @@ class ChatViewModelInterleavingTest : ViewModelHarness() {
                                 "server_full",
                             ).random(rnd)
                         if (!keepsSession(code)) c.resumedWith?.let { dead += hexOf(it) }
-                        core { c.answer.completeExceptionally(CoreException.Refused(code, "")) }
+                        core { c.answer.completeExceptionally(CoreException.Refused(code, "", null)) }
                         "refused $code"
                     }
                     6 -> {
@@ -390,8 +390,8 @@ class ChatViewModelInterleavingTest : ViewModelHarness() {
                         core { e.answer.complete(enrolled(CERT3, CARD3)) }
                         "certified for another identity"
                     }
-                    3 -> fails(e, CoreException.Refused("denied", "not_mine")).let { "denied" }
-                    4 -> fails(e, CoreException.Refused("no_holder", "")).let { "no holder" }
+                    3 -> fails(e, CoreException.Refused("denied", "not_mine", null)).let { "denied" }
+                    4 -> fails(e, CoreException.Refused("no_holder", "", null)).let { "no holder" }
                     5 -> {
                         // Unreachable before its request reached the mailbox.
                         e.posted = false
