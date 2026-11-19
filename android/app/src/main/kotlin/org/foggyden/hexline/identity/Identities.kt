@@ -269,7 +269,8 @@ class Identities(
      * [fingerprint], a successor, now the identity: [card], the card its
      * registrars attested, in place of the one kept, and the rotation it
      * came by no longer unfinished. Throws the core's refusal if it is not
-     * that identity's card for the device; null if it is not kept.
+     * that identity's card for the device, an [java.io.IOException] if the
+     * disk does not give it back as written; null if it is not kept.
      */
     fun rotated(
         fingerprint: String,
@@ -281,6 +282,13 @@ class Identities(
             val info = certInfo(stored.cert, card, stored.info.device, stored.info.deviceEnc)
             stored.copy(card = card, info = info, rotatingFrom = null).also {
                 write(file, it)
+                // Its rotation goes only once the disk holds the identity it made, or a
+                // start would find a successor with no rotation, and discard it.
+                val back = load(file)
+                if (back == null || back.rotatingFrom != null || !back.card.contentEquals(card)) {
+                    throw java.io.IOException("identity not kept")
+                }
+                syncDir(dir)
                 // In the same call, so no rotation is left that a start could take for one under way.
                 stored.rotatingFrom?.takeIf { from -> rotation(from).read?.to == fingerprint }?.let { from ->
                     AtomicFile(rotationFile(from)).delete()
@@ -291,11 +299,14 @@ class Identities(
     /** The rotation of [from]'s identity under way, as last kept: none, one that does not read, or it. */
     fun rotation(from: String): FoundRotation =
         synchronized(LOCK) {
+            val file = rotationFile(from)
+            if (!file.exists() && !File(file.path + ".bak").exists()) return FoundRotation.None
             val bytes =
                 try {
-                    AtomicFile(rotationFile(from)).readFully()
+                    AtomicFile(file).readFully()
                 } catch (_: FileNotFoundException) {
-                    return FoundRotation.None
+                    // There, and not to be opened: what it says is not known.
+                    return FoundRotation.Unreadable
                 }
             KeptRotation.decode(bytes)?.takeIf { it.from == from }?.let(FoundRotation::Read) ?: FoundRotation.Unreadable
         }

@@ -1068,6 +1068,8 @@ class ChatViewModelTest : ViewModelHarness() {
             }
         val none = emptyList<Boolean>()
         assertEquals(mapOf(RotationState.Holding to none, RotationState.Signed to none, RotationState.Sent to listOf(true)), synced)
+        outside { identities.rotated(FINGERPRINT, CARD) }
+        assertEquals("and again once finished", listOf(true, true), stores.synced.map { it == stores.identityDir })
     }
 
     @Test

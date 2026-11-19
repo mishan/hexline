@@ -233,6 +233,30 @@ class IdentitiesTest {
     }
 
     @Test
+    fun aFinishTheDiskDidNotKeepLeavesTheRotation() {
+        sending()
+        val lossy =
+            Identities(context, SecretStore(context, alias, secrets), dir) { file, bytes ->
+                if (!file.name.startsWith("identity-")) writeAtomically(file, bytes)
+            }
+        assertThrows(java.io.IOException::class.java) { lossy.rotated(FINGERPRINT, CARD) }
+        assertEquals(RotationState.Sent, identities().rotation(PREDECESSOR).read?.state)
+        assertEquals(PREDECESSOR, identities().list().single().rotatingFrom)
+    }
+
+    @Test
+    fun aRotationsFileThatWillNotOpenIsUnreadableNotGone() {
+        sending()
+        val file = files().single { it.name.startsWith("rotation-") }
+        try {
+            assertTrue(file.setReadable(false))
+            assertEquals(FoundRotation.Unreadable, identities().rotation(PREDECESSOR))
+        } finally {
+            file.setReadable(true)
+        }
+    }
+
+    @Test
     fun aRotationsFileThatDoesNotReadIsToldApartAndNotWrittenOver() {
         sending()
         files().single { it.name.startsWith("rotation-") }.writeText("{")
