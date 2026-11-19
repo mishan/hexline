@@ -403,13 +403,7 @@ pub(crate) fn with_attestation(
 ) -> Result<Vec<u8>, CoreError> {
     let parsed = Card::parse(card).map_err(|e| protocol(&format!("the card: {e}")))?;
     let new = Attestation::parse(attestation).map_err(|e| protocol(&e.to_string()))?;
-    let mut kept = match cbor::decode_canonical(card)
-        .map_err(|e| protocol(&e.to_string()))?
-        .get("attestations")
-    {
-        Some(cbor::Value::Array(items)) => items.clone(),
-        _ => Vec::new(),
-    };
+    let mut kept = parsed.embedded_attestations.clone();
     kept.retain(|v| {
         !(matches!(v.get("registrar"), Some(cbor::Value::Text(h)) if *h == new.registrar)
             && matches!(v.get("handle"), Some(cbor::Value::Text(h)) if *h == new.handle))
@@ -604,6 +598,44 @@ mod tests {
         ] {
             assert!(endpoint(&base, path).is_err(), "{path}");
         }
+    }
+
+    #[test]
+    fn a_renewal_replaces_its_handles_attestation_and_keeps_others_it_cannot_read() {
+        let id = IdentityKey::from_seed(&[1; 32]);
+        let reg = hl_identity::ServerKey::from_seed(&[3; 32]);
+        let att = |handle: &str, issued| Attestation {
+            identity: id.public(),
+            registrar: "reg.example".into(),
+            registrar_key: reg.public(),
+            handle: handle.into(),
+            registered: 1_600_000_000,
+            issued,
+            expires: 1_800_000_000,
+            level: None,
+        };
+        // As a newer registrar might issue it: a `v` this version does not read.
+        let newer = |handle| {
+            let cbor::Value::Map(mut entries) = att(handle, 1_700_000_000).signed_value(&reg)
+            else {
+                unreachable!("attestations are maps")
+            };
+            for (k, v) in &mut entries {
+                if *k == cbor::Value::Text("v".into()) {
+                    *v = cbor::Value::Uint(2);
+                }
+            }
+            cbor::Value::Map(entries)
+        };
+        let card = Card::new(&id, "Alice", 10)
+            .sign(&id, vec![newer("alice"), newer("alt")])
+            .unwrap();
+        let fresh = att("alice", 1_750_000_000).sign(&reg);
+        let renewed = Card::parse(&with_attestation(&id, &card, &fresh).unwrap()).unwrap();
+        assert_eq!(
+            renewed.embedded_attestations,
+            vec![newer("alt"), cbor::decode_canonical(&fresh).unwrap()]
+        );
     }
 
     #[test]
