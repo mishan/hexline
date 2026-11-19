@@ -72,7 +72,8 @@ impl RotationSetup {
     /// new successor code is shown), this phone's device under K1 and the
     /// record as signed, which is never signed again. The recovery code is
     /// new. Refused `wrong_identity` for a seed or a record that is not the
-    /// cards', `not_committed` for a K1 card that commits to no successor,
+    /// cards', `not_committed` for a card that commits to no successor,
+    /// `wrong_successor` for an old card that commits to another than K1,
     /// `bad_device` for a device that is not K1's or not a holder's own.
     #[uniffi::constructor]
     pub fn resume(
@@ -95,6 +96,11 @@ impl RotationSetup {
         {
             return Err(refused("wrong_identity"));
         }
+        match card0.successor {
+            None => return Err(refused("not_committed")),
+            Some(c) if c != rotation.commitment() => return Err(refused("wrong_successor")),
+            Some(_) => {}
+        }
         if parsed.successor.is_none() {
             return Err(refused("not_committed"));
         }
@@ -104,8 +110,9 @@ impl RotationSetup {
         if !(info.can_login && info.can_message && info.can_manage) || info.can_vouch {
             return Err(refused("bad_device"));
         }
-        // The process before may have signed in this second.
-        crate::backup::signed_at(crate::restore::now());
+        // The process before may have signed in this second, and at the
+        // record's time, whatever the clock says now.
+        crate::backup::signed_at(crate::restore::now().max(rotation.time));
         Ok(Arc::new(RotationSetup {
             state: Mutex::new(Rotating {
                 card0,
@@ -460,6 +467,12 @@ mod tests {
         .sign(&k0, &other)
         .unwrap();
         let (_, others_card0) = held(&s1);
+        let committing = |successor| {
+            let mut card = Card::new(&k0, "Alice", issued());
+            card.successor = successor;
+            card.sign(&k0, Vec::new()).unwrap()
+        };
+        let (misdirected, uncommitted0) = (committing(Some([7; 32])), committing(None));
         // Committed, and with this device certified by it, so only the
         // card's identity tells it apart.
         let mut others_card1 = Card::new(&other, "Alice", issued());
@@ -493,6 +506,24 @@ mod tests {
                 &minted.cert,
                 &record,
                 "wrong_identity",
+            ),
+            (
+                "an old card committing to another",
+                k1_seed.clone(),
+                &misdirected,
+                &card1,
+                &minted.cert,
+                &record,
+                "wrong_successor",
+            ),
+            (
+                "an old card committing to none",
+                k1_seed.clone(),
+                &uncommitted0,
+                &card1,
+                &minted.cert,
+                &record,
+                "not_committed",
             ),
             (
                 "another new card",
@@ -562,23 +593,26 @@ mod tests {
         .unwrap();
         let device = DeviceKey::generate();
         let cert = certify(&k1, &device, "Pixel").unwrap();
-        let record = Rotation {
-            identity: k0.public(),
-            successor: k1.public(),
-            time: 1,
+        // Ahead by more than any other test moves the shared clock.
+        for time in [1, crate::restore::now() + 10_000] {
+            let record = Rotation {
+                identity: k0.public(),
+                successor: k1.public(),
+                time,
+            }
+            .sign(&k0, &k1)
+            .unwrap();
+            let before = crate::restore::now().max(time);
+            RotationSetup::resume(
+                k1.seed().to_vec(),
+                card0.clone(),
+                card1.clone(),
+                device.seed().to_vec(),
+                cert.clone(),
+                record,
+            )
+            .unwrap();
+            assert!(crate::backup::signing_time() > before, "record at {time}");
         }
-        .sign(&k0, &k1)
-        .unwrap();
-        let before = crate::restore::now();
-        RotationSetup::resume(
-            k1.seed().to_vec(),
-            card0,
-            card1,
-            device.seed().to_vec(),
-            cert,
-            record,
-        )
-        .unwrap();
-        assert!(crate::backup::signing_time() > before);
     }
 }
