@@ -8,6 +8,7 @@ import org.foggyden.hexline.core.HeldRestore
 import org.foggyden.hexline.core.HolderCommitted
 import org.foggyden.hexline.core.HolderRequest
 import org.foggyden.hexline.core.NewIdentity
+import org.foggyden.hexline.core.Posted
 import org.foggyden.hexline.core.Restored
 import org.foggyden.hexline.core.RevokeReason
 import org.foggyden.hexline.core.SecretKind
@@ -28,6 +29,14 @@ import org.foggyden.hexline.identity.Setup
  */
 class FakeSetups : HolderSetups {
     val made = mutableListOf<FakeSetup>()
+
+    /** Each rotation posted, to which registrar, answered when the test completes it. */
+    val posts = mutableListOf<Pair<String, CompletableDeferred<Posted>>>()
+
+    override suspend fun postRotation(
+        registrar: String,
+        record: ByteArray,
+    ): Posted = CompletableDeferred<Posted>().also { posts += registrar to it }.await()
 
     /** What the registrar's check throws, if anything. */
     var checkFails: CoreException? = null

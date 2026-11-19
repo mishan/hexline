@@ -1,5 +1,7 @@
 package org.foggyden.hexline.chat
 
+import android.content.Context
+import android.text.format.DateFormat
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
@@ -34,10 +36,12 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -58,6 +62,7 @@ import org.foggyden.hexline.identity.DeviceList
 import org.foggyden.hexline.identity.EnrollProblem
 import org.foggyden.hexline.identity.Enrolling
 import org.foggyden.hexline.identity.HolderRefusal
+import org.foggyden.hexline.identity.KeptRotation
 import org.foggyden.hexline.identity.Renewing
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
@@ -111,6 +116,8 @@ fun ConnectFlow(
     /** Whether [identities] has been read yet: a selection is not judged against the list before it has. */
     identitiesRead: Boolean = false,
     revoking: Revoking = Revoking.Idle,
+    /** Each rotation sent, by the identity it moves away from. */
+    rotations: Map<String, KeptRotation> = emptyMap(),
 ) {
     var backupFor by rememberSaveable { mutableStateOf<String?>(null) }
     var devicesFor by rememberSaveable { mutableStateOf<String?>(null) }
@@ -207,6 +214,7 @@ fun ConnectFlow(
             onDevices = setup?.let { { fingerprint: String -> devicesFor = fingerprint } },
             renewing = renewing,
             onRenewSeen = { setup?.renewSeen() },
+            rotations = rotations,
         )
     }
 }
@@ -235,10 +243,12 @@ private fun ConnectScreen(
     onDevices: ((fingerprint: String) -> Unit)?,
     renewing: Renewing,
     onRenewSeen: () -> Unit,
+    rotations: Map<String, KeptRotation>,
 ) {
     var form by form
     val now = certificateClock(identities)
     var deleting by remember { mutableStateOf<StoredIdentity?>(null) }
+    var detailsFor by remember { mutableStateOf<StoredIdentity?>(null) }
     val refused = { server: Server, kept: StoredIdentity -> refusals[refusalKey(server, kept.info.device)] }
     // The servers arrive once read; the last fills only a form not yet begun.
     LaunchedEffect(saved.firstOrNull()) {
@@ -290,6 +300,17 @@ private fun ConnectScreen(
                 Text(banner, Modifier.weight(1f), color = MaterialTheme.colorScheme.error)
                 if (!kept.held || heldRenewal(kept, refusals) != HeldRenewal.NOTHING) {
                     TextButton({ onRestore(kept) }) { Text(stringResource(R.string.renew)) }
+                }
+            }
+        }
+        // Whichever way the person signs in, as it may be someone else's doing.
+        for (kept in identities) {
+            val notice = rotations[kept.fingerprint]?.let(::notice)?.takeIf { it.alarm } ?: continue
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(rotationBanner(notice, named(kept)), Modifier.weight(1f), color = MaterialTheme.colorScheme.error)
+                val label = stringResource(R.string.rotation_details_label, named(kept))
+                TextButton({ detailsFor = kept }, Modifier.semantics { contentDescription = label }) {
+                    Text(stringResource(R.string.details))
                 }
             }
         }
@@ -349,6 +370,7 @@ private fun ConnectScreen(
                             Text(capabilities(kept), style = MaterialTheme.typography.bodySmall)
                         }
                     }
+                    rotations[kept.fingerprint]?.let { RotationNote(it) }
                     if (kept.unrecoverable) {
                         Text(
                             stringResource(R.string.holder_unrecoverable),
@@ -426,6 +448,15 @@ private fun ConnectScreen(
             color = MaterialTheme.colorScheme.outline,
         )
     }
+    detailsFor?.let { shown ->
+        val notice = rotations[shown.fingerprint]?.let(::notice) ?: return@let
+        AlertDialog(
+            onDismissRequest = { detailsFor = null },
+            title = { Text(named(shown)) },
+            text = { Text(rotationText(notice)) },
+            confirmButton = { TextButton({ detailsFor = null }) { Text(stringResource(R.string.close)) } },
+        )
+    }
     deleting?.let { doomed ->
         AlertDialog(
             onDismissRequest = { deleting = null },
@@ -489,6 +520,72 @@ private fun describeRefusal(
 ): String {
     val host = runCatching { shownHost(java.net.URI(url.trim())) }.getOrNull() ?: url.trim()
     return if (code == "rotated") stringResource(R.string.refused_rotated, host) else stringResource(R.string.refused_revoked, host)
+}
+
+/**
+ * A rotation away from an identity, as its registrars answered: there from
+ * the time it is sent, so a live region announces what it changes to.
+ */
+@Composable
+private fun RotationNote(rotation: KeptRotation) {
+    val notice = notice(rotation) ?: return
+    val quiet = notice is RotationNotice.UnderWay || notice is RotationNotice.Pending
+    Text(
+        rotationText(notice),
+        Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+        style = MaterialTheme.typography.bodySmall,
+        color = if (quiet) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error,
+    )
+}
+
+/** What a rotation's [notice] tells the person, in full. */
+@Composable
+private fun rotationText(notice: RotationNotice): String {
+    val at = registrarHost(notice.registrar)
+    val context = LocalContext.current
+    return when (notice) {
+        is RotationNotice.UnderWay -> stringResource(R.string.rotation_under_way, at)
+        is RotationNotice.Pending -> stringResource(R.string.rotation_pending, at, publishTime(context, notice.until))
+        is RotationNotice.Frozen -> stringResource(R.string.rotation_frozen, at)
+        is RotationNotice.PendingElsewhere ->
+            notice.until?.let { stringResource(R.string.rotation_pending_elsewhere, at, publishTime(context, it)) }
+                ?: stringResource(R.string.rotation_pending_elsewhere_untimed, at)
+        is RotationNotice.Mismatch -> stringResource(R.string.rotation_successor_mismatch, at)
+        is RotationNotice.Superseded -> stringResource(R.string.rotation_superseded, at)
+        is RotationNotice.RotatedAway -> stringResource(R.string.rotation_rotated_away, at)
+        is RotationNotice.Refused ->
+            when (notice.code) {
+                "revoked" -> stringResource(R.string.rotation_revoked, at)
+                "not_registered" -> stringResource(R.string.rotation_not_registered, at)
+                else -> stringResource(R.string.rotation_refused, at, notice.code)
+            }
+    }
+}
+
+/** The banner of a rotation's [notice] that may be someone else's doing, for the identity [name]. */
+@Composable
+private fun rotationBanner(
+    notice: RotationNotice,
+    name: String,
+): String =
+    when (notice) {
+        is RotationNotice.PendingElsewhere -> stringResource(R.string.rotation_pending_elsewhere_banner, name)
+        is RotationNotice.Mismatch -> stringResource(R.string.rotation_mismatch_banner, name, registrarHost(notice.registrar))
+        is RotationNotice.Refused -> stringResource(R.string.rotation_revoked_banner, name, registrarHost(notice.registrar))
+        is RotationNotice.RotatedAway -> stringResource(R.string.rotation_rotated_away_banner, name)
+        else -> stringResource(R.string.rotation_superseded_banner, name)
+    }
+
+/** A registrar as a person knows it: its host. */
+private fun registrarHost(base: String): String = runCatching { java.net.URI(base).host }.getOrNull() ?: base
+
+/** When a registrar publishes a rotation, in seconds, by the person's own clock and its 12- or 24-hour setting. */
+internal fun publishTime(
+    context: Context,
+    until: Long,
+): String {
+    val date = java.util.Date(until * 1000)
+    return "${DateFormat.getMediumDateFormat(context).format(date)} ${DateFormat.getTimeFormat(context).format(date)}"
 }
 
 /** What this device's certificate lets it do, in words. */

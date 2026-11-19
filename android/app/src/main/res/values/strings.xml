@@ -271,4 +271,23 @@
     <string name="revoke_unconfirmed">The revocation was not confirmed by the registrar. Revoke it again.</string>
     <string name="revoke_own_device">This phone\'s own device is not revoked here: it goes when the identity is deleted from the phone.</string>
     <string name="revoke_done">%1$s is revoked.</string>
+    <string name="rotation_under_way">Moving to a new key at %1$s.</string>
+    <string name="rotation_pending">Moving to a new key: %1$s publishes the move at %2$s.</string>
+    <string name="rotation_frozen">Moving to a new key is on hold by the operator of %1$s. This phone posts it again once the hold is lifted.</string>
+    <string name="rotation_pending_elsewhere">Another move of this identity to a new key is held at %1$s until %2$s. If you did not start it from another phone of yours, contact the operator of %1$s now to freeze the identity before then.</string>
+    <string name="rotation_pending_elsewhere_untimed">Another move of this identity to a new key is held at %1$s. If you did not start it from another phone of yours, contact the operator of %1$s now to freeze the identity before it is published.</string>
+    <string name="rotation_superseded">This identity moved to the new key this phone holds, but under a new successor code this phone did not make, and whoever made that code controls the key\'s next move. If you moved it from another phone of yours, you need that phone\'s new successor code to move it again. If not, someone else has your successor code, and with it the key this identity now lives on: contact the operator of %1$s now.</string>
+    <string name="rotation_successor_mismatch">%1$s refused the move: it holds this identity, or its new key, to a successor code other than the one this phone used. Another phone of yours may have set it, or someone with your old key or your successor code may have. This identity keeps its current key for now. If it was not another phone of yours, contact the operator of %1$s now.</string>
+    <string name="rotation_rotated_away">%1$s says this identity was moved to a key this phone does not hold, so it now belongs to whoever holds that key. If you did not move it from another phone of yours, your old key was stolen: contact the operator of %1$s now, who can freeze the identity and may be able to recover its handles.</string>
+    <string name="rotation_revoked">%1$s refused the move: this identity was revoked there, so it can no longer move to a new key. If you did not revoke it, contact the operator of %1$s.</string>
+    <string name="rotation_not_registered">%1$s refused the move: it does not know this identity, so it cannot move it to a new key.</string>
+    <string name="rotation_refused">%1$s refused the move to a new key (%2$s).</string>
+    <string name="rotation_pending_elsewhere_banner">Someone may be moving %1$s to a new key.</string>
+    <string name="rotation_superseded_banner">%1$s was moved under a successor code this phone did not make.</string>
+    <string name="rotation_mismatch_banner">%1$s could not be moved: %2$s holds a successor code this phone did not use.</string>
+    <string name="rotation_rotated_away_banner">%1$s was moved to a key this phone does not hold.</string>
+    <string name="rotation_revoked_banner">%1$s was revoked at %2$s. If you did not revoke it, contact its operator.</string>
+    <string name="details">Details</string>
+    <string name="rotation_details_label">Details about %1$s</string>
+    <string name="close">Close</string>
 </resources>
