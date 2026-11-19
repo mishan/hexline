@@ -257,6 +257,20 @@ class IdentitiesTest {
     }
 
     @Test
+    fun aRotationsFileThatWillNotOpenKeepsItsOwnSuccessorAndNoOther() {
+        sending()
+        identities().keep(KeptRotation("k2", "k-held", CARD, RotationState.Holding))
+        val unopened = files().single { it.name.startsWith("rotation-") && KeptRotation.decode(it.readBytes())?.from == PREDECESSOR }
+        try {
+            assertTrue(unopened.setReadable(false))
+            assertEquals(listOf("k2" to "k-held"), identities().unsentRotations())
+            assertEquals(PREDECESSOR, identities().list().single().rotatingFrom)
+        } finally {
+            unopened.setReadable(true)
+        }
+    }
+
+    @Test
     fun aRotationsFileThatDoesNotReadIsToldApartAndNotWrittenOver() {
         sending()
         files().single { it.name.startsWith("rotation-") }.writeText("{")

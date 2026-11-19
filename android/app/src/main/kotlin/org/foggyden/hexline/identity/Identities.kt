@@ -57,7 +57,7 @@ data class StoredIdentity(
     /**
      * The identity this one is the successor of, while that rotation is
      * unfinished: the model neither publishes it, so it is offered to sign
-     * in with or renew nowhere, nor demotes it.
+     * in with or renew nowhere, nor renews it quietly, nor demotes it.
      */
     val rotatingFrom: String? = null,
     /** The rotation record that made it a successor, shown at each identity login. */
@@ -304,8 +304,8 @@ class Identities(
             val bytes =
                 try {
                     AtomicFile(file).readFully()
-                } catch (_: FileNotFoundException) {
-                    // There, and not to be opened: what it says is not known.
+                } catch (_: java.io.IOException) {
+                    // There, and not to be opened or read: what it says is not known.
                     return FoundRotation.Unreadable
                 }
             KeptRotation.decode(bytes)?.takeIf { it.from == from }?.let(FoundRotation::Read) ?: FoundRotation.Unreadable
@@ -388,7 +388,8 @@ class Identities(
             val unkept =
                 rotationFiles()
                     .mapNotNull { file ->
-                        KeptRotation.decode(AtomicFile(file).readFully()).also {
+                        // One file that will not open keeps its own rotation, and no other.
+                        runCatching { AtomicFile(file).readFully() }.getOrNull()?.let(KeptRotation::decode).also {
                             if (it == null) Log.w(TAG, "a rotation's file does not read: kept")
                         }
                     }.filter { r -> r.state != RotationState.Sent && kept.none { it.fingerprint == r.to } }

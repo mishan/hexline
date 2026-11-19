@@ -1073,6 +1073,20 @@ class ChatViewModelTest : ViewModelHarness() {
     }
 
     @Test
+    fun anUnfinishedSuccessorIsNotRenewedQuietly() {
+        outside {
+            identities.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Holding))
+            identities.save(SEED.copyOf(), CERT, CARD, "alice@example", null, "hl.example", rotatingFrom = PREDECESSOR, rotation = RECORD)
+            identities.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Sent, RECORD))
+        }
+        now = ISSUED + (EXPIRES - ISSUED) * 2 / 3 + DAY
+        model()
+        settle()
+        assertTrue("kept", kept())
+        assertTrue("not renewed", enrollments.isEmpty())
+    }
+
+    @Test
     fun aSuccessorWhoseKeyWentWithTheScreenLockIsNotDemoted() {
         successor(RotationState.Sent)
         hold()
