@@ -115,7 +115,7 @@ class FakeSetups : HolderSetups {
         registrar: String,
         passphrase: String,
     ) {
-        if (passphrase.trim().length < 10) throw CoreException.Refused("bad_passphrase", "")
+        if (passphrase.trim().length < 10) throw CoreException.Refused("bad_passphrase", "", null)
         backedUp("passphrase $passphrase", registrar)
     }
 
@@ -174,7 +174,7 @@ class FakeSetups : HolderSetups {
         thisDevice: ByteArray,
     ) {
         yield()
-        if (device.contentEquals(thisDevice)) throw CoreException.Refused("own_device", "")
+        if (device.contentEquals(thisDevice)) throw CoreException.Refused("own_device", "", null)
         onRevoke()
         revokeFails?.let {
             revokeFails = null
@@ -239,8 +239,8 @@ class FakeSetups : HolderSetups {
         }
 
         private fun answerable() {
-            if (canceled) throw CoreException.Refused("canceled", "")
-            if (certified || denials.isNotEmpty()) throw CoreException.Refused("used", "")
+            if (canceled) throw CoreException.Refused("canceled", "", null)
+            if (certified || denials.isNotEmpty()) throw CoreException.Refused("used", "", null)
         }
 
         override suspend fun certify(
@@ -250,7 +250,7 @@ class FakeSetups : HolderSetups {
         ): Certified {
             yield()
             answerable()
-            if (!device.contentEquals(checkNotNull(asked).device)) throw CoreException.Refused("not_asked", "")
+            if (!device.contentEquals(checkNotNull(asked).device)) throw CoreException.Refused("not_asked", "", null)
             certified = true
             onCertify()
             approvals += identitySeed to manage
@@ -263,9 +263,9 @@ class FakeSetups : HolderSetups {
         override suspend fun deliver() {
             beforeDeliver()
             yield()
-            if (canceled) throw CoreException.Refused("canceled", "")
-            if (!certified) throw CoreException.Refused("nothing_certified", "")
-            if (delivered) throw CoreException.Refused("used", "")
+            if (canceled) throw CoreException.Refused("canceled", "", null)
+            if (!certified) throw CoreException.Refused("nothing_certified", "", null)
+            if (delivered) throw CoreException.Refused("used", "", null)
             sends++
             deliverFails.removeFirstOrNull()?.let { throw it }
             onDeliver()
@@ -280,7 +280,7 @@ class FakeSetups : HolderSetups {
 
         override fun cancel() {
             canceled = true
-            if (!next.isCompleted) next.completeExceptionally(CoreException.Refused("canceled", ""))
+            if (!next.isCompleted) next.completeExceptionally(CoreException.Refused("canceled", "", null))
         }
 
         override fun close() {
@@ -301,7 +301,7 @@ class FakeSetups : HolderSetups {
             identitySeed: ByteArray,
             registrar: String,
         ) {
-            if (!confirmed) throw CoreException.Refused("unconfirmed", "")
+            if (!confirmed) throw CoreException.Refused("unconfirmed", "", null)
             backedUp("recovery", registrar)
         }
 
@@ -339,7 +339,7 @@ class FakeSetups : HolderSetups {
             check(!closed) { "a closed setup called" }
             // As the core's: answered later, not as it is asked.
             yield()
-            if (!held) throw CoreException.Refused("unheld", "")
+            if (!held) throw CoreException.Refused("unheld", "", null)
             commits += Triple(registrar, handle, invite)
             onCommit()
             answers.removeFirstOrNull()?.let { throw it }
@@ -354,17 +354,17 @@ class FakeSetups : HolderSetups {
         override fun fingerprint() = identity.fingerprint
 
         override fun held() {
-            if (!minted) throw CoreException.Refused("unminted", "")
+            if (!minted) throw CoreException.Refused("unminted", "", null)
             held = true
         }
 
         override fun identitySeed(): ByteArray {
-            if (successor != null || !recoveryConfirmed) throw CoreException.Refused("unconfirmed", "")
+            if (successor != null || !recoveryConfirmed) throw CoreException.Refused("unconfirmed", "", null)
             return identity.seed.copyOf().also { handed += it }
         }
 
         override fun mint(deviceName: String): org.foggyden.hexline.core.HolderMinted {
-            if (successor != null || !recoveryConfirmed) throw CoreException.Refused("unconfirmed", "")
+            if (successor != null || !recoveryConfirmed) throw CoreException.Refused("unconfirmed", "", null)
             // As the core does: a device minted again is not yet the one held.
             held = false
             return holderMint(identity.seed, identity.card, deviceName).also { minted = true }

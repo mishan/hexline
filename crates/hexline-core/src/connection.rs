@@ -64,8 +64,13 @@ pub enum CoreError {
     Connect { detail: String },
     /// The server answered with an error `code` (hotline-ng.md §10). Also
     /// `kicked` and `replaced`, for a session that ended so while it was
-    /// being taken back.
-    Refused { code: String, detail: String },
+    /// being taken back. `successor` is the key a `rotated` identity went
+    /// to, where the server named one that reads as a fingerprint.
+    Refused {
+        code: String,
+        detail: String,
+        successor: Option<String>,
+    },
     /// The server broke the protocol, and the connection was dropped.
     Protocol { detail: String },
     /// There is no connection to ask.
@@ -148,7 +153,7 @@ impl std::fmt::Display for CoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CoreError::Connect { detail } | CoreError::Protocol { detail } => f.write_str(detail),
-            CoreError::Refused { code, detail } => write!(f, "{code}: {detail}"),
+            CoreError::Refused { code, detail, .. } => write!(f, "{code}: {detail}"),
             CoreError::Closed => f.write_str("not connected"),
             CoreError::Busy => f.write_str("already connected"),
             CoreError::RateLimited { .. } => f.write_str("asked too often"),
@@ -164,6 +169,13 @@ impl From<driver::Error> for CoreError {
                 retry_after: r.error.retry_after,
             },
             driver::Error::Refused(r) => CoreError::Refused {
+                successor: r
+                    .error
+                    .rest
+                    .get("successor")
+                    .and_then(Value::as_str)
+                    .and_then(hl_identity::Fingerprint::parse)
+                    .map(|f| f.to_string()),
                 code: r.error.code,
                 detail: r.error.text,
             },
@@ -253,9 +265,12 @@ pub enum CoreUpdate {
         info: Option<LoginInfo>,
     },
     /// The server refused to take the session back, with its `code`: the
-    /// `Closed` that follows is for good.
+    /// `Closed` that follows is for good. `successor` as
+    /// [`CoreError::Refused`] has it.
     Refused {
         code: String,
+        #[uniffi(default = None)]
+        successor: Option<String>,
     },
     /// What `saved` gives is this link's session now, and is to be kept:
     /// told once the link's first batch is handed over, so it comes though
@@ -512,6 +527,7 @@ impl ServerConnection {
             .map_err(|e| CoreError::Refused {
                 code: e.code,
                 detail: e.text,
+                successor: None,
             })
     }
 
@@ -541,6 +557,7 @@ impl ServerConnection {
             .map_err(|e| CoreError::Refused {
                 code: e.code,
                 detail: e.text,
+                successor: None,
             })?;
         Ok(HistoryPage {
             lines: ok
@@ -675,6 +692,7 @@ async fn begin(
         return Err(CoreError::Refused {
             code: "session_expired".into(),
             detail: "the saved session does not read".into(),
+            successor: None,
         });
     }
     // A saved session another identity's, or a password's for an
@@ -686,9 +704,17 @@ async fn begin(
         creds.in_time()?;
         let start = Start::Resume(kept.resumable.clone());
         match establish(url, &start, Some(&kept), true, None).await {
-            Err(CoreError::Refused { code, detail }) if gone(&code) => {
+            Err(CoreError::Refused {
+                code,
+                detail,
+                successor,
+            }) if gone(&code) => {
                 if !creds.may_log_in_again(kept.guest) {
-                    return Err(CoreError::Refused { code, detail });
+                    return Err(CoreError::Refused {
+                        code,
+                        detail,
+                        successor,
+                    });
                 }
             }
             other => return other,
@@ -820,6 +846,7 @@ async fn log_in(
                 return Err(CoreError::Refused {
                     code: "identity_not_honored".into(),
                     detail: "the server did not log this session in as the identity proved".into(),
+                    successor: None,
                 });
             }
             // No login named, but no guest's either: the identity logs in again.
@@ -843,6 +870,11 @@ pub struct DeviceIdentity {
     pub device_seed: Vec<u8>,
     pub cert: Vec<u8>,
     pub card: Vec<u8>,
+    /// The rotation record that made the identity its predecessor's
+    /// successor, shown at each identity login (hotline-ng-identity.md
+    /// section 5.1).
+    #[uniffi(default = None)]
+    pub rotation: Option<Vec<u8>>,
 }
 
 impl DeviceIdentity {
@@ -865,7 +897,7 @@ impl DeviceIdentity {
             key: hl_identity::DeviceKey::from_seed(seed),
             cert: self.cert,
             card: self.card,
-            rotation: None,
+            rotation: self.rotation,
         };
         Ok((device, fingerprint))
     }
@@ -1056,6 +1088,7 @@ fn ended(code: &str) -> CoreError {
     CoreError::Refused {
         code: code.into(),
         detail: String::new(),
+        successor: None,
     }
 }
 
@@ -1179,7 +1212,9 @@ async fn supervise(
             };
             let refused = match tried {
                 Ok(l) => break l,
-                Err(CoreError::Refused { code, .. }) if known.is_some() && gone(&code) => {
+                Err(CoreError::Refused {
+                    code, successor, ..
+                }) if known.is_some() && gone(&code) => {
                     // Let go while the link was down: log in again, now,
                     // if that is still this person.
                     *shared.kept.lock().unwrap() = None;
@@ -1187,9 +1222,11 @@ async fn supervise(
                         delay = Duration::ZERO;
                         continue;
                     }
-                    code
+                    (code, successor)
                 }
-                Err(CoreError::Refused { code, .. }) if !for_now(&code) => code,
+                Err(CoreError::Refused {
+                    code, successor, ..
+                }) if !for_now(&code) => (code, successor),
                 Err(_) => {
                     delay = backoff + jitter(backoff / 4);
                     backoff = (backoff * 2).min(BACKOFF_MAX);
@@ -1197,6 +1234,7 @@ async fn supervise(
                 }
             };
             *shared.kept.lock().unwrap() = None;
+            let (refused, successor) = refused;
             shared.deliver(match refused.as_str() {
                 "kicked" => vec![
                     CoreUpdate::Kicked,
@@ -1210,7 +1248,10 @@ async fn supervise(
                     replaced: true,
                 }],
                 _ => vec![
-                    CoreUpdate::Refused { code: refused },
+                    CoreUpdate::Refused {
+                        code: refused,
+                        successor,
+                    },
                     CoreUpdate::Closed {
                         can_resume: false,
                         replaced: false,
@@ -1729,5 +1770,38 @@ mod tests {
             event("subject".into(), json!({ "subject": "topic", "room": 4 })),
             CoreUpdate::Subject { room: Some(4), .. }
         ));
+    }
+
+    #[test]
+    fn a_rotated_refusal_names_the_key_the_identity_went_to() {
+        let k1 = hl_identity::IdentityKey::generate()
+            .fingerprint()
+            .to_string();
+        let refused = |rest: Value| {
+            CoreError::from(driver::Error::Refused(Box::new(driver::Refusal {
+                error: hxng_client::ErrorReply {
+                    code: "rotated".into(),
+                    text: "the server's words".into(),
+                    retry_after: None,
+                    rest: rest.as_object().cloned().unwrap_or_default(),
+                },
+                resumable: None,
+            })))
+        };
+        for (rest, want) in [
+            (json!({ "successor": k1 }), Some(k1.as_str())),
+            (json!({ "successor": "not a key" }), None),
+            (json!({}), None),
+        ] {
+            match refused(rest) {
+                CoreError::Refused {
+                    detail, successor, ..
+                } => assert_eq!(
+                    (detail.as_str(), successor.as_deref()),
+                    ("the server's words", want)
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
     }
 }

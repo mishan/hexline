@@ -360,6 +360,7 @@ impl Enrollee {
                                         .and_then(Value::as_str)
                                         .unwrap_or_default(),
                                 ),
+                                successor: None,
                             })
                         }
                         // As long as the mailbox asks, never less than the floor.
@@ -684,6 +685,7 @@ fn refused(code: &str) -> CoreError {
     CoreError::Refused {
         code: code.into(),
         detail: String::new(),
+        successor: None,
     }
 }
 

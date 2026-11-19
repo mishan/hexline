@@ -43,6 +43,7 @@ class QuietRenewal(
                 withContext(queue.dispatcher) {
                     identities.list().filter {
                         it.mailbox != null &&
+                            it.rotatingFrom == null &&
                             renewalDue(it.info.issued, it.info.expires, at.toULong()) &&
                             standing(it, at).usable &&
                             at - it.renewTried >= DAY

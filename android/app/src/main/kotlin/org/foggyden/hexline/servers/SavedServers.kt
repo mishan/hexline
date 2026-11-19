@@ -117,8 +117,17 @@ class SavedServers(
         device: ByteArray,
     ): String? = refusals()[refusalKey(server, device)]
 
+    /** The key [server] said [device]'s identity rotated to, where it named one. */
+    fun successor(
+        server: Server,
+        device: ByteArray,
+    ): String? = kept()[refusalKey(server, device)]?.substringAfter('/', "")?.ifEmpty { null }
+
     /** Every refusal kept, by [refusalKey]: for a screen to look up without the disk. */
-    fun refusals(): Map<String, String> =
+    fun refusals(): Map<String, String> = kept().mapValues { it.value.substringBefore('/') }
+
+    /** Each refusal as kept: its code, and after a `/` the successor a `rotated` one named. */
+    private fun kept(): Map<String, String> =
         prefs
             .getStringSet(REFUSED, null)
             .orEmpty()
@@ -126,20 +135,45 @@ class SavedServers(
             .toMap()
 
     /**
-     * Keeps [server]'s refusal of [device]; with [since], a [generation],
-     * not if [server] has been forgotten since, nor [device]'s refusals,
-     * as [remember] does not.
+     * Keeps [server]'s refusal of [device], and the [successor] a
+     * `rotated` one named; with [since], a [generation], not if [server]
+     * has been forgotten since, nor [device]'s refusals, as [remember]
+     * does not.
      */
     fun markRefused(
         server: Server,
         device: ByteArray,
         code: String,
         since: Long? = null,
+        successor: String? = null,
     ): Unit =
         synchronized(LOCK) {
             if (since != null && listOf(name("list", server), deviceName(device)).any { (forgottenAt[it] ?: 0) > since }) return
             val key = refusalKey(server, device)
-            keepRefusals { it.filterNot { e -> e.startsWith("$key=") } + "$key=$code" }
+            val kept = successor?.let { "$code/$it" } ?: code
+            keepRefusals { it.filterNot { e -> e.startsWith("$key=") } + "$key=$kept" }
+        }
+
+    /**
+     * Every server signed in to as [from] now signed in to as [to], in the
+     * same place in the list: its session (the server ended it) and its
+     * refusals forgotten, as [forget] forgets them, [at] a [generation].
+     */
+    fun repoint(
+        from: String,
+        to: String,
+        at: Long? = null,
+    ): Unit =
+        synchronized(LOCK) {
+            val moved = all().filter { (it.signIn as? SignIn.Identity)?.fingerprint == from }
+            for (old in moved) {
+                forgotten(name("list", old), at)
+                forgotten(name("session", old), at)
+                secrets.delete(name("session", old))
+                askedToLink(old, false)
+                forgetRefusals(old)
+            }
+            write(all().map { if (it in moved) it.copy(signIn = SignIn.Identity(to)) else it }.distinct())
         }
 
     /** Forgets [server]'s refusal of [device], for a login to try again. */

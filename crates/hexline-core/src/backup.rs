@@ -333,6 +333,7 @@ fn refused(code: &str) -> CoreError {
     CoreError::Refused {
         code: code.into(),
         detail: String::new(),
+        successor: None,
     }
 }
 

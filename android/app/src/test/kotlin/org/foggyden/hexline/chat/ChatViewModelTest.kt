@@ -9,6 +9,10 @@ import kotlinx.coroutines.runBlocking
 import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.CoreUpdate
 import org.foggyden.hexline.identity.Enrolling
+import org.foggyden.hexline.identity.FoundRotation
+import org.foggyden.hexline.identity.KeptRotation
+import org.foggyden.hexline.identity.RotationState
+import org.foggyden.hexline.identity.StoredIdentity
 import org.foggyden.hexline.secrets.SecretUnavailable
 import org.foggyden.hexline.secrets.SecretUnreadable
 import org.junit.Assert.assertArrayEquals
@@ -248,7 +252,7 @@ class ChatViewModelTest : ViewModelHarness() {
                 // A login after a lapse refused: the core's last batch.
                 core { conn.sink.deliver(listOf(CoreUpdate.Refused(c.code), CoreUpdate.Closed(false, false))) }
             } else {
-                refuse(conn, CoreException.Refused(c.code, ""))
+                refuse(conn, CoreException.Refused(c.code, "", null))
             }
             settle()
             found[c.name] = outside { servers.refused(server, device) }
@@ -273,7 +277,7 @@ class ChatViewModelTest : ViewModelHarness() {
         live(newer)
         settle()
         // Its server had answered before the hang-up reached it.
-        refuse(old, CoreException.Refused("login_failed", ""))
+        refuse(old, CoreException.Refused("login_failed", "", null))
         settle()
         assertEquals("new", outside { servers.password(server) })
         assertArrayEquals(newer.session, outside { servers.session(server) })
@@ -738,7 +742,7 @@ class ChatViewModelTest : ViewModelHarness() {
             now += HOUR
             when (answer) {
                 "renewed" -> core { e.answer.complete(enrolled(RENEWED)) }
-                "no holder" -> core { e.answer.completeExceptionally(CoreException.Refused("no_holder", "")) }
+                "no holder" -> core { e.answer.completeExceptionally(CoreException.Refused("no_holder", "", null)) }
                 "left while waiting" -> owner.clear()
                 else -> {
                     // Unreachable before its request reached the mailbox.
@@ -911,7 +915,7 @@ class ChatViewModelTest : ViewModelHarness() {
             model()
             settle()
             val e = enrollments.single()
-            core { e.answer.completeExceptionally(CoreException.Refused("no_holder", "")) }
+            core { e.answer.completeExceptionally(CoreException.Refused("no_holder", "", null)) }
             settle()
             assertTrue("the holder was still asked", e.asked != null)
         } finally {
@@ -1039,10 +1043,115 @@ class ChatViewModelTest : ViewModelHarness() {
         assertArrayEquals(ByteArray(32) { 1 }, opened)
     }
 
+    @Test
+    fun aSuccessorIsNoSignInChoiceAndOneWhoseRotationWasNeverSentGoesAtStart() {
+        for (state in RotationState.entries) {
+            fresh()
+            successor(state)
+            hold()
+            val vm = model()
+            settle()
+            assertEquals("$state", emptyList<StoredIdentity>(), vm.identityList.value)
+            val sent = state == RotationState.Sent
+            val left = outside { listOf(kept(), stores.held.isHeld(FINGERPRINT), identities.rotation(PREDECESSOR) != FoundRotation.None) }
+            assertEquals("$state: the successor, its hold and its rotation", listOf(sent, sent, sent), left)
+        }
+    }
+
+    @Test
+    fun aRotationIsSyncedToTheDiskOnceItIsSentAndNotBefore() {
+        val synced =
+            RotationState.entries.associateWith { state ->
+                fresh()
+                successor(state)
+                stores.synced.map { it == stores.identityDir }
+            }
+        val none = emptyList<Boolean>()
+        assertEquals(mapOf(RotationState.Holding to none, RotationState.Signed to none, RotationState.Sent to listOf(true)), synced)
+        outside { identities.rotated(FINGERPRINT, CARD) }
+        assertEquals("and again once finished", listOf(true, true), stores.synced.map { it == stores.identityDir })
+    }
+
+    @Test
+    fun anUnfinishedSuccessorIsNotRenewedQuietly() {
+        outside {
+            identities.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Holding))
+            identities.save(SEED.copyOf(), CERT, CARD, "alice@example", null, "hl.example", rotatingFrom = PREDECESSOR, rotation = RECORD)
+            identities.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Sent, RECORD))
+        }
+        now = ISSUED + (EXPIRES - ISSUED) * 2 / 3 + DAY
+        model()
+        settle()
+        assertTrue("kept", kept())
+        assertTrue("not renewed", enrollments.isEmpty())
+    }
+
+    @Test
+    fun aSuccessorWhoseKeyWentWithTheScreenLockIsNotDemoted() {
+        successor(RotationState.Sent)
+        hold()
+        stores.keys.removeLock()
+        val vm = model()
+        settle()
+        assertEquals(emptyList<String>(), vm.heldLostNotices.value)
+    }
+
+    @Test
+    fun aSuccessorShowsItsRotationAtEachIdentityLogin() {
+        successor(RotationState.Sent)
+        outside { identities.rotated(FINGERPRINT, CARD) }
+        val vm = model()
+        settle()
+        vm.connect(identityServer("moved"), null, false)
+        settle()
+        assertArrayEquals(RECORD, opened.single().shown)
+    }
+
+    @Test
+    fun aRotatedRefusalKeepsTheKeyItNames() {
+        val found = mutableListOf<String?>()
+        for (lapse in listOf(false, true)) {
+            fresh()
+            val server = identityServer("rotated, lapse $lapse")
+            keepIdentity()
+            val device = device()
+            val vm = model()
+            settle()
+            vm.connect(server, null, false)
+            settle()
+            val conn = opened.single()
+            if (lapse) {
+                land(conn, identityLoggedIn())
+                live(conn)
+                settle()
+                core { conn.sink.deliver(listOf(CoreUpdate.Refused("rotated", SUCCESSOR), CoreUpdate.Closed(false, false))) }
+            } else {
+                refuse(conn, CoreException.Refused("rotated", "", SUCCESSOR))
+            }
+            settle()
+            found += outside { servers.successor(server, device) }
+        }
+        assertEquals(listOf(SUCCESSOR, SUCCESSOR), found)
+    }
+
+    /** This test's identity kept as [PREDECESSOR]'s successor, its rotation as far as [state]. */
+    private fun successor(state: RotationState) =
+        outside {
+            identities.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Holding))
+            identities.save(SEED.copyOf(), CERT, CARD, "alice@example", null, rotatingFrom = PREDECESSOR, rotation = RECORD)
+            if (state != RotationState.Holding) identities.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, state, RECORD))
+        }
+
     private fun hold() =
         assertTrue(
             runBlocking {
                 stores.held.hold(FINGERPRINT, ByteArray(32) { 1 }, stores.keys.authorizer())
             },
         )
+
+    private companion object {
+        const val PREDECESSOR = "k0"
+        const val SUCCESSOR = "k1"
+        val RECORD = byteArrayOf(0xa6.toByte(), 1, 2, 3)
+    }
 }

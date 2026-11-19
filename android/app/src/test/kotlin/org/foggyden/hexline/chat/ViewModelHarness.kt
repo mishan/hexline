@@ -127,10 +127,13 @@ abstract class ViewModelHarness {
         val servers = SavedServers(app, secrets, QueuedPrefs(app.getSharedPreferences("servers-$n", 0)))
         val identityDir = File(app.filesDir, "identities-$n")
 
+        /** Each directory the store synced, in order. */
+        val synced = mutableListOf<File>()
+
         /** Whether a device list written is lost while the write says it was made, as a failed rename can. */
         var losesLists = false
         val identities =
-            Identities(app, secrets, identityDir) { file, bytes ->
+            Identities(app, secrets, identityDir, syncDir = { synced += it }) { file, bytes ->
                 if (!(losesLists && file.name.startsWith("minted-"))) writeAtomically(file, bytes)
             }
         val keys = FakeHolderKeys()
@@ -447,14 +450,14 @@ abstract class ViewModelHarness {
             name: String,
         ): Enrolled {
             check(!closed) { "a closed enrollment called" }
-            if (inFlight) throw CoreException.Refused("busy", "")
+            if (inFlight) throw CoreException.Refused("busy", "", null)
             inFlight = true
             onAsk()
             asked = Triple(mailbox, code, name)
             posted = true
             try {
                 val got = answer.await()
-                if (expecting != null && got.fingerprint != expecting) throw CoreException.Refused("wrong_identity", "")
+                if (expecting != null && got.fingerprint != expecting) throw CoreException.Refused("wrong_identity", "", null)
                 refuses(got)?.let { throw it }
                 return got
             } finally {
@@ -464,7 +467,7 @@ abstract class ViewModelHarness {
 
         override fun cancel() {
             canceled = true
-            answer.completeExceptionally(CoreException.Refused("canceled", ""))
+            answer.completeExceptionally(CoreException.Refused("canceled", "", null))
         }
 
         /** What else the core would refuse [got] for; nothing, unless a test says. */
@@ -494,6 +497,9 @@ abstract class ViewModelHarness {
 
         /** The seed an identity login was given, as it was given. */
         var proved: ByteArray? = null
+
+        /** The rotation record an identity login showed. */
+        var shown: ByteArray? = null
         var resumedWith: ByteArray? = null
         var password: String? = null
         var hungUp: Boolean? = null
@@ -546,6 +552,7 @@ abstract class ViewModelHarness {
         ): LoginInfo {
             alive()
             proved = device.deviceSeed.copyOf()
+            shown = device.rotation
             seeds += device.deviceSeed
             linked = link
             resumedWith = saved
@@ -567,7 +574,7 @@ abstract class ViewModelHarness {
             limit: UInt,
         ): HistoryPage {
             alive()
-            throw CoreException.Refused("not_available", "")
+            throw CoreException.Refused("not_available", "", null)
         }
 
         override fun networkChanged() = alive()

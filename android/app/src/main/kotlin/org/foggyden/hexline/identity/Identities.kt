@@ -1,8 +1,12 @@
 package org.foggyden.hexline.identity
 
 import android.content.Context
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
 import android.util.AtomicFile
 import android.util.Base64
+import android.util.Log
 import org.foggyden.hexline.core.CertInfo
 import org.foggyden.hexline.core.certForDevice
 import org.foggyden.hexline.core.certInfo
@@ -17,8 +21,13 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileNotFoundException
 
-/** An identity this phone is a device of: what a server is shown, and what the core read of it. */
-class StoredIdentity(
+/**
+ * An identity this phone is a device of: what a server is shown, and what
+ * the core read of it. Changed by [copy], so a field added here is kept by
+ * every write that does not mean to change it; [Identities.save] alone
+ * makes one anew, and carries over what a successor keeps.
+ */
+data class StoredIdentity(
     val handle: String?,
     val cert: ByteArray,
     val card: ByteArray,
@@ -45,10 +54,17 @@ class StoredIdentity(
     val unrecoverable: Boolean = false,
     /** This phone holds the identity's key: never kept, the model says so as it reads the store. */
     val held: Boolean = false,
+    /**
+     * The identity this one is the successor of, while that rotation is
+     * unfinished: the model neither publishes it, so it is offered to sign
+     * in with or renew nowhere, nor renews it quietly, nor demotes it.
+     */
+    val rotatingFrom: String? = null,
+    /** The rotation record that made it a successor, shown at each identity login. */
+    val rotation: ByteArray? = null,
 ) {
     /** As held here, the model's word for it. */
-    fun held(): StoredIdentity =
-        StoredIdentity(handle, cert, card, info, registrar, mailbox, renewTried, noHolder, unfinished, unrecoverable, held = true)
+    fun held(): StoredIdentity = copy(held = true)
 
     /** The identity, in the form the core gives it: the only one to pass back. */
     val fingerprint: String get() = info.fingerprint
@@ -73,6 +89,8 @@ class Identities(
     context: Context,
     private val secrets: Secrets = SecretStore(context),
     private val dir: File = File(context.filesDir, "identities"),
+    /** How [dir]'s entries are synced to the disk: a test's may not, where no directory opens. */
+    private val syncDir: (File) -> Unit = ::syncDirectory,
     /** How a file is written whole: a test's may say it wrote what the disk did not keep. */
     private val commit: (File, ByteArray) -> Unit = ::writeAtomically,
 ) {
@@ -94,9 +112,14 @@ class Identities(
         registrar: String?,
         mailbox: String? = null,
         unfinished: Boolean = false,
+        rotatingFrom: String? = null,
+        rotation: ByteArray? = null,
     ): StoredIdentity =
         synchronized(LOCK) {
             val info = certForDevice(cert, card, seed)
+            // A successor is kept only once its rotation's file names it, so a
+            // start finds it to discard if nothing was sent.
+            check(rotatingFrom == null || rotation(rotatingFrom).read?.to == info.fingerprint) { "no rotation names it" }
             val file = file(info.fingerprint)
             val before = load(file)
             // The new device's seed under a name of its own, then the file
@@ -113,6 +136,9 @@ class Identities(
                     registrar?.ifEmpty { null },
                     mailbox?.ifEmpty { null },
                     unfinished = unfinished,
+                    // A new device of a successor, as a renewal makes, is still one.
+                    rotatingFrom = rotatingFrom ?: before?.rotatingFrom,
+                    rotation = rotation ?: before?.rotation,
                 )
             write(file, stored)
             before?.let { old ->
@@ -170,21 +196,7 @@ class Identities(
         synchronized(LOCK) {
             val file = file(fingerprint)
             val stored = load(file)?.takeIf { it.cert.contentEquals(cert) } ?: return
-            write(
-                file,
-                StoredIdentity(
-                    stored.handle,
-                    stored.cert,
-                    stored.card,
-                    stored.info,
-                    stored.registrar,
-                    stored.mailbox,
-                    at,
-                    noHolder,
-                    stored.unfinished,
-                    stored.unrecoverable,
-                ),
-            )
+            write(file, stored.copy(renewTried = at, noHolder = noHolder))
         }
 
     /** [fingerprint]'s unfinished setup now to be committed as [handle]; nothing once it is finished. */
@@ -195,20 +207,7 @@ class Identities(
         synchronized(LOCK) {
             val file = file(fingerprint)
             val stored = load(file)?.takeIf { it.unfinished } ?: return
-            write(
-                file,
-                StoredIdentity(
-                    handle,
-                    stored.cert,
-                    stored.card,
-                    stored.info,
-                    stored.registrar,
-                    stored.mailbox,
-                    stored.renewTried,
-                    stored.noHolder,
-                    unfinished = true,
-                ),
-            )
+            write(file, stored.copy(handle = handle))
         }
 
     /**
@@ -228,16 +227,7 @@ class Identities(
             val file = file(fingerprint)
             val stored = load(file)?.takeIf { it.cert.contentEquals(replacing) } ?: return null
             val info = certInfo(cert, stored.card, stored.info.device, stored.info.deviceEnc)
-            StoredIdentity(
-                stored.handle,
-                cert,
-                stored.card,
-                info,
-                stored.registrar,
-                stored.mailbox,
-                unfinished = stored.unfinished,
-                unrecoverable = stored.unrecoverable,
-            ).also { write(file, it) }
+            stored.copy(cert = cert, info = info, renewTried = 0, noHolder = false).also { write(file, it) }
         }
 
     /** [fingerprint]'s setup, its key gone before it was committed: no longer to be finished. */
@@ -245,20 +235,7 @@ class Identities(
         synchronized(LOCK) {
             val file = file(fingerprint)
             val stored = load(file)?.takeIf { it.unfinished } ?: return
-            write(
-                file,
-                StoredIdentity(
-                    stored.handle,
-                    stored.cert,
-                    stored.card,
-                    stored.info,
-                    stored.registrar,
-                    stored.mailbox,
-                    stored.renewTried,
-                    stored.noHolder,
-                    unrecoverable = true,
-                ),
-            )
+            write(file, stored.copy(unfinished = false, unrecoverable = true))
         }
 
     /**
@@ -276,7 +253,170 @@ class Identities(
             val file = file(fingerprint)
             val stored = load(file) ?: return null
             val info = certInfo(stored.cert, card, stored.info.device, stored.info.deviceEnc)
-            StoredIdentity(handle, stored.cert, card, info, stored.registrar, stored.mailbox).also { write(file, it) }
+            stored
+                .copy(
+                    handle = handle,
+                    card = card,
+                    info = info,
+                    renewTried = 0,
+                    noHolder = false,
+                    unfinished = false,
+                    unrecoverable = false,
+                ).also { write(file, it) }
+        }
+
+    /**
+     * [fingerprint], a successor, now the identity: [card], the card its
+     * registrars attested, in place of the one kept, and the rotation it
+     * came by no longer unfinished. Throws the core's refusal if it is not
+     * that identity's card for the device, an [java.io.IOException] if the
+     * disk does not give it back as written; null if it is not kept.
+     */
+    fun rotated(
+        fingerprint: String,
+        card: ByteArray,
+    ): StoredIdentity? =
+        synchronized(LOCK) {
+            val file = file(fingerprint)
+            val stored = load(file) ?: return null
+            val info = certInfo(stored.cert, card, stored.info.device, stored.info.deviceEnc)
+            stored.copy(card = card, info = info, rotatingFrom = null).also {
+                write(file, it)
+                // Its rotation goes only once the disk holds the identity it made, or a
+                // start would find a successor with no rotation, and discard it.
+                val back = load(file)
+                if (back == null || back.rotatingFrom != null || !back.card.contentEquals(card)) {
+                    throw java.io.IOException("identity not kept")
+                }
+                syncDir(dir)
+                // In the same call, so no rotation is left that a start could take for one under way.
+                stored.rotatingFrom?.takeIf { from -> rotation(from).read?.to == fingerprint }?.let { from ->
+                    AtomicFile(rotationFile(from)).delete()
+                }
+            }
+        }
+
+    /** The rotation of [from]'s identity under way, as last kept: none, one that does not read, or it. */
+    fun rotation(from: String): FoundRotation =
+        synchronized(LOCK) {
+            val file = rotationFile(from)
+            if (!file.exists() && !File(file.path + ".bak").exists()) return FoundRotation.None
+            val bytes =
+                try {
+                    AtomicFile(file).readFully()
+                } catch (_: java.io.IOException) {
+                    // There, and not to be opened or read: what it says is not known.
+                    return FoundRotation.Unreadable
+                }
+            KeptRotation.decode(bytes)?.takeIf { it.from == from }?.let(FoundRotation::Read) ?: FoundRotation.Unreadable
+        }
+
+    /**
+     * [rotation] kept whole in place of the one before, and read back: one
+     * the disk does not give back as written is an [java.io.IOException],
+     * so the step after it is not taken. [IllegalStateException] for one
+     * that would write over a file that does not read, unsend one sent or
+     * move it to another successor or record, or be sent while its
+     * successor is not kept: a start may have discarded it.
+     */
+    fun keep(rotation: KeptRotation): Unit =
+        synchronized(LOCK) {
+            when (val found = rotation(rotation.from)) {
+                FoundRotation.Unreadable -> error("a rotation's file that does not read is not written over")
+                is FoundRotation.Read ->
+                    if (found.rotation.state == RotationState.Sent) {
+                        check(
+                            rotation.state == RotationState.Sent &&
+                                rotation.to == found.rotation.to &&
+                                rotation.record.contentEquals(found.rotation.record),
+                        ) { "a rotation sent is only finished" }
+                    }
+                FoundRotation.None -> {}
+            }
+            if (rotation.state == RotationState.Sent) {
+                check(load(file(rotation.to))?.rotatingFrom == rotation.from) { "its successor is not kept" }
+            }
+            val file = rotationFile(rotation.from)
+            val bytes = rotation.encode()
+            commit(file, bytes)
+            if (!AtomicFile(file).readFully().contentEquals(bytes)) throw java.io.IOException("rotation not kept")
+            // So a power cut cannot take the rename back, and the rotation with it to before it was sent.
+            if (rotation.state == RotationState.Sent) syncDir(dir)
+        }
+
+    /**
+     * The rotation of [from]'s identity let go of: discarded before it was
+     * sent. [IllegalStateException] for one that may have been sent while a
+     * successor waits on it: [rotated] lets go of that one.
+     */
+    fun forgetRotation(from: String): Unit =
+        synchronized(LOCK) {
+            check(forgettable(from)) { "a rotation sent is only finished" }
+            AtomicFile(rotationFile(from)).delete()
+        }
+
+    /** Whether [from]'s rotation can go: nothing waits on it, or it was never sent. */
+    private fun forgettable(from: String): Boolean {
+        val found = rotation(from)
+        return list().none { it.rotatingFrom == from } ||
+            found == FoundRotation.None ||
+            (found as? FoundRotation.Read)?.rotation?.state?.let { it != RotationState.Sent } == true
+    }
+
+    /**
+     * The successors a start is to discard, with their holds, each beside
+     * its predecessor: each whose rotation was never sent, whose rotation's
+     * file is gone or names another, and each a rotation's unsent file
+     * names that is not kept as an identity at all, its hold alone left.
+     * Nothing it signed left the phone, and a successor's key beside its
+     * predecessor's behind one screen lock would hand whoever unlocks the
+     * phone both. A file there that does not read discards nothing: it may
+     * say the rotation was sent.
+     */
+    fun unsentRotations(): List<Pair<String, String>> =
+        synchronized(LOCK) {
+            val kept = list()
+            val successors = kept.filter { it.rotatingFrom != null }
+            val orphans =
+                successors.filter { k ->
+                    when (val found = rotation(k.rotatingFrom!!)) {
+                        FoundRotation.None -> true
+                        FoundRotation.Unreadable -> false.also { Log.w(TAG, "a rotation's file does not read: its successor is kept") }
+                        is FoundRotation.Read -> found.rotation.to != k.fingerprint || found.rotation.state != RotationState.Sent
+                    }
+                }
+            val unkept =
+                rotationFiles()
+                    .mapNotNull { file ->
+                        // One file that will not open keeps its own rotation, and no other.
+                        runCatching { AtomicFile(file).readFully() }.getOrNull()?.let(KeptRotation::decode).also {
+                            if (it == null) Log.w(TAG, "a rotation's file does not read: kept")
+                        }
+                    }.filter { r -> r.state != RotationState.Sent && kept.none { it.fingerprint == r.to } }
+            (orphans.map { it.rotatingFrom!! to it.fingerprint } + unkept.map { it.from to it.to }).distinct()
+        }
+
+    private fun rotationFiles() =
+        dir
+            .listFiles()
+            .orEmpty()
+            .map { it.name.removeSuffix(".bak") }
+            .filter { it.startsWith("rotation-") && !it.contains('.') }
+            .distinct()
+            .map { File(dir, it) }
+
+    /**
+     * [successor], [from]'s, discarded, its hold already let go of: its
+     * identity, if it is that successor, then [from]'s rotation's file, if
+     * that names it and was never sent.
+     */
+    fun discardRotation(
+        from: String,
+        successor: String,
+    ): Unit =
+        synchronized(LOCK) {
+            if (load(file(successor))?.rotatingFrom == from) delete(successor)
+            (rotation(from).read)?.takeIf { it.to == successor && it.state != RotationState.Sent }?.let { forgetRotation(from) }
         }
 
     /**
@@ -411,6 +551,16 @@ class Identities(
                 val hash = MINTED.matchEntire(file.name)?.groupValues?.get(1) ?: continue
                 if ("identity-$hash" !in identities) file.delete()
             }
+            // A rotation sent whose successor is the identity now: one a finish cut short left.
+            val kept = list()
+            for (file in rotationFiles()) {
+                val r = runCatching { KeptRotation.decode(AtomicFile(file).readFully()) }.getOrNull() ?: continue
+                if (r.state == RotationState.Sent &&
+                    kept.any { it.fingerprint == r.to && it.rotatingFrom == null }
+                ) {
+                    AtomicFile(file).delete()
+                }
+            }
         }
 
     fun delete(fingerprint: String): Unit =
@@ -420,6 +570,8 @@ class Identities(
             AtomicFile(mintedFile(fingerprint)).delete()
             unread(fingerprint).forEach { it.delete() }
             AtomicFile(file).delete()
+            // Its own rotation goes with it, but not one a successor waits on.
+            if (forgettable(fingerprint)) AtomicFile(rotationFile(fingerprint)).delete()
             stored?.let { secrets.delete(secretName(it.fingerprint, it.info.device)) }
         }
 
@@ -453,6 +605,8 @@ class Identities(
                 json.optBoolean("no_holder"),
                 json.optBoolean("unfinished"),
                 json.optBoolean("unrecoverable"),
+                rotatingFrom = json.optString("rotating_from").ifEmpty { null },
+                rotation = json.optString("rotation").ifEmpty { null }?.let(::unb64),
             )
         } catch (_: Exception) {
             null
@@ -477,6 +631,8 @@ class Identities(
                     if (stored.noHolder) put("no_holder", true)
                     if (stored.unfinished) put("unfinished", true)
                     if (stored.unrecoverable) put("unrecoverable", true)
+                    stored.rotatingFrom?.let { put("rotating_from", it) }
+                    stored.rotation?.let { put("rotation", b64(it)) }
                 }
         commit(file, json.toString().toByteArray())
     }
@@ -485,6 +641,8 @@ class Identities(
     private fun file(fingerprint: String) = File(dir, "identity-" + shortHash(fingerprint.toByteArray()))
 
     private fun mintedFile(fingerprint: String) = File(dir, "minted-" + shortHash(fingerprint.toByteArray()))
+
+    private fun rotationFile(from: String) = File(dir, "rotation-" + shortHash(from.toByteArray()))
 
     private fun secretName(
         fingerprint: String,
@@ -499,7 +657,23 @@ class Identities(
         /** One for the process: AtomicFile is not safe for two writers of one name. */
         val LOCK = Any()
 
+        const val TAG = "hexline"
+
         val MINTED = Regex("minted-([0-9a-f]{24})(\\.unread-[0-9]+)?(\\.bak|\\.new)?")
+    }
+}
+
+/** [dir]'s entries to the disk, as [AtomicFile] syncs a file's contents but not its rename. */
+fun syncDirectory(dir: File) {
+    try {
+        val fd = Os.open(dir.path, OsConstants.O_RDONLY, 0)
+        try {
+            Os.fsync(fd)
+        } finally {
+            Os.close(fd)
+        }
+    } catch (e: ErrnoException) {
+        throw java.io.IOException("not synced", e)
     }
 }
 

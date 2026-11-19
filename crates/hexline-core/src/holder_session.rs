@@ -894,6 +894,7 @@ fn refused(code: &str) -> CoreError {
     CoreError::Refused {
         code: code.into(),
         detail: String::new(),
+        successor: None,
     }
 }
 
@@ -1065,6 +1066,7 @@ mod tests {
         let gone = CoreError::Refused {
             code: "not_found".into(),
             detail: String::new(),
+            successor: None,
         };
         assert!(
             matches!(answer_refusal(gone), CoreError::Refused { code, .. } if code == "expired")

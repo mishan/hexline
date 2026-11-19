@@ -169,12 +169,12 @@ class CertifyFlowTest : ViewModelHarness() {
             "no_login_request" to CertifyEnd.NO_LOGIN,
         )) {
             val session = shown(vm, fingerprint)
-            session.next.completeExceptionally(CoreException.Refused(code, ""))
+            session.next.completeExceptionally(CoreException.Refused(code, "", null))
             settle()
             assertEquals(code, Certifying.Ended(fingerprint, why), vm.certify.value)
             assertTrue("$code: let go of", session.closed)
         }
-        setups.openFails = CoreException.Refused("no_mailbox", "")
+        setups.openFails = CoreException.Refused("no_mailbox", "", null)
         vm.startCertifying(fingerprint, "chat.example")
         settle()
         assertEquals(Certifying.Ended(fingerprint, CertifyEnd.NO_MAILBOX), vm.certify.value)
@@ -504,7 +504,7 @@ class CertifyFlowTest : ViewModelHarness() {
         vm.openDevices(fingerprint)
         certified(vm, fingerprint)
         val device = devices(vm).single { !it.own }
-        setups.revokeFails = CoreException.Refused("server_error", "")
+        setups.revokeFails = CoreException.Refused("server_error", "", null)
         vm.revokeDevice(fingerprint, device, RevokeReason.LOST, stores.keys.authorizer())
         settle()
         assertEquals(listOf(device.with(revoking = true)), onDisk(fingerprint))
@@ -756,7 +756,7 @@ class CertifyFlowTest : ViewModelHarness() {
         vm.revokeDevice(fingerprint, marked, RevokeReason.LOST, stores.keys.authorizer { false })
         settle()
         assertEquals(listOf(marked), onDisk(fingerprint))
-        setups.revokeFails = CoreException.Refused("bad_time", "")
+        setups.revokeFails = CoreException.Refused("bad_time", "", null)
         vm.revokingSeen()
         vm.revokeDevice(fingerprint, marked, RevokeReason.LOST, stores.keys.authorizer())
         settle()
@@ -783,7 +783,7 @@ class CertifyFlowTest : ViewModelHarness() {
         vm.openDevices(fingerprint)
         certified(vm, fingerprint)
         val device = devices(vm).single { !it.own }
-        setups.revokeFails = CoreException.Refused("bad_record", "")
+        setups.revokeFails = CoreException.Refused("bad_record", "", null)
         vm.revokeDevice(fingerprint, device, RevokeReason.LOST, stores.keys.authorizer())
         settle()
         assertEquals(listOf(device), onDisk(fingerprint))

@@ -432,6 +432,7 @@ impl HolderSetup {
                     return Err(CoreError::Refused {
                         code: "registered_as".into(),
                         detail: h.clone(),
+                        successor: None,
                     });
                 }
             }
@@ -528,6 +529,7 @@ impl HolderSetup {
             return Err(CoreError::Refused {
                 code: "registered_not_backed_up".into(),
                 detail: e.to_string(),
+                successor: None,
             });
         }
         // Committed: nothing more is asked of it, and what it kept goes.
@@ -705,6 +707,7 @@ async fn put_card(
             .unwrap_or("card_refused")
             .into(),
         detail: status.to_string(),
+        successor: None,
     })
 }
 
@@ -727,6 +730,7 @@ pub(crate) fn refused(code: &str) -> CoreError {
     CoreError::Refused {
         code: code.into(),
         detail: String::new(),
+        successor: None,
     }
 }
 
