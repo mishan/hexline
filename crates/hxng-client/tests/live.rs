@@ -181,6 +181,7 @@ async fn a_successor_takes_its_predecessors_account_only_by_showing_the_rotation
         identity: k0.public(),
         successor: k1.public(),
         time: now,
+        next: None,
     };
     let mut card = Card::new(&k0, "Alice", now);
     card.successor = Some(rotation.commitment());

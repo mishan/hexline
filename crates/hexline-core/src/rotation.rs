@@ -206,6 +206,7 @@ impl RotationSetup {
             identity: k0.public(),
             successor: k1.public(),
             time: crate::backup::signing_time(),
+            next: None,
         }
         .sign(&k0, &k1)
         .map_err(|e| CoreError::Protocol {
@@ -463,6 +464,7 @@ mod tests {
             identity: k0.public(),
             successor: other.public(),
             time: 1,
+            next: None,
         }
         .sign(&k0, &other)
         .unwrap();
@@ -599,6 +601,7 @@ mod tests {
                 identity: k0.public(),
                 successor: k1.public(),
                 time,
+                next: None,
             }
             .sign(&k0, &k1)
             .unwrap();
