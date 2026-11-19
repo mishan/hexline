@@ -161,10 +161,7 @@ struct Setup {
     fingerprint: String,
     seed: Zeroizing<[u8; 32]>,
     card: Vec<u8>,
-    /// Until it is typed back: then only its hash, in the card, is kept.
-    successor: Option<SuccessorCode>,
-    recovery: Option<RecoveryCode>,
-    recovery_confirmed: bool,
+    codes: Codes,
     /// This phone's device, minted here: what the card is put by.
     device: Option<(Zeroizing<[u8; 32]>, Vec<u8>)>,
     held: bool,
@@ -201,9 +198,7 @@ impl HolderSetup {
             fingerprint: id.fingerprint().to_string(),
             seed: id.seed(),
             card,
-            successor: Some(successor),
-            recovery: Some(RecoveryCode::generate()),
-            recovery_confirmed: false,
+            codes: Codes::new(Some(successor)),
             device: None,
             held: false,
             target: None,
@@ -241,9 +236,7 @@ impl HolderSetup {
             fingerprint: id.fingerprint().to_string(),
             seed,
             card,
-            successor: None,
-            recovery: Some(RecoveryCode::generate()),
-            recovery_confirmed: false,
+            codes: Codes::new(None),
             device: Some((device, device_cert)),
             held: true,
             target: Some((registrar, handle)),
@@ -264,53 +257,22 @@ impl HolderSetup {
     /// The successor's code, to show once: none once it has been typed
     /// back, or for a resumed setup.
     pub fn successor_code(&self) -> Option<Vec<u8>> {
-        let s = self.lock();
-        s.successor
-            .as_ref()
-            .map(|code| code.display().as_bytes().to_vec())
+        self.lock().codes.successor_code()
     }
 
     /// Whether `typed` is the successor's code; if so it is let go of.
     pub fn confirm_successor(&self, typed: Vec<u8>) -> bool {
-        let typed = Zeroizing::new(typed);
-        let mut s = self.lock();
-        let typed = std::str::from_utf8(&typed)
-            .ok()
-            .and_then(SuccessorCode::parse);
-        let right = match (&s.successor, typed) {
-            (Some(kept), Some(typed)) => *kept.key().seed() == *typed.key().seed(),
-            _ => false,
-        };
-        if right {
-            s.successor = None;
-        }
-        right
+        self.lock().codes.confirm_successor(typed)
     }
 
     /// The recovery code, to show once: none once it has been typed back.
     pub fn recovery_code(&self) -> Option<Vec<u8>> {
-        let s = self.lock();
-        s.recovery
-            .as_ref()
-            .filter(|_| !s.recovery_confirmed)
-            .map(|c| c.display().as_bytes().to_vec())
+        self.lock().codes.recovery_code()
     }
 
     /// Whether `typed` is the recovery code, as read off paper.
     pub fn confirm_recovery(&self, typed: Vec<u8>) -> bool {
-        let typed = Zeroizing::new(typed);
-        let mut s = self.lock();
-        let right = match (
-            &s.recovery,
-            std::str::from_utf8(&typed)
-                .ok()
-                .and_then(RecoveryCode::parse),
-        ) {
-            (Some(kept), Some(typed)) => typed.display() == kept.display(),
-            _ => false,
-        };
-        s.recovery_confirmed |= right;
-        right
+        self.lock().codes.confirm_recovery(typed)
     }
 
     /// The identity's seed, for the app to hold and then wipe, once both
@@ -443,12 +405,7 @@ impl HolderSetup {
 
     fn confirmed(&self) -> Result<std::sync::MutexGuard<'_, Setup>, CoreError> {
         let s = self.lock();
-        if s.recovery.is_none() {
-            return Err(refused("committed"));
-        }
-        if s.successor.is_some() || !s.recovery_confirmed {
-            return Err(refused("unconfirmed"));
-        }
+        s.codes.confirmed()?;
         Ok(s)
     }
 
@@ -481,7 +438,7 @@ impl HolderSetup {
             s.signed = later(s.signed, crate::backup::signing_time());
             crate::backup::signed_at(s.signed);
             let id = IdentityKey::from_seed(&s.seed);
-            let recovery = s.recovery.as_ref().expect("confirmed");
+            let recovery = s.codes.recovery().expect("confirmed");
             let (envelope, keys) = tokio::task::block_in_place(|| {
                 KeyEnvelope::seal(&id, &Secret::RecoveryCode(recovery))
             })
@@ -575,11 +532,94 @@ impl HolderSetup {
         }
         // Committed: nothing more is asked of it, and what it kept goes.
         let mut s = self.lock();
-        s.recovery = None;
+        s.codes.forget();
         s.device = None;
-        s.successor = None;
         zeroize::Zeroize::zeroize(&mut *s.seed);
         Ok(HolderCommitted { card })
+    }
+}
+
+/// A successor code and a recovery code, each shown until the person types
+/// it back; then only the successor's hash, in a card, is kept, and the
+/// recovery code only to seal by.
+pub(crate) struct Codes {
+    successor: Option<SuccessorCode>,
+    recovery: Option<RecoveryCode>,
+    recovery_confirmed: bool,
+}
+
+impl Codes {
+    /// `successor` to write down, none where a card already commits to
+    /// one, and a new recovery code.
+    pub(crate) fn new(successor: Option<SuccessorCode>) -> Codes {
+        Codes {
+            successor,
+            recovery: Some(RecoveryCode::generate()),
+            recovery_confirmed: false,
+        }
+    }
+
+    pub(crate) fn successor_code(&self) -> Option<Vec<u8>> {
+        self.successor
+            .as_ref()
+            .map(|code| code.display().as_bytes().to_vec())
+    }
+
+    pub(crate) fn confirm_successor(&mut self, typed: Vec<u8>) -> bool {
+        let typed = Zeroizing::new(typed);
+        let typed = std::str::from_utf8(&typed)
+            .ok()
+            .and_then(SuccessorCode::parse);
+        let right = match (&self.successor, typed) {
+            (Some(kept), Some(typed)) => *kept.key().seed() == *typed.key().seed(),
+            _ => false,
+        };
+        if right {
+            self.successor = None;
+        }
+        right
+    }
+
+    pub(crate) fn recovery_code(&self) -> Option<Vec<u8>> {
+        self.recovery
+            .as_ref()
+            .filter(|_| !self.recovery_confirmed)
+            .map(|c| c.display().as_bytes().to_vec())
+    }
+
+    pub(crate) fn confirm_recovery(&mut self, typed: Vec<u8>) -> bool {
+        let typed = Zeroizing::new(typed);
+        let right = match (
+            &self.recovery,
+            std::str::from_utf8(&typed)
+                .ok()
+                .and_then(RecoveryCode::parse),
+        ) {
+            (Some(kept), Some(typed)) => typed.display() == kept.display(),
+            _ => false,
+        };
+        self.recovery_confirmed |= right;
+        right
+    }
+
+    pub(crate) fn recovery(&self) -> Option<&RecoveryCode> {
+        self.recovery.as_ref()
+    }
+
+    /// `committed` once let go of, `unconfirmed` until both are typed back.
+    pub(crate) fn confirmed(&self) -> Result<(), CoreError> {
+        if self.recovery.is_none() {
+            return Err(refused("committed"));
+        }
+        if self.successor.is_some() || !self.recovery_confirmed {
+            return Err(refused("unconfirmed"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn forget(&mut self) {
+        self.successor = None;
+        self.recovery = None;
     }
 }
 
@@ -668,7 +708,7 @@ async fn put_card(
     })
 }
 
-fn seed32(seed: Vec<u8>) -> Result<Zeroizing<[u8; 32]>, CoreError> {
+pub(crate) fn seed32(seed: Vec<u8>) -> Result<Zeroizing<[u8; 32]>, CoreError> {
     let seed = Zeroizing::new(seed);
     let fixed: [u8; 32] = seed
         .as_slice()
@@ -683,7 +723,7 @@ fn protocol(detail: &str) -> CoreError {
     }
 }
 
-fn refused(code: &str) -> CoreError {
+pub(crate) fn refused(code: &str) -> CoreError {
     CoreError::Refused {
         code: code.into(),
         detail: String::new(),
