@@ -376,6 +376,11 @@ async fn published(
     let mut url = format!("{records}/{fingerprint}");
     for _ in 0..PAGES {
         let (status, body) = auth::get(http, &url).await?;
+        if status == 429 {
+            return Err(CoreError::RateLimited {
+                retry_after: crate::restore::retry_after(&body),
+            });
+        }
         let list = (status == 200)
             .then(|| SignedList::parse(&body, ListKind::Records, keys).ok())
             .flatten()
@@ -795,6 +800,60 @@ mod tests {
                 "{what}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_registrar_limiting_the_records_read_after_revoked_asks_to_be_waited_for() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (k0, k1) = (IdentityKey::generate(), IdentityKey::generate());
+        let record = Rotation {
+            identity: k0.public(),
+            successor: k1.public(),
+            time: 1,
+            next: Some([7; 32]),
+        }
+        .sign(&k0, &k1)
+        .unwrap();
+        let successor = k1.fingerprint().to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Discovery, then the post answered `revoked` naming K1, then the
+        // records list asked for too often.
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0; 8192];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let (status, body) = if head.starts_with("GET /.well-known/hotline") {
+                    (
+                        200,
+                        json!({ "registrar": { "host": "127.0.0.1",
+                            "endpoints": { "register": "/registrar/register" } } }),
+                    )
+                } else if head.starts_with("POST /registrar/records") {
+                    (403, json!({ "error": "revoked", "successor": successor }))
+                } else {
+                    (429, json!({ "error": "rate_limited", "retry_after": 7 }))
+                };
+                let body = body.to_string();
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(reply.as_bytes()).await;
+            }
+        });
+        let got = post_rotation(format!("http://127.0.0.1:{port}"), record).await;
+        assert!(
+            matches!(
+                got,
+                Err(CoreError::RateLimited {
+                    retry_after: Some(7)
+                })
+            ),
+            "{got:?}"
+        );
     }
 
     #[test]

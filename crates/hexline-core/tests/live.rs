@@ -3025,9 +3025,10 @@ async fn a_successor_holding_another_commitment_refuses_the_rotation_for_good() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_held_rotation_is_pending_until_its_time_and_another_waits_behind_it() {
+async fn a_held_rotation_is_pending_until_published_and_another_waits_behind_it() {
     use hexline_core::{post_rotation, Posted};
-    let server = Server::with_registrar_delay(2).await;
+    // Held for a day, so nothing here outlasts the hold but its publication.
+    let server = Server::with_registrar_delay(86_400).await;
     let (seed, card, s1) = committed_holder(&server, "kai").await;
     let (first, next) = signed_rotation(&seed, &card, &s1);
     // Another phone holding the same successor code, with a code of its own after.
@@ -3048,15 +3049,8 @@ async fn a_held_rotation_is_pending_until_its_time_and_another_waits_behind_it()
         "nothing moved while it waits"
     );
 
-    let now = || {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-    };
-    while now() <= until {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    let k1 = hl_identity::SuccessorCode::parse(&s1).unwrap().key();
+    server.publish(&k0.fingerprint().to_string(), &k1.fingerprint().to_string());
     assert_eq!(post(&first).await.unwrap(), Posted::Published);
     assert_eq!(
         post(&second).await.unwrap(),

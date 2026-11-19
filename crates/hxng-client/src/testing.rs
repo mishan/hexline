@@ -100,19 +100,33 @@ impl Server {
     /// Freezes the identity `fingerprint` at this server's registrar, or
     /// with `lift` lifts its freeze, as its operator would.
     pub fn freeze(&self, fingerprint: &str, lift: bool) {
-        let bin = std::env::var("HXD_BIN").unwrap();
-        let mut cmd = std::process::Command::new(bin);
-        cmd.arg("--config")
-            .arg(self._dir.0.join("hxd-ng.toml"))
-            .args(["registrar", "freeze", fingerprint])
-            .current_dir(&self._dir.0);
+        let mut args = vec!["registrar", "freeze", fingerprint];
         if lift {
-            cmd.arg("--lift");
+            args.push("--lift");
         }
-        let out = cmd.output().unwrap();
+        self.operator(&args);
+    }
+
+    /// Publishes the rotation of `fingerprint` to `successor` that this
+    /// server's registrar holds, without waiting out its delay, as its
+    /// operator would.
+    pub fn publish(&self, fingerprint: &str, successor: &str) {
+        self.operator(&["registrar", "publish", fingerprint, "--to", successor]);
+    }
+
+    /// Runs `hxd` with `args` against this server's config and store.
+    fn operator(&self, args: &[&str]) {
+        let bin = std::env::var("HXD_BIN").unwrap();
+        let out = std::process::Command::new(bin)
+            .arg("--config")
+            .arg(self._dir.0.join("hxd-ng.toml"))
+            .args(args)
+            .current_dir(&self._dir.0)
+            .output()
+            .unwrap();
         assert!(
             out.status.success(),
-            "{}",
+            "{args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
