@@ -39,7 +39,7 @@ jobs:
   live:
     runs-on: ubuntu-latest
     env:
-      HXD_REV: 760645198bb66a526bcaded822b51096427edbbc
+      HXD_REV: ebbd7e254a25ea71324852615bb88fc3ba1f9857
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install

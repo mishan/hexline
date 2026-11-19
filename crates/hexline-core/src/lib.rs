@@ -36,7 +36,7 @@ pub use identity::{
 pub use model::{ChatLine, HistoryPage, Status, User};
 pub use names::{parts_hash, short_hash};
 pub use restore::{restore_identity, restore_identity_to_hold, HeldRestore, Restored, SecretKind};
-pub use rotation::RotationSetup;
+pub use rotation::{post_rotation, Posted, RotationSetup};
 
 uniffi::setup_scaffolding!();
 
