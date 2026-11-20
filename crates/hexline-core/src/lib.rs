@@ -8,10 +8,12 @@ mod enroll;
 mod holder;
 mod holder_session;
 mod identity;
+mod kept_rotation;
 mod model;
 mod names;
 mod restore;
 mod rotation;
+mod rotation_notice;
 #[cfg(target_os = "android")]
 mod tls;
 
@@ -33,10 +35,15 @@ pub use holder_session::{
 pub use identity::{
     cert_for_device, cert_info, cert_time, new_device, CertInfo, CertTime, NewDevice,
 };
+pub use kept_rotation::{
+    decode_rotation, encode_rotation, rotation_due, rotation_posted, rotations_next_due,
+    KeptRotation, RegistrarState, RotationRegistrar, RotationState,
+};
 pub use model::{ChatLine, HistoryPage, Status, User};
 pub use names::{parts_hash, short_hash};
 pub use restore::{restore_identity, restore_identity_to_hold, HeldRestore, Restored, SecretKind};
 pub use rotation::{post_rotation, Posted, RotationSetup};
+pub use rotation_notice::{rotation_notice, RotationNotice, RotationNoticeKind};
 
 uniffi::setup_scaffolding!();
 

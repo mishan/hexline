@@ -404,7 +404,7 @@ impl HolderSession {
         let (pairing, qr) = match web.filter(|w| w.origin() == base.origin()) {
             Some(web) => {
                 let mut secret = Zeroizing::new([0u8; PAIRING_SECRET_BYTES]);
-                getrandom::getrandom(&mut *secret).map_err(|e| protocol(&e.to_string()))?;
+                getrandom::fill(&mut *secret).map_err(|e| protocol(&e.to_string()))?;
                 let identity = hl_identity::Card::parse(&card)
                     .map_err(|_| refused("bad_card"))?
                     .identity;

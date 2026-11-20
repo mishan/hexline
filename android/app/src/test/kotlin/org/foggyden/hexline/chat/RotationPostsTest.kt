@@ -5,12 +5,11 @@ import androidx.lifecycle.Lifecycle
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.awaitCancellation
 import org.foggyden.hexline.core.CoreException
+import org.foggyden.hexline.core.KeptRotation
 import org.foggyden.hexline.core.Posted
-import org.foggyden.hexline.identity.KeptRotation
-import org.foggyden.hexline.identity.REPOST_FLOOR
-import org.foggyden.hexline.identity.RegistrarState
-import org.foggyden.hexline.identity.RotationRegistrar
-import org.foggyden.hexline.identity.RotationState
+import org.foggyden.hexline.core.RegistrarState
+import org.foggyden.hexline.core.RotationRegistrar
+import org.foggyden.hexline.core.RotationState
 import org.foggyden.hexline.identity.read
 import org.junit.Assert.assertEquals
 import org.junit.Test
@@ -100,9 +99,9 @@ class RotationPostsTest : ViewModelHarness() {
             awaitCancellation()
         }
         sent(
-            RotationRegistrar(HOME, listOf("alice"), true, RegistrarState.Published),
-            RotationRegistrar(OTHER, listOf("alice"), false, RegistrarState.Sent),
-            RotationRegistrar(THIRD, listOf("alice"), false, RegistrarState.Sent),
+            RotationRegistrar(HOME, listOf("alice"), true, RegistrarState.PUBLISHED),
+            RotationRegistrar(OTHER, listOf("alice"), false, RegistrarState.SENT),
+            RotationRegistrar(THIRD, listOf("alice"), false, RegistrarState.SENT),
         )
         model()
         settle()
@@ -150,13 +149,13 @@ class RotationPostsTest : ViewModelHarness() {
     fun eachAnswerIsKeptInTheFileAndShown() {
         val cases =
             listOf(
-                Posted.Published to RegistrarState.Published,
-                Posted.Pending((NOW + DAY).toULong()) to RegistrarState.Pending,
-                Posted.PendingElsewhere(null) to RegistrarState.PendingElsewhere,
-                Posted.Superseded("c2") to RegistrarState.Superseded,
-                Posted.RotatedAway("k2") to RegistrarState.RotatedAway,
-                Posted.Frozen to RegistrarState.Frozen,
-                Posted.Refused("successor_mismatch") to RegistrarState.Refused,
+                Posted.Published to RegistrarState.PUBLISHED,
+                Posted.Pending((NOW + DAY).toULong()) to RegistrarState.PENDING,
+                Posted.PendingElsewhere(null) to RegistrarState.PENDING_ELSEWHERE,
+                Posted.Superseded("c2") to RegistrarState.SUPERSEDED,
+                Posted.RotatedAway("k2") to RegistrarState.ROTATED_AWAY,
+                Posted.Frozen to RegistrarState.FROZEN,
+                Posted.Refused("successor_mismatch") to RegistrarState.REFUSED,
             )
         for ((answer, want) in cases) {
             fresh()
@@ -206,16 +205,19 @@ class RotationPostsTest : ViewModelHarness() {
     /** This test's identity kept as [PREDECESSOR]'s successor, its rotation sent to a home registrar and another. */
     private fun sent(
         vararg registrars: RotationRegistrar =
-            arrayOf(RotationRegistrar(HOME, listOf("alice"), true, RegistrarState.Sent), RotationRegistrar(OTHER, listOf("alice"), false)),
+            arrayOf(
+                RotationRegistrar(HOME, listOf("alice"), true, RegistrarState.SENT),
+                RotationRegistrar(OTHER, listOf("alice"), false, RegistrarState.SIGNED),
+            ),
     ) = outside {
-        identities.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Holding))
+        identities.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.HOLDING))
         identities.save(SEED.copyOf(), CERT, CARD, "alice@example", null, rotatingFrom = PREDECESSOR, rotation = RECORD)
         identities.keep(
             KeptRotation(
                 PREDECESSOR,
                 FINGERPRINT,
                 CARD,
-                RotationState.Sent,
+                RotationState.SENT,
                 RECORD,
                 registrars.toList(),
             ),
@@ -239,6 +241,8 @@ class RotationPostsTest : ViewModelHarness() {
     }
 
     private companion object {
+        /** The core's wait after an answer that changed something. */
+        const val REPOST_FLOOR = 60L
         const val PREDECESSOR = "k0"
         const val HOME = "https://hl.example"
         const val OTHER = "https://other.example"

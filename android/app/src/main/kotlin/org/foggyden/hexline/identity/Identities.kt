@@ -8,9 +8,13 @@ import android.util.AtomicFile
 import android.util.Base64
 import android.util.Log
 import org.foggyden.hexline.core.CertInfo
+import org.foggyden.hexline.core.KeptRotation
+import org.foggyden.hexline.core.RotationState
 import org.foggyden.hexline.core.certForDevice
 import org.foggyden.hexline.core.certInfo
+import org.foggyden.hexline.core.decodeRotation
 import org.foggyden.hexline.core.deviceFingerprintOf
+import org.foggyden.hexline.core.encodeRotation
 import org.foggyden.hexline.core.shortHash
 import org.foggyden.hexline.secrets.SecretStore
 import org.foggyden.hexline.secrets.SecretUnavailable
@@ -308,7 +312,7 @@ class Identities(
                     // There, and not to be opened or read: what it says is not known.
                     return FoundRotation.Unreadable
                 }
-            KeptRotation.decode(bytes)?.takeIf { it.from == from }?.let(FoundRotation::Read) ?: FoundRotation.Unreadable
+            decodeRotation(bytes)?.takeIf { it.from == from }?.let(FoundRotation::Read) ?: FoundRotation.Unreadable
         }
 
     /**
@@ -324,24 +328,24 @@ class Identities(
             when (val found = rotation(rotation.from)) {
                 FoundRotation.Unreadable -> error("a rotation's file that does not read is not written over")
                 is FoundRotation.Read ->
-                    if (found.rotation.state == RotationState.Sent) {
+                    if (found.rotation.state == RotationState.SENT) {
                         check(
-                            rotation.state == RotationState.Sent &&
+                            rotation.state == RotationState.SENT &&
                                 rotation.to == found.rotation.to &&
                                 rotation.record.contentEquals(found.rotation.record),
                         ) { "a rotation sent is only finished" }
                     }
                 FoundRotation.None -> {}
             }
-            if (rotation.state == RotationState.Sent) {
+            if (rotation.state == RotationState.SENT) {
                 check(load(file(rotation.to))?.rotatingFrom == rotation.from) { "its successor is not kept" }
             }
             val file = rotationFile(rotation.from)
-            val bytes = rotation.encode()
+            val bytes = encodeRotation(rotation)
             commit(file, bytes)
             if (!AtomicFile(file).readFully().contentEquals(bytes)) throw java.io.IOException("rotation not kept")
             // So a power cut cannot take the rename back, and the rotation with it to before it was sent.
-            if (rotation.state == RotationState.Sent) syncDir(dir)
+            if (rotation.state == RotationState.SENT) syncDir(dir)
         }
 
     /**
@@ -360,7 +364,7 @@ class Identities(
         val found = rotation(from)
         return list().none { it.rotatingFrom == from } ||
             found == FoundRotation.None ||
-            (found as? FoundRotation.Read)?.rotation?.state?.let { it != RotationState.Sent } == true
+            (found as? FoundRotation.Read)?.rotation?.state?.let { it != RotationState.SENT } == true
     }
 
     /**
@@ -382,17 +386,17 @@ class Identities(
                     when (val found = rotation(k.rotatingFrom!!)) {
                         FoundRotation.None -> true
                         FoundRotation.Unreadable -> false.also { Log.w(TAG, "a rotation's file does not read: its successor is kept") }
-                        is FoundRotation.Read -> found.rotation.to != k.fingerprint || found.rotation.state != RotationState.Sent
+                        is FoundRotation.Read -> found.rotation.to != k.fingerprint || found.rotation.state != RotationState.SENT
                     }
                 }
             val unkept =
                 rotationFiles()
                     .mapNotNull { file ->
                         // One file that will not open keeps its own rotation, and no other.
-                        runCatching { AtomicFile(file).readFully() }.getOrNull()?.let(KeptRotation::decode).also {
+                        runCatching { AtomicFile(file).readFully() }.getOrNull()?.let(::decodeRotation).also {
                             if (it == null) Log.w(TAG, "a rotation's file does not read: kept")
                         }
-                    }.filter { r -> r.state != RotationState.Sent && kept.none { it.fingerprint == r.to } }
+                    }.filter { r -> r.state != RotationState.SENT && kept.none { it.fingerprint == r.to } }
             (orphans.map { it.rotatingFrom!! to it.fingerprint } + unkept.map { it.from to it.to }).distinct()
         }
 
@@ -416,7 +420,7 @@ class Identities(
     ): Unit =
         synchronized(LOCK) {
             if (load(file(successor))?.rotatingFrom == from) delete(successor)
-            (rotation(from).read)?.takeIf { it.to == successor && it.state != RotationState.Sent }?.let { forgetRotation(from) }
+            (rotation(from).read)?.takeIf { it.to == successor && it.state != RotationState.SENT }?.let { forgetRotation(from) }
         }
 
     /**
@@ -554,8 +558,8 @@ class Identities(
             // A rotation sent whose successor is the identity now: one a finish cut short left.
             val kept = list()
             for (file in rotationFiles()) {
-                val r = runCatching { KeptRotation.decode(AtomicFile(file).readFully()) }.getOrNull() ?: continue
-                if (r.state == RotationState.Sent &&
+                val r = runCatching { decodeRotation(AtomicFile(file).readFully()) }.getOrNull() ?: continue
+                if (r.state == RotationState.SENT &&
                     kept.any { it.fingerprint == r.to && it.rotatingFrom == null }
                 ) {
                     AtomicFile(file).delete()

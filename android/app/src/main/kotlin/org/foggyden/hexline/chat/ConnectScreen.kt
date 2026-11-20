@@ -54,15 +54,18 @@ import org.foggyden.hexline.R
 import org.foggyden.hexline.core.CertInfo
 import org.foggyden.hexline.core.ClassicLogin
 import org.foggyden.hexline.core.HeldRenewal
+import org.foggyden.hexline.core.KeptRotation
+import org.foggyden.hexline.core.RotationNotice
+import org.foggyden.hexline.core.RotationNoticeKind
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.coreVersion
+import org.foggyden.hexline.core.rotationNotice
 import org.foggyden.hexline.identity.BackingUp
 import org.foggyden.hexline.identity.Certifying
 import org.foggyden.hexline.identity.DeviceList
 import org.foggyden.hexline.identity.EnrollProblem
 import org.foggyden.hexline.identity.Enrolling
 import org.foggyden.hexline.identity.HolderRefusal
-import org.foggyden.hexline.identity.KeptRotation
 import org.foggyden.hexline.identity.Renewing
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
@@ -305,7 +308,7 @@ private fun ConnectScreen(
         }
         // Whichever way the person signs in, as it may be someone else's doing.
         for (kept in identities) {
-            val notice = rotations[kept.fingerprint]?.let(::notice)?.takeIf { it.alarm } ?: continue
+            val notice = rotations[kept.fingerprint]?.let(::rotationNotice)?.takeIf { it.alarm } ?: continue
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(rotationBanner(notice, named(kept)), Modifier.weight(1f), color = MaterialTheme.colorScheme.error)
                 val label = stringResource(R.string.rotation_details_label, named(kept))
@@ -449,7 +452,7 @@ private fun ConnectScreen(
         )
     }
     detailsFor?.let { shown ->
-        val notice = rotations[shown.fingerprint]?.let(::notice) ?: return@let
+        val notice = rotations[shown.fingerprint]?.let(::rotationNotice) ?: return@let
         AlertDialog(
             onDismissRequest = { detailsFor = null },
             title = { Text(named(shown)) },
@@ -528,8 +531,8 @@ private fun describeRefusal(
  */
 @Composable
 private fun RotationNote(rotation: KeptRotation) {
-    val notice = notice(rotation) ?: return
-    val quiet = notice is RotationNotice.UnderWay || notice is RotationNotice.Pending
+    val notice = rotationNotice(rotation) ?: return
+    val quiet = notice.kind is RotationNoticeKind.UnderWay || notice.kind is RotationNoticeKind.Pending
     Text(
         rotationText(notice),
         Modifier.semantics { liveRegion = LiveRegionMode.Polite },
@@ -543,22 +546,19 @@ private fun RotationNote(rotation: KeptRotation) {
 private fun rotationText(notice: RotationNotice): String {
     val at = registrarHost(notice.registrar)
     val context = LocalContext.current
-    return when (notice) {
-        is RotationNotice.UnderWay -> stringResource(R.string.rotation_under_way, at)
-        is RotationNotice.Pending -> stringResource(R.string.rotation_pending, at, publishTime(context, notice.until))
-        is RotationNotice.Frozen -> stringResource(R.string.rotation_frozen, at)
-        is RotationNotice.PendingElsewhere ->
-            notice.until?.let { stringResource(R.string.rotation_pending_elsewhere, at, publishTime(context, it)) }
+    return when (val kind = notice.kind) {
+        is RotationNoticeKind.UnderWay -> stringResource(R.string.rotation_under_way, at)
+        is RotationNoticeKind.Pending -> stringResource(R.string.rotation_pending, at, publishTime(context, kind.until))
+        is RotationNoticeKind.Frozen -> stringResource(R.string.rotation_frozen, at)
+        is RotationNoticeKind.PendingElsewhere ->
+            kind.until?.let { stringResource(R.string.rotation_pending_elsewhere, at, publishTime(context, it)) }
                 ?: stringResource(R.string.rotation_pending_elsewhere_untimed, at)
-        is RotationNotice.Mismatch -> stringResource(R.string.rotation_successor_mismatch, at)
-        is RotationNotice.Superseded -> stringResource(R.string.rotation_superseded, at)
-        is RotationNotice.RotatedAway -> stringResource(R.string.rotation_rotated_away, at)
-        is RotationNotice.Refused ->
-            when (notice.code) {
-                "revoked" -> stringResource(R.string.rotation_revoked, at)
-                "not_registered" -> stringResource(R.string.rotation_not_registered, at)
-                else -> stringResource(R.string.rotation_refused, at, notice.code)
-            }
+        is RotationNoticeKind.Mismatch -> stringResource(R.string.rotation_successor_mismatch, at)
+        is RotationNoticeKind.Superseded -> stringResource(R.string.rotation_superseded, at)
+        is RotationNoticeKind.RotatedAway -> stringResource(R.string.rotation_rotated_away, at)
+        is RotationNoticeKind.Revoked -> stringResource(R.string.rotation_revoked, at)
+        is RotationNoticeKind.NotRegistered -> stringResource(R.string.rotation_not_registered, at)
+        is RotationNoticeKind.Refused -> stringResource(R.string.rotation_refused, at, kind.code)
     }
 }
 
@@ -568,11 +568,11 @@ private fun rotationBanner(
     notice: RotationNotice,
     name: String,
 ): String =
-    when (notice) {
-        is RotationNotice.PendingElsewhere -> stringResource(R.string.rotation_pending_elsewhere_banner, name)
-        is RotationNotice.Mismatch -> stringResource(R.string.rotation_mismatch_banner, name, registrarHost(notice.registrar))
-        is RotationNotice.Refused -> stringResource(R.string.rotation_revoked_banner, name, registrarHost(notice.registrar))
-        is RotationNotice.RotatedAway -> stringResource(R.string.rotation_rotated_away_banner, name)
+    when (notice.kind) {
+        is RotationNoticeKind.PendingElsewhere -> stringResource(R.string.rotation_pending_elsewhere_banner, name)
+        is RotationNoticeKind.Mismatch -> stringResource(R.string.rotation_mismatch_banner, name, registrarHost(notice.registrar))
+        is RotationNoticeKind.Revoked -> stringResource(R.string.rotation_revoked_banner, name, registrarHost(notice.registrar))
+        is RotationNoticeKind.RotatedAway -> stringResource(R.string.rotation_rotated_away_banner, name)
         else -> stringResource(R.string.rotation_superseded_banner, name)
     }
 
