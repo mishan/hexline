@@ -266,9 +266,12 @@ impl KeptRotation {
     }
 
     /// The file's bytes. Refused `no_record` for a rotation past `Holding`
-    /// without its record, which no file holds.
+    /// without its record, or with an empty one, which the file would read
+    /// back as none.
     fn encode(&self) -> Result<Vec<u8>, CoreError> {
-        if self.state != RotationState::Holding && self.record.is_none() {
+        if self.state != RotationState::Holding
+            && self.record.as_deref().is_none_or(<[u8]>::is_empty)
+        {
             return Err(refused("no_record"));
         }
         let registrars: Vec<Value> = self
@@ -944,12 +947,15 @@ mod tests {
         ] {
             assert_eq!(KeptRotation::decode(bytes.as_bytes()), None, "{what}");
         }
-        let unrecorded = KeptRotation {
-            record: None,
-            ..want
-        };
-        assert!(
-            matches!(unrecorded.encode(), Err(CoreError::Refused { code, .. }) if code == "no_record")
-        );
+        for record in [None, Some(vec![])] {
+            let unrecorded = KeptRotation {
+                record: record.clone(),
+                ..want.clone()
+            };
+            assert!(
+                matches!(unrecorded.encode(), Err(CoreError::Refused { code, .. }) if code == "no_record"),
+                "{record:?}"
+            );
+        }
     }
 }
