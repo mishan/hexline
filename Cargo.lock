@@ -535,7 +535,7 @@ dependencies = [
  "curve25519-dalek",
  "ed25519",
  "serde",
- "sha2",
+ "sha2 0.10.9",
  "subtle",
  "zeroize",
 ]
@@ -741,7 +741,7 @@ dependencies = [
  "qrcode",
  "rustls-platform-verifier",
  "serde_json",
- "sha2",
+ "sha2 0.11.0",
  "tokio",
  "uniffi",
  "zeroize",
@@ -767,7 +767,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hmac",
  "hpke",
- "sha2",
+ "sha2 0.10.9",
  "unicode-normalization",
  "url",
  "x25519-dalek",
@@ -797,7 +797,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "rand_core 0.9.5",
- "sha2",
+ "sha2 0.10.9",
  "subtle",
  "x25519-dalek",
  "zeroize",
@@ -1730,6 +1730,17 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "digest 0.10.7",
+]
+
+[[package]]
+name = "sha2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.1",
+ "digest 0.11.3",
 ]
 
 [[package]]
