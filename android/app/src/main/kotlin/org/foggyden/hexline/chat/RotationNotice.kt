@@ -1,8 +1,8 @@
 package org.foggyden.hexline.chat
 
-import org.foggyden.hexline.identity.KeptRotation
-import org.foggyden.hexline.identity.RegistrarState
-import org.foggyden.hexline.identity.RotationRegistrar
+import org.foggyden.hexline.core.KeptRotation
+import org.foggyden.hexline.core.RegistrarState
+import org.foggyden.hexline.core.RotationRegistrar
 
 /** What the person is told of a rotation sent: the worst any of its registrars answered. */
 sealed interface RotationNotice {
@@ -75,12 +75,12 @@ fun notice(rotation: KeptRotation): RotationNotice? {
 
 private fun noticeAt(r: RotationRegistrar): RotationNotice =
     when (r.state) {
-        RegistrarState.Pending -> RotationNotice.Pending(r.base, r.until)
-        RegistrarState.PendingElsewhere -> RotationNotice.PendingElsewhere(r.base, r.until.takeIf { it > 0 })
-        RegistrarState.Frozen -> RotationNotice.Frozen(r.base)
-        RegistrarState.Superseded -> RotationNotice.Superseded(r.base)
-        RegistrarState.RotatedAway -> RotationNotice.RotatedAway(r.base)
-        RegistrarState.Refused ->
+        RegistrarState.PENDING -> RotationNotice.Pending(r.base, r.until)
+        RegistrarState.PENDING_ELSEWHERE -> RotationNotice.PendingElsewhere(r.base, r.until.takeIf { it > 0 })
+        RegistrarState.FROZEN -> RotationNotice.Frozen(r.base)
+        RegistrarState.SUPERSEDED -> RotationNotice.Superseded(r.base)
+        RegistrarState.ROTATED_AWAY -> RotationNotice.RotatedAway(r.base)
+        RegistrarState.REFUSED ->
             if (r.refused == "successor_mismatch") RotationNotice.Mismatch(r.base) else RotationNotice.Refused(r.base, r.refused.orEmpty())
         else -> RotationNotice.UnderWay(r.base)
     }

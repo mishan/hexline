@@ -8,10 +8,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.CoreUpdate
+import org.foggyden.hexline.core.KeptRotation
+import org.foggyden.hexline.core.RotationState
 import org.foggyden.hexline.identity.Enrolling
 import org.foggyden.hexline.identity.FoundRotation
-import org.foggyden.hexline.identity.KeptRotation
-import org.foggyden.hexline.identity.RotationState
 import org.foggyden.hexline.identity.StoredIdentity
 import org.foggyden.hexline.secrets.SecretUnavailable
 import org.foggyden.hexline.secrets.SecretUnreadable
@@ -1052,7 +1052,7 @@ class ChatViewModelTest : ViewModelHarness() {
             val vm = model()
             settle()
             assertEquals("$state", emptyList<StoredIdentity>(), vm.identityList.value)
-            val sent = state == RotationState.Sent
+            val sent = state == RotationState.SENT
             val left = outside { listOf(kept(), stores.held.isHeld(FINGERPRINT), identities.rotation(PREDECESSOR) != FoundRotation.None) }
             assertEquals("$state: the successor, its hold and its rotation", listOf(sent, sent, sent), left)
         }
@@ -1067,7 +1067,7 @@ class ChatViewModelTest : ViewModelHarness() {
                 stores.synced.map { it == stores.identityDir }
             }
         val none = emptyList<Boolean>()
-        assertEquals(mapOf(RotationState.Holding to none, RotationState.Signed to none, RotationState.Sent to listOf(true)), synced)
+        assertEquals(mapOf(RotationState.HOLDING to none, RotationState.SIGNED to none, RotationState.SENT to listOf(true)), synced)
         outside { identities.rotated(FINGERPRINT, CARD) }
         assertEquals("and again once finished", listOf(true, true), stores.synced.map { it == stores.identityDir })
     }
@@ -1075,9 +1075,9 @@ class ChatViewModelTest : ViewModelHarness() {
     @Test
     fun anUnfinishedSuccessorIsNotRenewedQuietly() {
         outside {
-            identities.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Holding))
+            identities.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.HOLDING))
             identities.save(SEED.copyOf(), CERT, CARD, "alice@example", null, "hl.example", rotatingFrom = PREDECESSOR, rotation = RECORD)
-            identities.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Sent, RECORD))
+            identities.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.SENT, RECORD))
         }
         now = ISSUED + (EXPIRES - ISSUED) * 2 / 3 + DAY
         model()
@@ -1088,7 +1088,7 @@ class ChatViewModelTest : ViewModelHarness() {
 
     @Test
     fun aSuccessorWhoseKeyWentWithTheScreenLockIsNotDemoted() {
-        successor(RotationState.Sent)
+        successor(RotationState.SENT)
         hold()
         stores.keys.removeLock()
         val vm = model()
@@ -1098,7 +1098,7 @@ class ChatViewModelTest : ViewModelHarness() {
 
     @Test
     fun aSuccessorShowsItsRotationAtEachIdentityLogin() {
-        successor(RotationState.Sent)
+        successor(RotationState.SENT)
         outside { identities.rotated(FINGERPRINT, CARD) }
         val vm = model()
         settle()
@@ -1137,9 +1137,9 @@ class ChatViewModelTest : ViewModelHarness() {
     /** This test's identity kept as [PREDECESSOR]'s successor, its rotation as far as [state]. */
     private fun successor(state: RotationState) =
         outside {
-            identities.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Holding))
+            identities.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.HOLDING))
             identities.save(SEED.copyOf(), CERT, CARD, "alice@example", null, rotatingFrom = PREDECESSOR, rotation = RECORD)
-            if (state != RotationState.Holding) identities.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, state, RECORD))
+            if (state != RotationState.HOLDING) identities.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, state, RECORD))
         }
 
     private fun hold() =

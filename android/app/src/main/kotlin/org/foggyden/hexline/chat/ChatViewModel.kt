@@ -33,6 +33,7 @@ import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.CoreUpdate
 import org.foggyden.hexline.core.DeviceIdentity
 import org.foggyden.hexline.core.Enrollment
+import org.foggyden.hexline.core.KeptRotation
 import org.foggyden.hexline.core.LoginInfo
 import org.foggyden.hexline.core.Restored
 import org.foggyden.hexline.core.RevokeReason
@@ -58,7 +59,6 @@ import org.foggyden.hexline.identity.HeldSeeds
 import org.foggyden.hexline.identity.HolderRefusal
 import org.foggyden.hexline.identity.HolderSetups
 import org.foggyden.hexline.identity.Identities
-import org.foggyden.hexline.identity.KeptRotation
 import org.foggyden.hexline.identity.MintedDevice
 import org.foggyden.hexline.identity.NewRecoveryCode
 import org.foggyden.hexline.identity.Renewing

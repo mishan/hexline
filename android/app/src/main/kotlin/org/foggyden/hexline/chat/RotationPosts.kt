@@ -2,10 +2,13 @@ package org.foggyden.hexline.chat
 
 import kotlinx.coroutines.withContext
 import org.foggyden.hexline.core.CoreException
+import org.foggyden.hexline.core.KeptRotation
 import org.foggyden.hexline.core.Posted
+import org.foggyden.hexline.core.RotationState
+import org.foggyden.hexline.core.rotationDue
+import org.foggyden.hexline.core.rotationPosted
+import org.foggyden.hexline.core.rotationsNextDue
 import org.foggyden.hexline.identity.Identities
-import org.foggyden.hexline.identity.KeptRotation
-import org.foggyden.hexline.identity.RotationState
 import org.foggyden.hexline.identity.read
 import org.foggyden.hexline.servers.StoreQueue
 import org.foggyden.hexline.servers.stored
@@ -46,9 +49,12 @@ class RotationPosts(
                 val at = now()
                 val due =
                     withContext(queue.dispatcher) { sentRotations(identities) }.flatMap { r ->
-                        r.due(at).filter { (r.from to it.base) !in asked }.map { r to it.base }
+                        rotationDue(r, at).filter { (r.from to it) !in asked }.map { r to it }
                     }
-                if (due.isEmpty()) return if (unkept) null else withContext(queue.dispatcher) { nextDue(sentRotations(identities), at) }
+                if (due.isEmpty()) {
+                    val rotations = if (unkept) emptyList() else withContext(queue.dispatcher) { sentRotations(identities) }
+                    return rotationsNextDue(rotations, at, !unkept)
+                }
                 for ((rotation, base) in due) {
                     asked += rotation.from to base
                     var retryAfter: Long? = null
@@ -69,7 +75,7 @@ class RotationPosts(
                                     identities,
                                 ).find { it.from == rotation.from && it.record.contentEquals(rotation.record) }
                             if (kept != null) {
-                                identities.keep(kept.posted(base, answer, postedAt, retryAfter))
+                                identities.keep(rotationPosted(kept, base, answer, postedAt, retryAfter))
                                 published()
                             }
                             written = true
@@ -82,26 +88,10 @@ class RotationPosts(
             running = false
         }
     }
-
-    /** The first time from [at] that any of [rotations] is due somewhere. */
-    private fun nextDue(
-        rotations: List<KeptRotation>,
-        at: Long,
-    ): Long? {
-        // One posted earlier in the run, due again while a later post was out: at once.
-        if (rotations.any { it.due(at).isNotEmpty() }) return at
-        // Due changes only at these: a registrar's wait ending, a held time coming.
-        val times =
-            rotations
-                .flatMap { r -> r.registrars.flatMap { listOf(it.postedAt + it.wait, it.until) } }
-                .filter { it > at }
-                .sorted()
-        return times.firstOrNull { t -> rotations.any { it.due(t).isNotEmpty() } }
-    }
 }
 
 /** Each rotation sent whose successor this phone keeps, as its file has it: on the store queue. */
 fun sentRotations(identities: Identities): List<KeptRotation> =
     identities.list().mapNotNull { k ->
-        k.rotatingFrom?.let { identities.rotation(it).read }?.takeIf { it.state == RotationState.Sent && it.to == k.fingerprint }
+        k.rotatingFrom?.let { identities.rotation(it).read }?.takeIf { it.state == RotationState.SENT && it.to == k.fingerprint }
     }

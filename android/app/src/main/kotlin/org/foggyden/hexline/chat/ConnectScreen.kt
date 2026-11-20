@@ -54,6 +54,7 @@ import org.foggyden.hexline.R
 import org.foggyden.hexline.core.CertInfo
 import org.foggyden.hexline.core.ClassicLogin
 import org.foggyden.hexline.core.HeldRenewal
+import org.foggyden.hexline.core.KeptRotation
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.coreVersion
 import org.foggyden.hexline.identity.BackingUp
@@ -62,7 +63,6 @@ import org.foggyden.hexline.identity.DeviceList
 import org.foggyden.hexline.identity.EnrollProblem
 import org.foggyden.hexline.identity.Enrolling
 import org.foggyden.hexline.identity.HolderRefusal
-import org.foggyden.hexline.identity.KeptRotation
 import org.foggyden.hexline.identity.Renewing
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring

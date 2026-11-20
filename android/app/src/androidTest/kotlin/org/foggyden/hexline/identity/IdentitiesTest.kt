@@ -3,6 +3,12 @@ package org.foggyden.hexline.identity
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.foggyden.hexline.core.CoreException
+import org.foggyden.hexline.core.KeptRotation
+import org.foggyden.hexline.core.RegistrarState
+import org.foggyden.hexline.core.RotationRegistrar
+import org.foggyden.hexline.core.RotationState
+import org.foggyden.hexline.core.decodeRotation
+import org.foggyden.hexline.core.encodeRotation
 import org.foggyden.hexline.core.holderMint
 import org.foggyden.hexline.core.newIdentity
 import org.foggyden.hexline.secrets.SecretStore
@@ -129,7 +135,7 @@ class IdentitiesTest {
 
     @Test
     fun everyWriteKeepsWhatASuccessorCarries() {
-        identities().keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Holding))
+        identities().keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.HOLDING))
         identities().save(
             SEED.copyOf(),
             CERT,
@@ -179,12 +185,12 @@ class IdentitiesTest {
 
     @Test
     fun aRotationIsSentOnlyWhileItsSuccessorIsKeptAndOnceSentIsOnlyFinished() {
-        identities().keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Signed, RECORD))
-        val sent = KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Sent, RECORD)
+        identities().keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.SIGNED, RECORD))
+        val sent = KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.SENT, RECORD)
         assertThrows("discarded by another start", IllegalStateException::class.java) { identities().keep(sent) }
         sending()
         for (undo in listOf(
-            sent.copy(state = RotationState.Signed),
+            sent.copy(state = RotationState.SIGNED),
             sent.copy(to = "k-other"),
             sent.copy(record = byteArrayOf(1)),
         )) {
@@ -194,7 +200,7 @@ class IdentitiesTest {
             identities().forgetRotation(PREDECESSOR)
         }
         identities().delete(PREDECESSOR)
-        assertEquals("nor by its predecessor's delete", RotationState.Sent, identities().rotation(PREDECESSOR).read?.state)
+        assertEquals("nor by its predecessor's delete", RotationState.SENT, identities().rotation(PREDECESSOR).read?.state)
         identities().keep(sent.copy(backedUp = true))
         assertTrue(identities().rotation(PREDECESSOR).read!!.backedUp)
 
@@ -206,13 +212,13 @@ class IdentitiesTest {
 
     @Test
     fun aRotationWhoseSyncFailedIsStillSent() {
-        identities().keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Holding))
+        identities().keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.HOLDING))
         identities().save(SEED.copyOf(), CERT, CARD, null, null, rotatingFrom = PREDECESSOR, rotation = RECORD)
         val unsynced = Identities(context, SecretStore(context, alias, secrets), dir, syncDir = { throw java.io.IOException("no sync") })
         assertThrows(java.io.IOException::class.java) {
-            unsynced.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Sent, RECORD))
+            unsynced.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.SENT, RECORD))
         }
-        assertEquals(RotationState.Sent, identities().rotation(PREDECESSOR).read?.state)
+        assertEquals(RotationState.SENT, identities().rotation(PREDECESSOR).read?.state)
         assertThrows(IllegalStateException::class.java) { identities().forgetRotation(PREDECESSOR) }
         assertEquals(emptyList<Pair<String, String>>(), identities().unsentRotations())
     }
@@ -240,7 +246,7 @@ class IdentitiesTest {
                 if (!file.name.startsWith("identity-")) writeAtomically(file, bytes)
             }
         assertThrows(java.io.IOException::class.java) { lossy.rotated(FINGERPRINT, CARD) }
-        assertEquals(RotationState.Sent, identities().rotation(PREDECESSOR).read?.state)
+        assertEquals(RotationState.SENT, identities().rotation(PREDECESSOR).read?.state)
         assertEquals(PREDECESSOR, identities().list().single().rotatingFrom)
     }
 
@@ -259,8 +265,8 @@ class IdentitiesTest {
     @Test
     fun aRotationsFileThatWillNotOpenKeepsItsOwnSuccessorAndNoOther() {
         sending()
-        identities().keep(KeptRotation("k2", "k-held", CARD, RotationState.Holding))
-        val unopened = files().single { it.name.startsWith("rotation-") && KeptRotation.decode(it.readBytes())?.from == PREDECESSOR }
+        identities().keep(KeptRotation("k2", "k-held", CARD, RotationState.HOLDING))
+        val unopened = files().single { it.name.startsWith("rotation-") && decodeRotation(it.readBytes())?.from == PREDECESSOR }
         try {
             assertTrue(unopened.setReadable(false))
             assertEquals(listOf("k2" to "k-held"), identities().unsentRotations())
@@ -276,7 +282,7 @@ class IdentitiesTest {
         files().single { it.name.startsWith("rotation-") }.writeText("{")
         assertEquals(FoundRotation.Unreadable, identities().rotation(PREDECESSOR))
         assertThrows(IllegalStateException::class.java) {
-            identities().keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Holding))
+            identities().keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.HOLDING))
         }
     }
 
@@ -285,7 +291,7 @@ class IdentitiesTest {
         val k0 = newIdentity("Bob")
         val device = holderMint(k0.seed, k0.card, "Pixel")
         identities().save(device.deviceSeed, device.cert, k0.card, null, null)
-        identities().keep(KeptRotation(k0.fingerprint, FINGERPRINT, CARD, RotationState.Holding))
+        identities().keep(KeptRotation(k0.fingerprint, FINGERPRINT, CARD, RotationState.HOLDING))
         assertEquals("held, and not yet kept", listOf(k0.fingerprint to FINGERPRINT), identities().unsentRotations())
         identities().save(SEED.copyOf(), CERT, CARD, null, null, rotatingFrom = k0.fingerprint, rotation = RECORD)
         assertEquals(listOf(k0.fingerprint to FINGERPRINT), identities().unsentRotations())
@@ -294,7 +300,7 @@ class IdentitiesTest {
         assertEquals(FoundRotation.None, identities().rotation(k0.fingerprint))
 
         // A rotation's file naming an identity kept as no successor of it.
-        identities().keep(KeptRotation(PREDECESSOR, k0.fingerprint, CARD, RotationState.Holding))
+        identities().keep(KeptRotation(PREDECESSOR, k0.fingerprint, CARD, RotationState.HOLDING))
         assertEquals(emptyList<Pair<String, String>>(), identities().unsentRotations())
         identities().discardRotation(PREDECESSOR, k0.fingerprint)
         assertEquals(listOf(k0.fingerprint), identities().list().map { it.fingerprint })
@@ -304,12 +310,12 @@ class IdentitiesTest {
     fun aSuccessorIsDiscardedByItsRotationsFileOnlyWhenThatIsGoneOrAnothers() {
         val found = mutableMapOf<String, Any?>()
         for (case in listOf("gone", "another's", "unreadable")) {
-            identities().keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Holding))
+            identities().keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.HOLDING))
             identities().save(SEED.copyOf(), CERT, CARD, null, null, rotatingFrom = PREDECESSOR, rotation = RECORD)
             val file = files().single { it.name.startsWith("rotation-") }
             when (case) {
                 "gone" -> identities().forgetRotation(PREDECESSOR)
-                "another's" -> writeAtomically(file, KeptRotation(PREDECESSOR, "k-other", CARD, RotationState.Sent, RECORD).encode())
+                "another's" -> writeAtomically(file, encodeRotation(KeptRotation(PREDECESSOR, "k-other", CARD, RotationState.SENT, RECORD)))
                 else -> file.writeText("{")
             }
             val unsent = identities().unsentRotations()
@@ -349,22 +355,22 @@ class IdentitiesTest {
                 )
             }
         assertThrows(java.io.IOException::class.java) {
-            cut.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Holding))
+            cut.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.HOLDING))
         }
     }
 
     /** This test's identity kept as [PREDECESSOR]'s successor, its rotation sent. */
     private fun sending(): KeptRotation {
-        identities().keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Holding))
+        identities().keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.HOLDING))
         identities().save(SEED.copyOf(), CERT, CARD, null, null, rotatingFrom = PREDECESSOR, rotation = RECORD)
         val sent =
             KeptRotation(
                 PREDECESSOR,
                 FINGERPRINT,
                 CARD,
-                RotationState.Sent,
+                RotationState.SENT,
                 RECORD,
-                listOf(RotationRegistrar("https://reg.example", listOf("alice"), home = true, RegistrarState.Pending, 1_234)),
+                listOf(RotationRegistrar("https://reg.example", listOf("alice"), home = true, RegistrarState.PENDING, 1_234)),
                 backedUp = true,
             )
         identities().keep(sent)
