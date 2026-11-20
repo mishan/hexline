@@ -556,12 +556,9 @@ private fun rotationText(notice: RotationNotice): String {
         is RotationNoticeKind.Mismatch -> stringResource(R.string.rotation_successor_mismatch, at)
         is RotationNoticeKind.Superseded -> stringResource(R.string.rotation_superseded, at)
         is RotationNoticeKind.RotatedAway -> stringResource(R.string.rotation_rotated_away, at)
-        is RotationNoticeKind.Refused ->
-            when (kind.code) {
-                "revoked" -> stringResource(R.string.rotation_revoked, at)
-                "not_registered" -> stringResource(R.string.rotation_not_registered, at)
-                else -> stringResource(R.string.rotation_refused, at, kind.code)
-            }
+        is RotationNoticeKind.Revoked -> stringResource(R.string.rotation_revoked, at)
+        is RotationNoticeKind.NotRegistered -> stringResource(R.string.rotation_not_registered, at)
+        is RotationNoticeKind.Refused -> stringResource(R.string.rotation_refused, at, kind.code)
     }
 }
 
@@ -574,7 +571,7 @@ private fun rotationBanner(
     when (notice.kind) {
         is RotationNoticeKind.PendingElsewhere -> stringResource(R.string.rotation_pending_elsewhere_banner, name)
         is RotationNoticeKind.Mismatch -> stringResource(R.string.rotation_mismatch_banner, name, registrarHost(notice.registrar))
-        is RotationNoticeKind.Refused -> stringResource(R.string.rotation_revoked_banner, name, registrarHost(notice.registrar))
+        is RotationNoticeKind.Revoked -> stringResource(R.string.rotation_revoked_banner, name, registrarHost(notice.registrar))
         is RotationNoticeKind.RotatedAway -> stringResource(R.string.rotation_rotated_away_banner, name)
         else -> stringResource(R.string.rotation_superseded_banner, name)
     }

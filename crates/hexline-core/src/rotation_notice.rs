@@ -24,8 +24,13 @@ pub enum RotationNoticeKind {
         until: i64,
     },
     Frozen,
-    /// Refused for good: `revoked`, which anyone holding the old key alone
-    /// can do, or `not_registered`.
+    /// Refused for good as `revoked`, naming no successor, which anyone
+    /// holding the old key alone can do.
+    Revoked,
+    /// Refused for good as `not_registered`: the registrar attests no such
+    /// identity.
+    NotRegistered,
+    /// Refused for good under any other `code`.
     Refused {
         code: String,
     },
@@ -57,6 +62,8 @@ impl RotationNoticeKind {
             RegistrarState::RotatedAway => Self::RotatedAway,
             RegistrarState::Refused => match r.refused.as_deref() {
                 Some("successor_mismatch") => Self::Mismatch,
+                Some("revoked") => Self::Revoked,
+                Some("not_registered") => Self::NotRegistered,
                 code => Self::Refused {
                     code: code.unwrap_or_default().to_owned(),
                 },
@@ -67,9 +74,13 @@ impl RotationNoticeKind {
 
     fn alarm(&self) -> bool {
         match self {
-            Self::UnderWay | Self::Pending { .. } | Self::Frozen => false,
-            Self::Refused { code } => code == "revoked",
-            Self::PendingElsewhere { .. }
+            Self::UnderWay
+            | Self::Pending { .. }
+            | Self::Frozen
+            | Self::NotRegistered
+            | Self::Refused { .. } => false,
+            Self::Revoked
+            | Self::PendingElsewhere { .. }
             | Self::Mismatch
             | Self::Superseded
             | Self::RotatedAway => true,
@@ -81,8 +92,9 @@ impl RotationNoticeKind {
             Self::UnderWay => 0,
             Self::Pending { .. } => 1,
             Self::Frozen => 2,
-            // A revocation is an alarm, so above the refusals that are not.
-            Self::Refused { .. } => 3 + u8::from(self.alarm()),
+            Self::NotRegistered | Self::Refused { .. } => 3,
+            // An alarm, so above the refusals that are not.
+            Self::Revoked => 4,
             Self::PendingElsewhere { .. } => 5,
             Self::Mismatch => 6,
             Self::Superseded => 7,
@@ -151,7 +163,6 @@ mod tests {
     fn a_rotation_is_shown_as_its_registrars_worst_answer_home_first() {
         use RegistrarState::*;
         use RotationNoticeKind as K;
-        let refused = |code: &str| K::Refused { code: code.into() };
         let cases = [
             (
                 vec![at(HOME, Sent, None), at(OTHER, Signed, None)],
@@ -170,14 +181,14 @@ mod tests {
                     at(OTHER, Refused, Some("not_registered")),
                     at(HOME, Refused, Some("not_registered")),
                 ],
-                notice(HOME, refused("not_registered")),
+                notice(HOME, K::NotRegistered),
             ),
             (
                 vec![
                     at(HOME, Refused, Some("not_registered")),
                     at(OTHER, Refused, Some("revoked")),
                 ],
-                notice(OTHER, refused("revoked")),
+                notice(OTHER, K::Revoked),
             ),
             (
                 vec![
@@ -249,15 +260,35 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_is_told_by_its_code() {
+        use RotationNoticeKind as K;
+        for (code, want) in [
+            (Some("revoked"), K::Revoked),
+            (Some("not_registered"), K::NotRegistered),
+            (Some("successor_mismatch"), K::Mismatch),
+            (
+                Some("bad_request"),
+                K::Refused {
+                    code: "bad_request".into(),
+                },
+            ),
+            (None, K::Refused { code: "".into() }),
+        ] {
+            let r = at(HOME, RegistrarState::Refused, code);
+            assert_eq!(RotationNoticeKind::at(&r), want, "{code:?}");
+        }
+    }
+
+    #[test]
     fn what_may_be_someone_elses_doing_is_an_alarm() {
         use RotationNoticeKind as K;
-        let refused = |code: &str| K::Refused { code: code.into() };
         for (kind, alarm) in [
             (K::UnderWay, false),
             (K::Pending { until: 1 }, false),
             (K::Frozen, false),
-            (refused("not_registered"), false),
-            (refused("revoked"), true),
+            (K::NotRegistered, false),
+            (K::Refused { code: "bad".into() }, false),
+            (K::Revoked, true),
             (K::PendingElsewhere { until: None }, true),
             (K::Mismatch, true),
             (K::Superseded, true),
