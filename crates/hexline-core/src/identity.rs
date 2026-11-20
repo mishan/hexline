@@ -119,6 +119,7 @@ pub fn cert_time(issued: u64, expires: u64, now: u64) -> CertTime {
         expires,
         caps: None,
         name: None,
+        epoch: 0,
     };
     match window.check_valid(now, hxng_client::auth::CLOCK_SKEW) {
         Ok(()) => CertTime::Valid,

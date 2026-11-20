@@ -13,7 +13,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zeroize = "1"
 # hx-libs at the revision the core needs, which may run ahead of hxd-ng's.
-hl-identity = { git = "https://github.com/mishan/hx-libs.git", rev = "fb86aa15df43a0f1b04037d0b106dd2ffc7988c5" }
+hl-identity = { git = "https://github.com/mishan/hx-libs.git", rev = "ac6a9bc4de616686e4da7c67432d6bd20adc7b2e" }
 
 # Dependencies optimized in debug builds too: the JVM tests load a debug
 # core, and a signature checked unoptimized costs them tens of milliseconds.

@@ -279,17 +279,46 @@ pub enum Posted {
     Refused { code: String },
 }
 
+/// What a post of a rotation came to.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum PostOutcome {
+    Answered {
+        answer: Posted,
+    },
+    /// No answer that changes what is kept: the same bytes are posted
+    /// again later, after the longer of the backoff for posts that changed
+    /// nothing and the `retry_after` seconds a `rate_limited` answer asked
+    /// for, which is held to a day.
+    Unanswered {
+        retry_after: Option<u64>,
+    },
+}
+
+impl From<Result<Posted, CoreError>> for PostOutcome {
+    fn from(posted: Result<Posted, CoreError>) -> PostOutcome {
+        match posted {
+            Ok(answer) => PostOutcome::Answered { answer },
+            Err(CoreError::RateLimited { retry_after }) => PostOutcome::Unanswered { retry_after },
+            Err(_) => PostOutcome::Unanswered { retry_after: None },
+        }
+    }
+}
+
 /// What a registrar before `rotation_pending` answered a second rotation
 /// with, as a `bad_request` (registrar §6.2).
 const PENDING_TEXT: &str = "a rotation for this identity is already pending";
 
 /// Posts `record`, a rotation as signed, to `registrar`'s records. Any
-/// other answer is an error, and the same bytes may be posted again
+/// other answer is unanswered, and the same bytes may be posted again
 /// later: a registrar not reached, `rate_limited` with its `retry_after`,
 /// or a `bad_request`, among them §5.4's successor that is revoked,
 /// frozen or rotating itself, which hxd tells apart by its text alone.
 #[uniffi::export(async_runtime = "tokio")]
-pub async fn post_rotation(registrar: String, record: Vec<u8>) -> Result<Posted, CoreError> {
+pub async fn post_rotation(registrar: String, record: Vec<u8>) -> PostOutcome {
+    post(registrar, record).await.into()
+}
+
+async fn post(registrar: String, record: Vec<u8>) -> Result<Posted, CoreError> {
     let rotation = Rotation::parse(&record).map_err(|_| refused("bad_record"))?;
     crate::connection::RUNTIME
         .spawn(async move {
@@ -844,16 +873,57 @@ mod tests {
                 let _ = s.write_all(reply.as_bytes()).await;
             }
         });
-        let got = post_rotation(format!("http://127.0.0.1:{port}"), record).await;
-        assert!(
-            matches!(
-                got,
-                Err(CoreError::RateLimited {
-                    retry_after: Some(7)
-                })
-            ),
-            "{got:?}"
+        assert_eq!(
+            post_rotation(format!("http://127.0.0.1:{port}"), record).await,
+            PostOutcome::Unanswered {
+                retry_after: Some(7)
+            }
         );
+    }
+
+    #[test]
+    fn a_post_is_unanswered_but_where_a_registrar_answered_and_waits_only_where_it_asked() {
+        let refused = |code: &str| CoreError::Refused {
+            code: code.into(),
+            detail: String::new(),
+            successor: None,
+        };
+        let unanswered = |retry_after| PostOutcome::Unanswered { retry_after };
+        for (posted, want) in [
+            (
+                Ok(Posted::Frozen),
+                PostOutcome::Answered {
+                    answer: Posted::Frozen,
+                },
+            ),
+            (
+                Err(CoreError::RateLimited {
+                    retry_after: Some(7),
+                }),
+                unanswered(Some(7)),
+            ),
+            (
+                Err(CoreError::RateLimited { retry_after: None }),
+                unanswered(None),
+            ),
+            (
+                Err(CoreError::Connect {
+                    detail: "unreachable".into(),
+                }),
+                unanswered(None),
+            ),
+            (Err(refused("bad_request")), unanswered(None)),
+            (Err(refused("bad_record")), unanswered(None)),
+            (
+                Err(CoreError::Protocol {
+                    detail: "neither".into(),
+                }),
+                unanswered(None),
+            ),
+        ] {
+            let what = format!("{posted:?}");
+            assert_eq!(PostOutcome::from(posted), want, "{what}");
+        }
     }
 
     #[test]

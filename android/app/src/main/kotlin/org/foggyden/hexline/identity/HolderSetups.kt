@@ -5,7 +5,7 @@ import org.foggyden.hexline.core.HolderSession
 import org.foggyden.hexline.core.HolderSessionInterface
 import org.foggyden.hexline.core.HolderSetup
 import org.foggyden.hexline.core.HolderSetupInterface
-import org.foggyden.hexline.core.Posted
+import org.foggyden.hexline.core.PostOutcome
 import org.foggyden.hexline.core.RecoveryCodeSetup
 import org.foggyden.hexline.core.RecoveryCodeSetupInterface
 import org.foggyden.hexline.core.RevokeReason
@@ -103,7 +103,7 @@ interface HolderSetups {
     suspend fun postRotation(
         registrar: String,
         record: ByteArray,
-    ): Posted
+    ): PostOutcome
 }
 
 object CoreHolderSetups : HolderSetups {

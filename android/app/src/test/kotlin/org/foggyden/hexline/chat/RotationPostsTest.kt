@@ -4,8 +4,8 @@ import android.app.Application
 import androidx.lifecycle.Lifecycle
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.awaitCancellation
-import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.KeptRotation
+import org.foggyden.hexline.core.PostOutcome
 import org.foggyden.hexline.core.Posted
 import org.foggyden.hexline.core.RegistrarState
 import org.foggyden.hexline.core.RotationRegistrar
@@ -175,11 +175,10 @@ class RotationPostsTest : ViewModelHarness() {
     fun anUnansweredPostWaitsTheFloorAndARateLimitedOneItsRetryAfter() {
         val cases =
             listOf(
-                CoreException.Connect("unreachable") to REPOST_FLOOR,
-                CoreException.RateLimited(null) to REPOST_FLOOR,
-                CoreException.RateLimited(10u * REPOST_FLOOR.toULong()) to 10 * REPOST_FLOOR,
+                PostOutcome.Unanswered(null) to REPOST_FLOOR,
+                PostOutcome.Unanswered(10u * REPOST_FLOOR.toULong()) to 10 * REPOST_FLOOR,
             )
-        for ((e, wait) in cases) {
+        for ((outcome, wait) in cases) {
             fresh()
             setups = FakeSetups()
             now = NOW
@@ -190,15 +189,15 @@ class RotationPostsTest : ViewModelHarness() {
                 setups.posts
                     .last()
                     .second
-                    .completeExceptionally(e)
+                    .complete(outcome)
             }
             settle()
             now = NOW + wait - 1
             front()
-            assertEquals("$e: not posted again before", 1, posted().size)
+            assertEquals("$outcome: not posted again before", 1, posted().size)
             now = NOW + wait
             front()
-            assertEquals("$e: posted again once waited", 2, posted().size)
+            assertEquals("$outcome: posted again once waited", 2, posted().size)
         }
     }
 
@@ -229,7 +228,7 @@ class RotationPostsTest : ViewModelHarness() {
     /** The last post's answer, [answer], or none where null. */
     private fun answer(answer: Posted?) {
         val out = setups.posts.last().second
-        core { if (answer == null) out.completeExceptionally(CoreException.Connect("unreachable")) else out.complete(answer) }
+        core { out.complete(if (answer == null) PostOutcome.Unanswered(null) else PostOutcome.Answered(answer)) }
         settle()
     }
 

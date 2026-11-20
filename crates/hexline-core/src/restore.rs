@@ -605,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn a_renewal_replaces_its_handles_attestation_and_keeps_others_it_cannot_read() {
+    fn a_renewal_replaces_its_handles_attestation_and_keeps_what_it_cannot_read() {
         let id = IdentityKey::from_seed(&[1; 32]);
         let reg = hl_identity::ServerKey::from_seed(&[3; 32]);
         let att = |handle: &str, issued| Attestation {
@@ -631,15 +631,17 @@ mod tests {
             }
             cbor::Value::Map(entries)
         };
-        let card = Card::new(&id, "Alice", 10)
-            .sign(&id, vec![newer("alice"), newer("alt")])
-            .unwrap();
+        let mut card = Card::new(&id, "Alice", 10);
+        // A key a newer card might carry, that this version does not know.
+        card.extra.insert("future".into(), cbor::Value::Uint(42));
+        let card = card.sign(&id, vec![newer("alice"), newer("alt")]).unwrap();
         let fresh = att("alice", 1_750_000_000).sign(&reg);
         let renewed = Card::parse(&with_attestation(&id, &card, &fresh).unwrap()).unwrap();
         assert_eq!(
             renewed.embedded_attestations,
             vec![newer("alt"), cbor::decode_canonical(&fresh).unwrap()]
         );
+        assert_eq!(renewed.extra.get("future"), Some(&cbor::Value::Uint(42)));
     }
 
     /// A registrar answering every request `status`, with no body.

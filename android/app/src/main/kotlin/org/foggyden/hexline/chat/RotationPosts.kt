@@ -1,9 +1,8 @@
 package org.foggyden.hexline.chat
 
 import kotlinx.coroutines.withContext
-import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.KeptRotation
-import org.foggyden.hexline.core.Posted
+import org.foggyden.hexline.core.PostOutcome
 import org.foggyden.hexline.core.RotationState
 import org.foggyden.hexline.core.rotationDue
 import org.foggyden.hexline.core.rotationPosted
@@ -24,7 +23,7 @@ import org.foggyden.hexline.servers.stored
 class RotationPosts(
     private val identities: Identities,
     private val queue: StoreQueue,
-    private val post: suspend (registrar: String, record: ByteArray) -> Posted,
+    private val post: suspend (registrar: String, record: ByteArray) -> PostOutcome,
     private val now: () -> Long,
     private val published: () -> Unit,
 ) {
@@ -57,14 +56,7 @@ class RotationPosts(
                 }
                 for ((rotation, base) in due) {
                     asked += rotation.from to base
-                    var retryAfter: Long? = null
-                    val answer =
-                        try {
-                            post(base, rotation.record!!)
-                        } catch (e: CoreException) {
-                            if (e is CoreException.RateLimited) retryAfter = e.retryAfter?.toLong()
-                            null
-                        }
+                    val outcome = post(base, rotation.record!!)
                     val postedAt = now()
                     var written = false
                     withContext(queue.dispatcher) {
@@ -75,7 +67,7 @@ class RotationPosts(
                                     identities,
                                 ).find { it.from == rotation.from && it.record.contentEquals(rotation.record) }
                             if (kept != null) {
-                                identities.keep(rotationPosted(kept, base, answer, postedAt, retryAfter))
+                                identities.keep(rotationPosted(kept, base, outcome, postedAt))
                                 published()
                             }
                             written = true
