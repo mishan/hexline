@@ -733,7 +733,7 @@ name = "hexline-core"
 version = "0.1.0"
 dependencies = [
  "base64",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "hl-identity",
  "hxng-client",
  "jni",
