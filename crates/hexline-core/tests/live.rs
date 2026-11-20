@@ -2970,21 +2970,30 @@ async fn looked_up(server: &Server, handle: &str) -> Value {
     serde_json::from_slice(&body).unwrap()
 }
 
+/// `record` posted to `http`'s registrar: its answer, or what came instead.
+async fn posted(
+    http: String,
+    record: Vec<u8>,
+) -> Result<hexline_core::Posted, hexline_core::PostOutcome> {
+    match hexline_core::post_rotation(http, record).await {
+        hexline_core::PostOutcome::Answered { answer } => Ok(answer),
+        unanswered => Err(unanswered),
+    }
+}
+
 fn fingerprint_of(commitment: [u8; 32]) -> String {
     hl_identity::Fingerprint(commitment).to_string()
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rotation_publishes_and_the_successor_holds_the_commitment_it_names() {
-    use hexline_core::{post_rotation, Posted};
+    use hexline_core::Posted;
     let server = Server::with_registrar(&[]).await;
     let (seed, card, s1) = committed_holder(&server, "ivy").await;
     let (record, next) = signed_rotation(&seed, &card, &s1);
     for post in ["first", "again"] {
         assert_eq!(
-            post_rotation(server.http.clone(), record.clone())
-                .await
-                .unwrap(),
+            posted(server.http.clone(), record.clone()).await.unwrap(),
             Posted::Published,
             "{post}"
         );
@@ -2997,7 +3006,7 @@ async fn a_rotation_publishes_and_the_successor_holds_the_commitment_it_names() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_successor_holding_another_commitment_refuses_the_rotation_for_good() {
-    use hexline_core::{post_rotation, Posted};
+    use hexline_core::Posted;
     let server = Server::with_registrar(&[]).await;
     let (seed, card, s1) = committed_holder(&server, "june").await;
     let k1 = hl_identity::SuccessorCode::parse(&s1).unwrap().key();
@@ -3007,9 +3016,7 @@ async fn a_successor_holding_another_commitment_refuses_the_rotation_for_good() 
     let (record, _) = signed_rotation(&seed, &card, &s1);
     for post in ["first", "again"] {
         assert_eq!(
-            post_rotation(server.http.clone(), record.clone())
-                .await
-                .unwrap(),
+            posted(server.http.clone(), record.clone()).await.unwrap(),
             Posted::Refused {
                 code: "successor_mismatch".into()
             },
@@ -3026,14 +3033,14 @@ async fn a_successor_holding_another_commitment_refuses_the_rotation_for_good() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_held_rotation_is_pending_until_published_and_another_waits_behind_it() {
-    use hexline_core::{post_rotation, Posted};
+    use hexline_core::Posted;
     // Held for a day, so nothing here outlasts the hold but its publication.
     let server = Server::with_registrar_delay(86_400).await;
     let (seed, card, s1) = committed_holder(&server, "kai").await;
     let (first, next) = signed_rotation(&seed, &card, &s1);
     // Another phone holding the same successor code, with a code of its own after.
     let (second, _) = signed_rotation(&seed, &card, &s1);
-    let post = |record: &Vec<u8>| post_rotation(server.http.clone(), record.clone());
+    let post = |record: &Vec<u8>| posted(server.http.clone(), record.clone());
     let Posted::Pending { until } = post(&first).await.unwrap() else {
         panic!("not held");
     };
@@ -3067,12 +3074,12 @@ async fn a_held_rotation_is_pending_until_published_and_another_waits_behind_it(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rotation_published_first_with_another_commitment_supersedes_this_one() {
-    use hexline_core::{post_rotation, Posted};
+    use hexline_core::Posted;
     let server = Server::with_registrar(&[]).await;
     let (seed, card, s1) = committed_holder(&server, "lena").await;
     let (theirs, their_next) = signed_rotation(&seed, &card, &s1);
     let (mine, _) = signed_rotation(&seed, &card, &s1);
-    let post = |record: &Vec<u8>| post_rotation(server.http.clone(), record.clone());
+    let post = |record: &Vec<u8>| posted(server.http.clone(), record.clone());
     assert_eq!(post(&theirs).await.unwrap(), Posted::Published);
     assert_eq!(
         post(&mine).await.unwrap(),
@@ -3089,7 +3096,7 @@ async fn a_rotation_published_first_with_another_commitment_supersedes_this_one(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rotation_of_a_revoked_or_unregistered_identity_is_refused_for_good() {
-    use hexline_core::{post_rotation, Posted};
+    use hexline_core::Posted;
     let server = Server::with_registrar(&[]).await;
     let (seed, card, s1) = committed_holder(&server, "max").await;
     let k0 = hl_identity::IdentityKey::from_seed(&seed.clone().try_into().unwrap());
@@ -3116,7 +3123,7 @@ async fn a_rotation_of_a_revoked_or_unregistered_identity_is_refused_for_good() 
     .unwrap();
     let (record, _) = signed_rotation(&seed, &card, &s1);
     assert_eq!(
-        post_rotation(server.http.clone(), record).await.unwrap(),
+        posted(server.http.clone(), record).await.unwrap(),
         Posted::Refused {
             code: "revoked".into()
         }
@@ -3130,7 +3137,7 @@ async fn a_rotation_of_a_revoked_or_unregistered_identity_is_refused_for_good() 
     let card = card.sign(&stranger, Vec::new()).unwrap();
     let (record, _) = signed_rotation(stranger.seed().as_ref(), &card, &s1.display());
     assert_eq!(
-        post_rotation(server.http.clone(), record).await.unwrap(),
+        posted(server.http.clone(), record).await.unwrap(),
         Posted::Refused {
             code: "not_registered".into()
         }
@@ -3139,13 +3146,13 @@ async fn a_rotation_of_a_revoked_or_unregistered_identity_is_refused_for_good() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_frozen_identitys_rotation_publishes_when_posted_again_once_lifted() {
-    use hexline_core::{post_rotation, Posted};
+    use hexline_core::Posted;
     let server = Server::with_registrar(&[]).await;
     let (seed, card, s1) = committed_holder(&server, "nora").await;
     let k0 = hl_identity::IdentityKey::from_seed(&seed.clone().try_into().unwrap());
     let (record, _) = signed_rotation(&seed, &card, &s1);
     server.freeze(&k0.fingerprint().to_string(), false);
-    let post = || post_rotation(server.http.clone(), record.clone());
+    let post = || posted(server.http.clone(), record.clone());
     assert_eq!(post().await.unwrap(), Posted::Frozen);
     server.freeze(&k0.fingerprint().to_string(), true);
     assert_eq!(post().await.unwrap(), Posted::Published);
@@ -3154,7 +3161,7 @@ async fn a_frozen_identitys_rotation_publishes_when_posted_again_once_lifted() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_identity_rotated_first_to_another_key_is_rotated_away() {
     use base64::Engine;
-    use hexline_core::{post_rotation, Posted};
+    use hexline_core::Posted;
     use hl_identity::{Card, IdentityKey, Rotation, SuccessorCode};
     let server = Server::with_registrar(&[]).await;
     // Registered with no commitment, so the registrar takes a rotation to
@@ -3188,7 +3195,7 @@ async fn an_identity_rotated_first_to_another_key_is_rotated_away() {
     let card = card.sign(&k0, Vec::new()).unwrap();
     let (record, _) = signed_rotation(k0.seed().as_ref(), &card, &s1.display());
     assert_eq!(
-        post_rotation(server.http.clone(), record).await.unwrap(),
+        posted(server.http.clone(), record).await.unwrap(),
         Posted::RotatedAway {
             successor: theirs.fingerprint().to_string()
         }

@@ -10,7 +10,7 @@ use base64::{alphabet, Engine};
 use serde_json::{json, Map, Value};
 
 use crate::holder::refused;
-use crate::{CoreError, Posted};
+use crate::{CoreError, PostOutcome, Posted};
 
 /// How long a registrar is left after an answer that changed something, in
 /// seconds, whatever its clock says of its times; doubled for each post in
@@ -403,18 +403,23 @@ pub fn rotation_due(rotation: KeptRotation, now: i64) -> Vec<String> {
     rotation.due(now).map(|r| r.base.clone()).collect()
 }
 
-/// `rotation` as `registrar`'s `answer`, posted at `now`, leaves it: none
-/// where none came, with the `retry_after` a `rate_limited` one asked for.
-/// Refused `not_sent` for a rotation not marked sent, `not_its_registrar`
-/// for a registrar it has none of.
+/// `rotation` as a post to `registrar` at `now` that came to `outcome`
+/// leaves it. Refused `not_sent` for a rotation not marked sent,
+/// `not_its_registrar` for a registrar it has none of.
 #[uniffi::export]
 pub fn rotation_posted(
     rotation: KeptRotation,
     registrar: String,
-    answer: Option<Posted>,
+    outcome: PostOutcome,
     now: i64,
-    retry_after: Option<i64>,
 ) -> Result<KeptRotation, CoreError> {
+    let (answer, retry_after) = match outcome {
+        PostOutcome::Answered { answer } => (Some(answer), None),
+        PostOutcome::Unanswered { retry_after } => (
+            None,
+            retry_after.map(|s| i64::try_from(s).unwrap_or(i64::MAX)),
+        ),
+    };
     rotation.posted(&registrar, answer, now, retry_after)
 }
 
@@ -802,11 +807,21 @@ mod tests {
 
     #[test]
     fn a_retry_after_past_a_day_is_waited_for_a_day() {
-        let r = sent(&[at(HOME, RegistrarState::Sent)])
-            .posted(HOME, None, NOW, Some(i64::MAX))
-            .unwrap();
-        assert_eq!(home(&r).wait, RETRY_AFTER_CEILING);
-        assert_eq!(due(&r, NOW + RETRY_AFTER_CEILING), [HOME]);
+        let r = || sent(&[at(HOME, RegistrarState::Sent)]);
+        let unanswered = PostOutcome::Unanswered {
+            retry_after: Some(u64::MAX),
+        };
+        for (what, r) in [
+            ("i64::MAX", r().posted(HOME, None, NOW, Some(i64::MAX))),
+            (
+                "u64::MAX",
+                rotation_posted(r(), HOME.into(), unanswered, NOW),
+            ),
+        ] {
+            let r = r.unwrap();
+            assert_eq!(home(&r).wait, RETRY_AFTER_CEILING, "{what}");
+            assert_eq!(due(&r, NOW + RETRY_AFTER_CEILING), [HOME], "{what}");
+        }
     }
 
     #[test]

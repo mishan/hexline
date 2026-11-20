@@ -42,7 +42,7 @@ pub use kept_rotation::{
 pub use model::{ChatLine, HistoryPage, Status, User};
 pub use names::{parts_hash, short_hash};
 pub use restore::{restore_identity, restore_identity_to_hold, HeldRestore, Restored, SecretKind};
-pub use rotation::{post_rotation, Posted, RotationSetup};
+pub use rotation::{post_rotation, PostOutcome, Posted, RotationSetup};
 pub use rotation_notice::{rotation_notice, RotationNotice, RotationNoticeKind};
 
 uniffi::setup_scaffolding!();

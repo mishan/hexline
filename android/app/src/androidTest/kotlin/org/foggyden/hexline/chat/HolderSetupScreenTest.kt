@@ -33,7 +33,7 @@ import org.foggyden.hexline.core.HolderCommitted
 import org.foggyden.hexline.core.HolderRequest
 import org.foggyden.hexline.core.HolderSetup
 import org.foggyden.hexline.core.HolderSetupInterface
-import org.foggyden.hexline.core.Posted
+import org.foggyden.hexline.core.PostOutcome
 import org.foggyden.hexline.core.Qr
 import org.foggyden.hexline.core.RevokeReason
 import org.foggyden.hexline.core.SecretKind
@@ -430,7 +430,7 @@ class HolderSetupScreenTest {
         override suspend fun postRotation(
             registrar: String,
             record: ByteArray,
-        ): Posted = error("no registrar here")
+        ): PostOutcome = error("no registrar here")
     }
 
     /** A mailbox that hands over the request the test makes, and certifies with the seed it is handed. */
