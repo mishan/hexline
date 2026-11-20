@@ -90,9 +90,10 @@ private fun severity(n: RotationNotice): Int =
         is RotationNotice.UnderWay -> 0
         is RotationNotice.Pending -> 1
         is RotationNotice.Frozen -> 2
-        is RotationNotice.Refused -> 3
-        is RotationNotice.PendingElsewhere -> 4
-        is RotationNotice.Mismatch -> 5
-        is RotationNotice.Superseded -> 6
-        is RotationNotice.RotatedAway -> 7
+        // A revocation is an alarm, so above the refusals that are not.
+        is RotationNotice.Refused -> if (n.alarm) 4 else 3
+        is RotationNotice.PendingElsewhere -> 5
+        is RotationNotice.Mismatch -> 6
+        is RotationNotice.Superseded -> 7
+        is RotationNotice.RotatedAway -> 8
     }

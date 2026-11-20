@@ -3,6 +3,7 @@ package org.foggyden.hexline.chat
 import android.app.Application
 import androidx.lifecycle.Lifecycle
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.awaitCancellation
 import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.Posted
 import org.foggyden.hexline.identity.KeptRotation
@@ -92,6 +93,28 @@ class RotationPostsTest : ViewModelHarness() {
     }
 
     @Test
+    fun aRegistrarDueAgainWhileALaterPostOfTheRunWasOutIsPostedAtOnce() {
+        val waits = mutableListOf<Long>()
+        wait = { seconds ->
+            waits += seconds
+            awaitCancellation()
+        }
+        sent(
+            RotationRegistrar(HOME, listOf("alice"), true, RegistrarState.Published),
+            RotationRegistrar(OTHER, listOf("alice"), false, RegistrarState.Sent),
+            RotationRegistrar(THIRD, listOf("alice"), false, RegistrarState.Sent),
+        )
+        model()
+        settle()
+        answer(null)
+        assertEquals(listOf(OTHER, THIRD), posted())
+        // Answered once the first's wait is over: that one is due now, not at some later time.
+        now += REPOST_FLOOR
+        answer(Posted.Published)
+        assertEquals(0L, waits.last())
+    }
+
+    @Test
     fun aRotationIsNotPostedAgainWhileAPostOfItIsOut() {
         sent()
         model()
@@ -162,24 +185,23 @@ class RotationPostsTest : ViewModelHarness() {
     }
 
     /** This test's identity kept as [PREDECESSOR]'s successor, its rotation sent to a home registrar and another. */
-    private fun sent() =
-        outside {
-            identities.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Holding))
-            identities.save(SEED.copyOf(), CERT, CARD, "alice@example", null, rotatingFrom = PREDECESSOR, rotation = RECORD)
-            identities.keep(
-                KeptRotation(
-                    PREDECESSOR,
-                    FINGERPRINT,
-                    CARD,
-                    RotationState.Sent,
-                    RECORD,
-                    listOf(
-                        RotationRegistrar(HOME, listOf("alice"), true, RegistrarState.Sent),
-                        RotationRegistrar(OTHER, listOf("alice"), false),
-                    ),
-                ),
-            )
-        }
+    private fun sent(
+        vararg registrars: RotationRegistrar =
+            arrayOf(RotationRegistrar(HOME, listOf("alice"), true, RegistrarState.Sent), RotationRegistrar(OTHER, listOf("alice"), false)),
+    ) = outside {
+        identities.keep(KeptRotation(PREDECESSOR, FINGERPRINT, CARD, RotationState.Holding))
+        identities.save(SEED.copyOf(), CERT, CARD, "alice@example", null, rotatingFrom = PREDECESSOR, rotation = RECORD)
+        identities.keep(
+            KeptRotation(
+                PREDECESSOR,
+                FINGERPRINT,
+                CARD,
+                RotationState.Sent,
+                RECORD,
+                registrars.toList(),
+            ),
+        )
+    }
 
     private fun posted() = setups.posts.map { it.first }
 
@@ -201,6 +223,7 @@ class RotationPostsTest : ViewModelHarness() {
         const val PREDECESSOR = "k0"
         const val HOME = "https://hl.example"
         const val OTHER = "https://other.example"
+        const val THIRD = "https://third.example"
         const val NOW = ISSUED + DAY
         val RECORD = byteArrayOf(0xa6.toByte(), 1, 2, 3)
     }

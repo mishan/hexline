@@ -21,8 +21,10 @@ class RotationNoticeTest {
                 listOf(at(HOME, RegistrarState.Sent), at(OTHER, RegistrarState.Signed)) to RotationNotice.UnderWay(HOME),
                 listOf(at(HOME, RegistrarState.Published), at(OTHER, RegistrarState.Frozen)) to RotationNotice.Frozen(OTHER),
                 listOf(at(HOME, RegistrarState.Published), at(OTHER, RegistrarState.Superseded)) to RotationNotice.Superseded(OTHER),
-                listOf(at(OTHER, RegistrarState.Refused, "revoked"), at(HOME, RegistrarState.Refused, "not_registered")) to
+                listOf(at(OTHER, RegistrarState.Refused, "not_registered"), at(HOME, RegistrarState.Refused, "not_registered")) to
                     RotationNotice.Refused(HOME, "not_registered"),
+                listOf(at(HOME, RegistrarState.Refused, "not_registered"), at(OTHER, RegistrarState.Refused, "revoked")) to
+                    RotationNotice.Refused(OTHER, "revoked"),
                 listOf(at(HOME, RegistrarState.Refused, "revoked"), at(OTHER, RegistrarState.PendingElsewhere)) to
                     RotationNotice.PendingElsewhere(OTHER, null),
                 listOf(at(HOME, RegistrarState.Superseded), at(OTHER, RegistrarState.Refused, "successor_mismatch")) to

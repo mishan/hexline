@@ -76,11 +76,13 @@ class RotationPosts(
         }
     }
 
-    /** The first time after [at] that any of [rotations] is due somewhere. */
+    /** The first time from [at] that any of [rotations] is due somewhere. */
     private fun nextDue(
         rotations: List<KeptRotation>,
         at: Long,
     ): Long? {
+        // One posted earlier in the run, due again while a later post was out: at once.
+        if (rotations.any { it.due(at).isNotEmpty() }) return at
         // Due changes only at these: a registrar's wait ending, a held time coming.
         val times =
             rotations
