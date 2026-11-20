@@ -420,6 +420,8 @@ pub(crate) fn with_attestation(
 /// The identity's card as the registrar keeps it: `None` only when it
 /// keeps none. Any other failure is passed up, since a new card made in
 /// its place would carry no attestation and commit to no successor.
+/// Signed by the identity, it is the one source of the identity's
+/// successor commitment a restore may trust (identity-registrar.md §9.4).
 async fn card_kept(
     http: &hxng_client::reqwest::Client,
     base: &Url,
@@ -431,7 +433,7 @@ async fn card_kept(
         200 if Card::parse(&body).is_ok_and(|c| c.identity == *identity) => Ok(Some(body)),
         200 => Err(protocol("the registrar's card is not this identity's")),
         // The lookup's `successor` is not taken in its place: it is
-        // unauthenticated, and hxd-ng plans a source a phone can verify.
+        // unauthenticated (identity-registrar.md §6.3).
         404 => Ok(None),
         // 503: the registrar cannot check the card just now.
         429 | 503 => Err(CoreError::RateLimited {
@@ -681,6 +683,175 @@ mod tests {
                 want,
                 "{status}"
             );
+        }
+    }
+
+    /// A request's first line and its body, or none for a connection that
+    /// closed first.
+    async fn request(s: &mut tokio::net::TcpStream) -> Option<(String, Vec<u8>)> {
+        use tokio::io::AsyncReadExt;
+        let mut got = Vec::new();
+        let mut buf = [0; 4096];
+        loop {
+            let n = s.read(&mut buf).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            got.extend_from_slice(&buf[..n]);
+            let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&got[..end]).to_lowercase();
+            let len = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .map_or(0, |n| n.trim().parse().unwrap());
+            if got.len() >= end + 4 + len {
+                let line = head.lines().next().unwrap_or_default().to_owned();
+                return Some((line, got[end + 4..end + 4 + len].to_vec()));
+            }
+        }
+    }
+
+    /// The commitment each registration a registrar was sent asked for.
+    type Asked = std::sync::Arc<std::sync::Mutex<Vec<Option<[u8; 32]>>>>;
+
+    /// A registrar keeping `id`'s envelope under `passphrase`, answering
+    /// its card's fetch with `card`, and attesting every registration.
+    async fn registrar_serving(
+        id: &IdentityKey,
+        passphrase: &str,
+        card: (u16, Vec<u8>),
+    ) -> (Url, Asked) {
+        use tokio::io::AsyncWriteExt;
+        let (envelope, _) = KeyEnvelope::seal(id, &Secret::Passphrase(passphrase)).unwrap();
+        let reg = hl_identity::ServerKey::from_seed(&[3; 32]);
+        let identity = id.public();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = asked.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let Some((line, body)) = request(&mut s).await else {
+                    continue;
+                };
+                let json = |v: Value| (200, v.to_string().into_bytes());
+                let (status, reply) = match line.split(' ').nth(1).unwrap_or_default() {
+                    "/.well-known/hotline" => json(json!({ "registrar": {
+                        "host": "127.0.0.1",
+                        "key": b64(&reg.public()),
+                        "endpoints": {
+                            "envelopes": "/registrar/envelopes",
+                            "register": "/registrar/register",
+                        },
+                    } })),
+                    "/registrar/envelopes/params" => {
+                        json(json!({ "kdf": b64(&envelope.kdf.encode()) }))
+                    }
+                    "/registrar/envelopes/fetch" => json(json!({
+                        "identity": b64(&identity),
+                        "envelope": b64(&envelope.encode()),
+                    })),
+                    "/registrar/register" => {
+                        let body: Value = serde_json::from_slice(&body).unwrap();
+                        let req = hl_identity::RegisterRequest::parse(
+                            &unb64(body["request"].as_str().unwrap()).unwrap(),
+                        )
+                        .unwrap();
+                        kept.lock().unwrap().push(req.successor);
+                        let attestation = Attestation {
+                            identity: req.identity,
+                            registrar: req.registrar,
+                            registrar_key: reg.public(),
+                            handle: req.handle,
+                            registered: now(),
+                            issued: now(),
+                            expires: now() + 86_400,
+                            level: None,
+                        };
+                        json(json!({ "attestation": b64(&attestation.sign(&reg)) }))
+                    }
+                    path if path.starts_with("/identity/card/") => card.clone(),
+                    _ => (404, Vec::new()),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    reply.len()
+                );
+                let _ = s.write_all(&[head.as_bytes(), &reply].concat()).await;
+            }
+        });
+        (base, asked)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restore_keeps_a_card_the_identity_signed_and_its_commitment() {
+        let id = IdentityKey::from_seed(&[1; 32]);
+        let commitment = [9; 32];
+        let mut card = Card::new(&id, "Alice", 10);
+        card.successor = Some(commitment);
+        card.extra.insert("future".into(), cbor::Value::Uint(42));
+        let card = card.sign(&id, Vec::new()).unwrap();
+        // The card with its name changed after it was signed.
+        let forged = {
+            let cbor::Value::Map(mut entries) = cbor::decode_canonical(&card).unwrap() else {
+                unreachable!("cards are maps")
+            };
+            for (k, v) in &mut entries {
+                if *k == cbor::Value::Text("name".into()) {
+                    *v = cbor::Value::Text("Mallory".into());
+                }
+            }
+            cbor::encode(&cbor::Value::Map(entries))
+        };
+        let other = IdentityKey::from_seed(&[2; 32]);
+        let others = Card::new(&other, "Alice", 10)
+            .sign(&other, Vec::new())
+            .unwrap();
+
+        // The restored card's commitment, whether it is new and whether it
+        // kept what it carried; and the commitment each registration asked for.
+        type Got = Result<(Option<[u8; 32]>, bool, bool), &'static str>;
+        let cases: [(_, Got, Vec<_>); 5] = [
+            (
+                (200, card),
+                Ok((Some(commitment), false, true)),
+                vec![Some(commitment)],
+            ),
+            ((404, Vec::new()), Ok((None, true, false)), vec![None]),
+            ((200, forged), Err("protocol"), vec![]),
+            ((200, others), Err("protocol"), vec![]),
+            ((503, Vec::new()), Err("wait"), vec![]),
+        ];
+        for (case, (served, want, want_asked)) in cases.into_iter().enumerate() {
+            let (base, asked) = registrar_serving(&id, "correct horse", served).await;
+            let got: Got = match restore(
+                base.as_str(),
+                "alice",
+                SecretKind::Passphrase,
+                Zeroizing::new("correct horse".into()),
+                "Pixel",
+            )
+            .await
+            {
+                Ok((restored, _)) => {
+                    assert!(restored.attested, "case {case}");
+                    let card = Card::parse(&restored.card).unwrap();
+                    assert_eq!(card.identity, id.public(), "case {case}");
+                    Ok((
+                        card.successor,
+                        restored.new_card,
+                        card.extra.get("future") == Some(&cbor::Value::Uint(42)),
+                    ))
+                }
+                Err(CoreError::Protocol { .. }) => Err("protocol"),
+                Err(CoreError::RateLimited { .. }) => Err("wait"),
+                Err(_) => Err("other"),
+            };
+            assert_eq!(got, want, "case {case}");
+            assert_eq!(*asked.lock().unwrap(), want_asked, "case {case}");
         }
     }
 

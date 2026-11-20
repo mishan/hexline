@@ -1759,6 +1759,13 @@ async fn a_holder_made_on_the_phone_logs_in_attested_and_is_restored_by_its_reco
     .await
     .unwrap();
     assert_eq!(held.identity_seed, seed);
+    assert_eq!(
+        hl_identity::Card::parse(&held.device.card)
+            .unwrap()
+            .successor,
+        card.successor,
+        "the commitment kept from the registrar's card"
+    );
     holder_mint(held.identity_seed, held.device.card, "Tablet".into()).unwrap();
 
     let conn = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
