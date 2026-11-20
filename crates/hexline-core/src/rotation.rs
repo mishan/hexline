@@ -6,11 +6,16 @@
 
 use std::sync::{Arc, Mutex};
 
-use hl_identity::{Card, DeviceKey, IdentityKey, Rotation, SuccessorCode};
+use hl_identity::{
+    Card, DeviceKey, Fingerprint, IdentityKey, ListKind, Record, RegistrarKeys, Rotation,
+    SignedList, SuccessorCode,
+};
+use hxng_client::auth;
+use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
 use crate::holder::{refused, seed32, Codes, HolderMinted};
-use crate::restore::{certify, issued};
+use crate::restore::{b64, certify, discovered, endpoint, issued, registrar_base};
 use crate::CoreError;
 
 /// A rotation being made: the successor key K1, read from the code the
@@ -29,6 +34,10 @@ struct Rotating {
     mended: bool,
     codes: Codes,
     card1: Vec<u8>,
+    /// K1's card's commitment, which the record names as `next`: the
+    /// registrar holds it as K1's, and refuses a later rotation of K1 to
+    /// any other key.
+    next: [u8; 32],
     /// This phone's device under K1, once minted.
     device: Option<(Zeroizing<[u8; 32]>, Vec<u8>)>,
     record: Option<Vec<u8>>,
@@ -59,6 +68,7 @@ impl RotationSetup {
                 card0,
                 successor: k1.seed(),
                 mended,
+                next: next.commitment(),
                 codes: Codes::new(Some(next)),
                 card1,
                 device: None,
@@ -72,7 +82,9 @@ impl RotationSetup {
     /// new successor code is shown), this phone's device under K1 and the
     /// record as signed, which is never signed again. The recovery code is
     /// new. Refused `wrong_identity` for a seed or a record that is not the
-    /// cards', `not_committed` for a card that commits to no successor,
+    /// cards' (a record's `next` is K1's card's commitment), `no_next` for
+    /// a record that names no `next`, signed before rotations named one,
+    /// `not_committed` for a card that commits to no successor,
     /// `wrong_successor` for an old card that commits to another than K1,
     /// `bad_device` for a device that is not K1's or not a holder's own.
     #[uniffi::constructor]
@@ -101,8 +113,11 @@ impl RotationSetup {
             Some(c) if c != rotation.commitment() => return Err(refused("wrong_successor")),
             Some(_) => {}
         }
-        if parsed.successor.is_none() {
-            return Err(refused("not_committed"));
+        let next = parsed.successor.ok_or_else(|| refused("not_committed"))?;
+        match rotation.next {
+            None => return Err(refused("no_next")),
+            Some(n) if n != next => return Err(refused("wrong_identity")),
+            Some(_) => {}
         }
         let info =
             crate::identity::cert_for_device(device_cert.clone(), card1.clone(), device.to_vec())
@@ -118,6 +133,7 @@ impl RotationSetup {
                 card0,
                 successor: seed,
                 mended: false,
+                next,
                 codes: Codes::new(None),
                 card1,
                 device: Some((device, device_cert)),
@@ -206,7 +222,7 @@ impl RotationSetup {
             identity: k0.public(),
             successor: k1.public(),
             time: crate::backup::signing_time(),
-            next: None,
+            next: Some(s.next),
         }
         .sign(&k0, &k1)
         .map_err(|e| CoreError::Protocol {
@@ -226,6 +242,175 @@ impl RotationSetup {
         let s = self.lock();
         s.codes.confirmed()?;
         Ok(s)
+    }
+}
+
+/// A registrar's answer to a rotation record (registrar §6.2).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum Posted {
+    /// Published there, now or by an earlier post of the same record.
+    Published,
+    /// Held for the registrar's delay: posted again, as the same bytes,
+    /// at or after `until`, when that post publishes it.
+    Pending { until: u64 },
+    /// Another rotation of the identity is held there, and this one is
+    /// not taken while it is: until `until`, where the registrar says
+    /// (one older than `rotation_pending` does not).
+    PendingElsewhere { until: Option<u64> },
+    /// Another rotation to the same successor was published there
+    /// first, naming `next` (as a fingerprint, or none) for the
+    /// successor's commitment rather than this record's: another phone
+    /// holding the same successor code, or whoever holds both the old key
+    /// and that code. The identity is the successor's now, held to a
+    /// commitment this phone did not make.
+    Superseded { next: Option<String> },
+    /// The identity was rotated there to `successor` (a fingerprint), a
+    /// key other than this record's: whoever holds the old key, or
+    /// another phone with a successor code of its own, moved it first.
+    RotatedAway { successor: String },
+    /// Frozen there by its operator, which cancels a held rotation:
+    /// posted again once the freeze is lifted (registrar §8.2).
+    Frozen,
+    /// Refused there as `code`, which posting the same bytes again does
+    /// not change: `successor_mismatch` (the successor holds another
+    /// commitment there), `revoked` (the identity was revoked, naming no
+    /// successor), or
+    /// `not_registered` (the registrar attests no such identity).
+    Refused { code: String },
+}
+
+/// What a registrar before `rotation_pending` answered a second rotation
+/// with, as a `bad_request` (registrar §6.2).
+const PENDING_TEXT: &str = "a rotation for this identity is already pending";
+
+/// Posts `record`, a rotation as signed, to `registrar`'s records. Any
+/// other answer is an error, and the same bytes may be posted again
+/// later: a registrar not reached, `rate_limited` with its `retry_after`,
+/// or a `bad_request`, among them §5.4's successor that is revoked,
+/// frozen or rotating itself, which hxd tells apart by its text alone.
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn post_rotation(registrar: String, record: Vec<u8>) -> Result<Posted, CoreError> {
+    let rotation = Rotation::parse(&record).map_err(|_| refused("bad_record"))?;
+    crate::connection::RUNTIME
+        .spawn(async move {
+            let base = registrar_base(&registrar)?;
+            let http = auth::http_client(base.as_str(), None)?;
+            let reg = discovered(&http, &base).await?;
+            let records = endpoint(&base, &reg.records)?;
+            match auth::post(&http, &records, Some(json!({ "record": b64(&record) }))).await {
+                Ok(reply) if reply["published"] == true => Ok(Posted::Published),
+                Ok(reply) => match reply["pending_until"].as_u64() {
+                    Some(until) => Ok(Posted::Pending { until }),
+                    None => Err(protocol("a rotation neither published nor pending")),
+                },
+                Err(hxng_client::driver::Error::Refused(r))
+                    if r.error.code == "rotation_pending" =>
+                {
+                    match r.error.rest.get("pending_until").and_then(Value::as_u64) {
+                        Some(until) => Ok(Posted::PendingElsewhere { until: Some(until) }),
+                        None => Err(protocol("a rotation pending with no time")),
+                    }
+                }
+                Err(hxng_client::driver::Error::Refused(r))
+                    if r.error.code == "bad_request" && r.error.text == PENDING_TEXT =>
+                {
+                    Ok(Posted::PendingElsewhere { until: None })
+                }
+                Err(e) => match CoreError::from(e) {
+                    CoreError::Refused {
+                        code, successor, ..
+                    } if code == "revoked"
+                        && successor == Some(Fingerprint::of(&rotation.successor).to_string()) =>
+                    {
+                        let published = published(&http, &reg, &records, &rotation).await?;
+                        // hxd answers a repost of this record from its
+                        // records, before `revoked`; a registrar that does
+                        // not is answered by its bytes here.
+                        if published.1 == record || published.0.next == rotation.next {
+                            Ok(Posted::Published)
+                        } else {
+                            Ok(Posted::Superseded {
+                                next: published.0.next.map(|n| Fingerprint(n).to_string()),
+                            })
+                        }
+                    }
+                    CoreError::Refused {
+                        code,
+                        successor: Some(successor),
+                        ..
+                    } if code == "revoked" => Ok(Posted::RotatedAway { successor }),
+                    CoreError::Refused { code, .. } if code == "frozen" => Ok(Posted::Frozen),
+                    CoreError::Refused { code, .. }
+                        if matches!(
+                            code.as_str(),
+                            "successor_mismatch" | "revoked" | "not_registered"
+                        ) =>
+                    {
+                        Ok(Posted::Refused { code })
+                    }
+                    e => Err(e),
+                },
+            }
+        })
+        .await
+        .unwrap_or_else(|_| Err(protocol("the rotation's post stopped")))
+}
+
+/// The rotation of `rotation`'s identity to its successor that the
+/// registrar published, as its records list for the identity carries it,
+/// and its bytes: page after page, each past the last seq seen, until the
+/// list ends.
+async fn published(
+    http: &hxng_client::reqwest::Client,
+    reg: &crate::restore::Registrar,
+    records: &str,
+    rotation: &Rotation,
+) -> Result<(Rotation, Vec<u8>), CoreError> {
+    // A registrar serving pages without end is not followed for ever.
+    const PAGES: usize = 64;
+    let fingerprint = Fingerprint::of(&rotation.identity);
+    let keys = RegistrarKeys {
+        host: &reg.host,
+        keys: &reg.keys,
+    };
+    let mut url = format!("{records}/{fingerprint}");
+    for _ in 0..PAGES {
+        let (status, body) = auth::get(http, &url).await?;
+        if status == 429 {
+            return Err(CoreError::RateLimited {
+                retry_after: crate::restore::retry_after(&body),
+            });
+        }
+        let list = (status == 200)
+            .then(|| SignedList::parse(&body, ListKind::Records, keys).ok())
+            .flatten()
+            .filter(|l| l.fingerprint == Some(fingerprint.0))
+            .ok_or_else(|| protocol("the identity's records do not read"))?;
+        let last = list.entries.last().map(|(seq, _)| *seq);
+        let found = list.entries.into_iter().find_map(|(_, bytes)| {
+            match Record::parse(&bytes, Some(keys)) {
+                Ok(Record::Rotate(r))
+                    if r.identity == rotation.identity && r.successor == rotation.successor =>
+                {
+                    Some((r, bytes))
+                }
+                _ => None,
+            }
+        });
+        match (found, last) {
+            (Some(found), _) => return Ok(found),
+            (None, Some(last)) if list.more => {
+                url = format!("{records}/{fingerprint}?since={last}")
+            }
+            _ => break,
+        }
+    }
+    Err(protocol("rotated, with no rotation in its records"))
+}
+
+fn protocol(detail: &str) -> CoreError {
+    CoreError::Protocol {
+        detail: detail.into(),
     }
 }
 
@@ -417,6 +602,8 @@ mod tests {
         let rotation = Rotation::parse(&record).unwrap();
         assert_eq!(rotation.identity, k0.public());
         assert_eq!(rotation.successor, s1.key().public());
+        let card1 = Card::parse(&r.successor_card().unwrap()).unwrap();
+        assert_eq!(rotation.next, card1.successor, "K1's first commitment");
         assert_eq!(
             r.sign(k0.seed().to_vec()).unwrap(),
             record,
@@ -467,6 +654,22 @@ mod tests {
             next: None,
         }
         .sign(&k0, &other)
+        .unwrap();
+        let other_next = Rotation {
+            identity: k0.public(),
+            successor: k1.public(),
+            time: 1,
+            next: Some([7; 32]),
+        }
+        .sign(&k0, &k1)
+        .unwrap();
+        let no_next = Rotation {
+            identity: k0.public(),
+            successor: k1.public(),
+            time: 1,
+            next: None,
+        }
+        .sign(&k0, &k1)
         .unwrap();
         let (_, others_card0) = held(&s1);
         let committing = |successor| {
@@ -546,6 +749,24 @@ mod tests {
                 "wrong_identity",
             ),
             (
+                "a record naming another next",
+                k1_seed.clone(),
+                &card0,
+                &card1,
+                &minted.cert,
+                &other_next,
+                "wrong_identity",
+            ),
+            (
+                "a record naming no next",
+                k1_seed.clone(),
+                &card0,
+                &card1,
+                &minted.cert,
+                &no_next,
+                "no_next",
+            ),
+            (
                 "no commitment",
                 k1_seed.clone(),
                 &card0,
@@ -581,18 +802,68 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_registrar_limiting_the_records_read_after_revoked_asks_to_be_waited_for() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (k0, k1) = (IdentityKey::generate(), IdentityKey::generate());
+        let record = Rotation {
+            identity: k0.public(),
+            successor: k1.public(),
+            time: 1,
+            next: Some([7; 32]),
+        }
+        .sign(&k0, &k1)
+        .unwrap();
+        let successor = k1.fingerprint().to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Discovery, then the post answered `revoked` naming K1, then the
+        // records list asked for too often.
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0; 8192];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let (status, body) = if head.starts_with("GET /.well-known/hotline") {
+                    (
+                        200,
+                        json!({ "registrar": { "host": "127.0.0.1",
+                            "endpoints": { "register": "/registrar/register" } } }),
+                    )
+                } else if head.starts_with("POST /registrar/records") {
+                    (403, json!({ "error": "revoked", "successor": successor }))
+                } else {
+                    (429, json!({ "error": "rate_limited", "retry_after": 7 }))
+                };
+                let body = body.to_string();
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(reply.as_bytes()).await;
+            }
+        });
+        let got = post_rotation(format!("http://127.0.0.1:{port}"), record).await;
+        assert!(
+            matches!(
+                got,
+                Err(CoreError::RateLimited {
+                    retry_after: Some(7)
+                })
+            ),
+            "{got:?}"
+        );
+    }
+
     #[test]
     fn a_resumed_rotation_signs_nothing_at_a_time_the_process_before_may_have() {
         // Built by hand: nothing here signs before the resume does.
         let s1 = SuccessorCode::generate();
         let (k0, card0) = held(&s1);
         let k1 = s1.key();
-        let card1 = successor_card(
-            &k1,
-            &Card::parse(&card0).unwrap(),
-            &SuccessorCode::generate(),
-        )
-        .unwrap();
+        let s2 = SuccessorCode::generate();
+        let card1 = successor_card(&k1, &Card::parse(&card0).unwrap(), &s2).unwrap();
         let device = DeviceKey::generate();
         let cert = certify(&k1, &device, "Pixel").unwrap();
         // Ahead by more than any other test moves the shared clock.
@@ -601,7 +872,7 @@ mod tests {
                 identity: k0.public(),
                 successor: k1.public(),
                 time,
-                next: None,
+                next: Some(s2.commitment()),
             }
             .sign(&k0, &k1)
             .unwrap();

@@ -1777,9 +1777,42 @@ async fn a_holder_made_on_the_phone_logs_in_attested_and_is_restored_by_its_reco
     );
 }
 
+/// `id`'s registration of `handle` at `server`'s registrar, committing to
+/// `successor`: later than any request a commit just signed.
+async fn registered(
+    server: &Server,
+    id: &hl_identity::IdentityKey,
+    handle: &str,
+    successor: Option<[u8; 32]>,
+) -> Result<Value, CoreError> {
+    use base64::Engine;
+    let request = hl_identity::RegisterRequest {
+        identity: id.public(),
+        registrar: "127.0.0.1".into(),
+        handle: handle.into(),
+        time: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 2,
+        successor,
+        proof: None,
+    }
+    .sign(id)
+    .unwrap();
+    let http = hxng_client::auth::http_client(&server.http, None).unwrap();
+    Ok(hxng_client::auth::post(
+        &http,
+        &format!("{}/registrar/register", server.http),
+        Some(serde_json::json!({
+            "request": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(request)
+        })),
+    )
+    .await?)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_registrar_holds_the_successor_a_setup_commits_to() {
-    use hl_identity::{IdentityKey, RegisterRequest};
     let server = Server::with_registrar(&[]).await;
     let (setup, ..) = confirmed_setup();
     let seed: [u8; 32] = setup.identity_seed().unwrap().try_into().unwrap();
@@ -1787,33 +1820,11 @@ async fn the_registrar_holds_the_successor_a_setup_commits_to() {
         .commit(server.http.clone(), "gina".into(), None)
         .await
         .unwrap();
-    let id = IdentityKey::from_seed(&seed);
-    let request = RegisterRequest {
-        identity: id.public(),
-        registrar: "127.0.0.1".into(),
-        handle: "gina".into(),
-        time: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            + 2,
-        successor: Some([9; 32]),
-        proof: None,
-    }
-    .sign(&id)
-    .unwrap();
-    use base64::Engine;
-    let http = hxng_client::auth::http_client(&server.http, None).unwrap();
-    let e = hxng_client::auth::post(
-        &http,
-        &format!("{}/registrar/register", server.http),
-        Some(serde_json::json!({
-            "request": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(request)
-        })),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(refused_as(&CoreError::from(e)), "successor_mismatch");
+    let id = hl_identity::IdentityKey::from_seed(&seed);
+    let e = registered(&server, &id, "gina", Some([9; 32]))
+        .await
+        .unwrap_err();
+    assert_eq!(refused_as(&e), "successor_mismatch");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2919,4 +2930,267 @@ async fn a_web_client_on_another_origin_gets_no_qr_code() {
         .await
         .unwrap();
     assert!(session.qr().is_none(), "a code typed, never one scanned");
+}
+
+/// A holder committed as `handle` at `server`'s registrar: its seed, its
+/// attested card, and the successor code that card commits to.
+async fn committed_holder(server: &Server, handle: &str) -> (Vec<u8>, Vec<u8>, String) {
+    let setup = hexline_core::HolderSetup::new("Ivy".into()).unwrap();
+    let s1 = String::from_utf8(setup.successor_code().unwrap()).unwrap();
+    assert!(setup.confirm_successor(s1.clone().into_bytes()));
+    assert!(setup.confirm_recovery(setup.recovery_code().unwrap()));
+    setup.mint("Pixel".into()).unwrap();
+    setup.held().unwrap();
+    let seed = setup.identity_seed().unwrap();
+    let committed = setup
+        .commit(server.http.clone(), handle.into(), None)
+        .await
+        .unwrap();
+    (seed, committed.card, s1)
+}
+
+/// That holder's rotation to the successor `s1` names, signed: the record,
+/// and the commitment the successor's card carries.
+fn signed_rotation(seed: &[u8], card: &[u8], s1: &str) -> (Vec<u8>, [u8; 32]) {
+    let r = hexline_core::RotationSetup::new(card.to_vec(), s1.as_bytes().to_vec()).unwrap();
+    assert!(r.confirm_next_successor(r.next_successor_code().unwrap()));
+    assert!(r.confirm_recovery(r.recovery_code().unwrap()));
+    r.mint("Pixel".into()).unwrap();
+    let record = r.sign(seed.to_vec()).unwrap();
+    let card1 = hl_identity::Card::parse(&r.successor_card().unwrap()).unwrap();
+    (record, card1.successor.unwrap())
+}
+
+/// What `server`'s registrar's lookup answers for `handle`.
+async fn looked_up(server: &Server, handle: &str) -> Value {
+    let http = hxng_client::auth::http_client(&server.http, None).unwrap();
+    let url = format!("{}/registrar/lookup/{handle}", server.http);
+    let (status, body) = hxng_client::auth::get(&http, &url).await.unwrap();
+    assert_eq!(status, 200, "{handle}");
+    serde_json::from_slice(&body).unwrap()
+}
+
+fn fingerprint_of(commitment: [u8; 32]) -> String {
+    hl_identity::Fingerprint(commitment).to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rotation_publishes_and_the_successor_holds_the_commitment_it_names() {
+    use hexline_core::{post_rotation, Posted};
+    let server = Server::with_registrar(&[]).await;
+    let (seed, card, s1) = committed_holder(&server, "ivy").await;
+    let (record, next) = signed_rotation(&seed, &card, &s1);
+    for post in ["first", "again"] {
+        assert_eq!(
+            post_rotation(server.http.clone(), record.clone())
+                .await
+                .unwrap(),
+            Posted::Published,
+            "{post}"
+        );
+    }
+    let found = looked_up(&server, "ivy").await;
+    let k1 = hl_identity::SuccessorCode::parse(&s1).unwrap().key();
+    assert_eq!(found["fingerprint"], k1.fingerprint().to_string());
+    assert_eq!(found["successor"], fingerprint_of(next));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_successor_holding_another_commitment_refuses_the_rotation_for_good() {
+    use hexline_core::{post_rotation, Posted};
+    let server = Server::with_registrar(&[]).await;
+    let (seed, card, s1) = committed_holder(&server, "june").await;
+    let k1 = hl_identity::SuccessorCode::parse(&s1).unwrap().key();
+    registered(&server, &k1, "june2", Some([9; 32]))
+        .await
+        .unwrap();
+    let (record, _) = signed_rotation(&seed, &card, &s1);
+    for post in ["first", "again"] {
+        assert_eq!(
+            post_rotation(server.http.clone(), record.clone())
+                .await
+                .unwrap(),
+            Posted::Refused {
+                code: "successor_mismatch".into()
+            },
+            "{post}"
+        );
+    }
+    let k0 = hl_identity::IdentityKey::from_seed(&seed.try_into().unwrap());
+    assert_eq!(
+        looked_up(&server, "june").await["fingerprint"],
+        k0.fingerprint().to_string(),
+        "the identity stays where it was"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_rotation_is_pending_until_published_and_another_waits_behind_it() {
+    use hexline_core::{post_rotation, Posted};
+    // Held for a day, so nothing here outlasts the hold but its publication.
+    let server = Server::with_registrar_delay(86_400).await;
+    let (seed, card, s1) = committed_holder(&server, "kai").await;
+    let (first, next) = signed_rotation(&seed, &card, &s1);
+    // Another phone holding the same successor code, with a code of its own after.
+    let (second, _) = signed_rotation(&seed, &card, &s1);
+    let post = |record: &Vec<u8>| post_rotation(server.http.clone(), record.clone());
+    let Posted::Pending { until } = post(&first).await.unwrap() else {
+        panic!("not held");
+    };
+    assert_eq!(post(&first).await.unwrap(), Posted::Pending { until });
+    assert_eq!(
+        post(&second).await.unwrap(),
+        Posted::PendingElsewhere { until: Some(until) }
+    );
+    let k0 = hl_identity::IdentityKey::from_seed(&seed.try_into().unwrap());
+    assert_eq!(
+        looked_up(&server, "kai").await["fingerprint"],
+        k0.fingerprint().to_string(),
+        "nothing moved while it waits"
+    );
+
+    let k1 = hl_identity::SuccessorCode::parse(&s1).unwrap().key();
+    server.publish(&k0.fingerprint().to_string(), &k1.fingerprint().to_string());
+    assert_eq!(post(&first).await.unwrap(), Posted::Published);
+    assert_eq!(
+        post(&second).await.unwrap(),
+        Posted::Superseded {
+            next: Some(fingerprint_of(next))
+        },
+        "rotated to the same successor, under the first's commitment"
+    );
+    assert_eq!(
+        looked_up(&server, "kai").await["successor"],
+        fingerprint_of(next)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rotation_published_first_with_another_commitment_supersedes_this_one() {
+    use hexline_core::{post_rotation, Posted};
+    let server = Server::with_registrar(&[]).await;
+    let (seed, card, s1) = committed_holder(&server, "lena").await;
+    let (theirs, their_next) = signed_rotation(&seed, &card, &s1);
+    let (mine, _) = signed_rotation(&seed, &card, &s1);
+    let post = |record: &Vec<u8>| post_rotation(server.http.clone(), record.clone());
+    assert_eq!(post(&theirs).await.unwrap(), Posted::Published);
+    assert_eq!(
+        post(&mine).await.unwrap(),
+        Posted::Superseded {
+            next: Some(fingerprint_of(their_next))
+        }
+    );
+    assert_eq!(
+        post(&theirs).await.unwrap(),
+        Posted::Published,
+        "theirs again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rotation_of_a_revoked_or_unregistered_identity_is_refused_for_good() {
+    use hexline_core::{post_rotation, Posted};
+    let server = Server::with_registrar(&[]).await;
+    let (seed, card, s1) = committed_holder(&server, "max").await;
+    let k0 = hl_identity::IdentityKey::from_seed(&seed.clone().try_into().unwrap());
+    let revocation = hl_identity::IdentityRevocation {
+        identity: k0.public(),
+        time: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        reason: None,
+    }
+    .sign(&k0)
+    .unwrap();
+    use base64::Engine;
+    let http = hxng_client::auth::http_client(&server.http, None).unwrap();
+    hxng_client::auth::post(
+        &http,
+        &format!("{}/registrar/records", server.http),
+        Some(serde_json::json!({
+            "record": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(revocation)
+        })),
+    )
+    .await
+    .unwrap();
+    let (record, _) = signed_rotation(&seed, &card, &s1);
+    assert_eq!(
+        post_rotation(server.http.clone(), record).await.unwrap(),
+        Posted::Refused {
+            code: "revoked".into()
+        }
+    );
+
+    // An identity the registrar never registered.
+    let stranger = hl_identity::IdentityKey::generate();
+    let s1 = hl_identity::SuccessorCode::generate();
+    let mut card = hl_identity::Card::new(&stranger, "Ned", 1);
+    card.successor = Some(s1.commitment());
+    let card = card.sign(&stranger, Vec::new()).unwrap();
+    let (record, _) = signed_rotation(stranger.seed().as_ref(), &card, &s1.display());
+    assert_eq!(
+        post_rotation(server.http.clone(), record).await.unwrap(),
+        Posted::Refused {
+            code: "not_registered".into()
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frozen_identitys_rotation_publishes_when_posted_again_once_lifted() {
+    use hexline_core::{post_rotation, Posted};
+    let server = Server::with_registrar(&[]).await;
+    let (seed, card, s1) = committed_holder(&server, "nora").await;
+    let k0 = hl_identity::IdentityKey::from_seed(&seed.clone().try_into().unwrap());
+    let (record, _) = signed_rotation(&seed, &card, &s1);
+    server.freeze(&k0.fingerprint().to_string(), false);
+    let post = || post_rotation(server.http.clone(), record.clone());
+    assert_eq!(post().await.unwrap(), Posted::Frozen);
+    server.freeze(&k0.fingerprint().to_string(), true);
+    assert_eq!(post().await.unwrap(), Posted::Published);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identity_rotated_first_to_another_key_is_rotated_away() {
+    use base64::Engine;
+    use hexline_core::{post_rotation, Posted};
+    use hl_identity::{Card, IdentityKey, Rotation, SuccessorCode};
+    let server = Server::with_registrar(&[]).await;
+    // Registered with no commitment, so the registrar takes a rotation to
+    // any key the old one acknowledges with it.
+    let k0 = IdentityKey::generate();
+    registered(&server, &k0, "olga", None).await.unwrap();
+    let theirs = IdentityKey::generate();
+    let taken = Rotation {
+        identity: k0.public(),
+        successor: theirs.public(),
+        time: 1,
+        next: None,
+    }
+    .sign(&k0, &theirs)
+    .unwrap();
+    let http = hxng_client::auth::http_client(&server.http, None).unwrap();
+    hxng_client::auth::post(
+        &http,
+        &format!("{}/registrar/records", server.http),
+        Some(serde_json::json!({
+            "record": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(taken)
+        })),
+    )
+    .await
+    .unwrap();
+
+    // This phone's card commits to a successor of its own.
+    let s1 = SuccessorCode::generate();
+    let mut card = Card::new(&k0, "Olga", 1);
+    card.successor = Some(s1.commitment());
+    let card = card.sign(&k0, Vec::new()).unwrap();
+    let (record, _) = signed_rotation(k0.seed().as_ref(), &card, &s1.display());
+    assert_eq!(
+        post_rotation(server.http.clone(), record).await.unwrap(),
+        Posted::RotatedAway {
+            successor: theirs.fingerprint().to_string()
+        }
+    );
 }

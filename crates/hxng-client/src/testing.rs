@@ -11,6 +11,16 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::task::{AbortHandle, JoinHandle};
 
+/// How long records wait: as hxd configures it, a server fetching its
+/// registrar's records again a second on, or its registrar holding a
+/// rotation so many seconds before it publishes it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Timing {
+    Usual,
+    FreshRecords,
+    RotationDelay(u64),
+}
+
 /// A real hxd, the binary `HXD_BIN` names, on a config, ports and an
 /// accounts directory of its own; killed and removed when dropped.
 pub struct Server {
@@ -87,6 +97,40 @@ impl Server {
         assert!(hup.success());
     }
 
+    /// Freezes the identity `fingerprint` at this server's registrar, or
+    /// with `lift` lifts its freeze, as its operator would.
+    pub fn freeze(&self, fingerprint: &str, lift: bool) {
+        let mut args = vec!["registrar", "freeze", fingerprint];
+        if lift {
+            args.push("--lift");
+        }
+        self.operator(&args);
+    }
+
+    /// Publishes the rotation of `fingerprint` to `successor` that this
+    /// server's registrar holds, without waiting out its delay, as its
+    /// operator would.
+    pub fn publish(&self, fingerprint: &str, successor: &str) {
+        self.operator(&["registrar", "publish", fingerprint, "--to", successor]);
+    }
+
+    /// Runs `hxd` with `args` against this server's config and store.
+    fn operator(&self, args: &[&str]) {
+        let bin = std::env::var("HXD_BIN").unwrap();
+        let out = std::process::Command::new(bin)
+            .arg("--config")
+            .arg(self._dir.0.join("hxd-ng.toml"))
+            .args(args)
+            .current_dir(&self._dir.0)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// Each of `accounts` has the password `pw-<name>`, but `guest`.
     pub async fn start(accounts: &[&str]) -> Server {
         Server::with_grace(accounts, 300).await
@@ -94,7 +138,7 @@ impl Server {
 
     /// As [`Server::start`], with detached sessions kept `grace` seconds.
     pub async fn with_grace(accounts: &[&str], grace: u64) -> Server {
-        Server::launch(accounts, grace, None, None, None, false).await
+        Server::launch(accounts, grace, None, None, None, Timing::Usual).await
     }
 
     /// As [`Server::with_grace`], taking identity logins at the host it
@@ -107,7 +151,7 @@ impl Server {
             Some(("allow", "create")),
             None,
             None,
-            false,
+            Timing::Usual,
         )
         .await
     }
@@ -121,7 +165,7 @@ impl Server {
             Some(("allow", "create")),
             Some(&[]),
             None,
-            false,
+            Timing::Usual,
         )
         .await
     }
@@ -129,7 +173,29 @@ impl Server {
     /// As [`Server::with_registrar`], its registrar's records fetched again
     /// a second on rather than an hour, so a revocation is seen at once.
     pub async fn with_registrar_fresh_records() -> Server {
-        Server::launch(&[], 300, Some(("allow", "create")), Some(&[]), None, true).await
+        Server::launch(
+            &[],
+            300,
+            Some(("allow", "create")),
+            Some(&[]),
+            None,
+            Timing::FreshRecords,
+        )
+        .await
+    }
+
+    /// As [`Server::with_registrar`], its registrar holding a rotation
+    /// `delay` seconds before it publishes it.
+    pub async fn with_registrar_delay(delay: u64) -> Server {
+        Server::launch(
+            &[],
+            300,
+            Some(("allow", "create")),
+            Some(&[]),
+            None,
+            Timing::RotationDelay(delay),
+        )
+        .await
     }
 
     /// As [`Server::with_registrar`], and a web client, on the server's own
@@ -142,7 +208,7 @@ impl Server {
             Some(("allow", "create")),
             Some(&[]),
             Some(own_origin),
-            false,
+            Timing::Usual,
         )
         .await
     }
@@ -156,7 +222,7 @@ impl Server {
             Some(("allow", "create")),
             Some(invites),
             None,
-            false,
+            Timing::Usual,
         )
         .await
     }
@@ -170,7 +236,7 @@ impl Server {
             Some(("guest", "create")),
             Some(&[]),
             None,
-            false,
+            Timing::Usual,
         )
         .await
     }
@@ -178,7 +244,15 @@ impl Server {
     /// As [`Server::with_identity`], under the default policy: an identity
     /// no registrar vouches for, or one with no account, logs in as a guest.
     pub async fn with_guest_identity(accounts: &[&str]) -> Server {
-        Server::launch(accounts, 300, Some(("guest", "guest")), None, None, false).await
+        Server::launch(
+            accounts,
+            300,
+            Some(("guest", "guest")),
+            None,
+            None,
+            Timing::Usual,
+        )
+        .await
     }
 
     /// `identity` is the `unattested` and `new_accounts` policies.
@@ -188,7 +262,7 @@ impl Server {
         identity: Option<(&str, &str)>,
         registrar: Option<&[&str]>,
         web: Option<bool>,
-        fresh_records: bool,
+        timing: Timing,
     ) -> Server {
         // A port found free is free only until it is bound: another test's
         // server may take it first. Each try is on fresh ports, and taken
@@ -196,8 +270,7 @@ impl Server {
         for _ in 0..5 {
             let ng = free_port();
             if let Some(server) =
-                Server::try_launch(accounts, grace, identity, registrar, web, fresh_records, ng)
-                    .await
+                Server::try_launch(accounts, grace, identity, registrar, web, timing, ng).await
             {
                 return server;
             }
@@ -209,7 +282,7 @@ impl Server {
     /// another test may have taken the same port: none if this one's hxd
     /// is not the one that answers there.
     pub async fn try_on(ng: u16) -> Option<Server> {
-        Server::try_launch(&[], 300, None, None, None, false, ng).await
+        Server::try_launch(&[], 300, None, None, None, Timing::Usual, ng).await
     }
 
     async fn try_launch(
@@ -219,7 +292,7 @@ impl Server {
         // The invites it takes; none, and it takes anyone.
         registrar: Option<&[&str]>,
         web: Option<bool>,
-        fresh_records: bool,
+        timing: Timing,
         ng: u16,
     ) -> Option<Server> {
         let bin = std::env::var("HXD_BIN").expect(
@@ -266,7 +339,11 @@ impl Server {
                             format!(
                                 "trusted_registrars = [\"127.0.0.1\"]\n\
                                  registrar_urls = {{ \"127.0.0.1\" = \"http://127.0.0.1:{ng}\" }}\n{}",
-                                if fresh_records { "revocation_max_age = 1\n" } else { "" }
+                                if timing == Timing::FreshRecords {
+                                    "revocation_max_age = 1\n"
+                                } else {
+                                    ""
+                                }
                             )
                         } else {
                             String::new()
@@ -279,11 +356,16 @@ impl Server {
                         format!(
                             "[registrar]\nhost = \"127.0.0.1\"\nkey = \"registrar.key\"\n\
                              store = \"registrar.db\"\ninvites = \"invites\"\n{}\
-                             envelopes = true\nenvelope_secret = \"envelope.secret\"\n",
+                             envelopes = true\nenvelope_secret = \"envelope.secret\"\n\
+                             rotation_delay = {}\n",
                             if invites.is_empty() {
                                 "signup = \"open\"\n"
                             } else {
                                 "signup = \"proof\"\nproof = \"invite\"\n"
+                            },
+                            match timing {
+                                Timing::RotationDelay(delay) => delay,
+                                _ => 0,
                             }
                         )
                     }
