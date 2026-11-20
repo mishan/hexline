@@ -51,6 +51,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.shadows.ShadowConnectivityManager
 import java.io.File
+import java.io.IOException
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
 
@@ -136,8 +137,12 @@ abstract class ViewModelHarness {
 
         /** Whether a device list written is lost while the write says it was made, as a failed rename can. */
         var losesLists = false
+
+        /** Whether a rotation's file fails to be written, as a full disk does. */
+        var rotationsFail = false
         val identities =
             Identities(app, secrets, identityDir, syncDir = { synced += it }) { file, bytes ->
+                if (rotationsFail && file.name.startsWith("rotation-")) throw IOException("disk full")
                 if (!(losesLists && file.name.startsWith("minted-"))) writeAtomically(file, bytes)
             }
         val keys = FakeHolderKeys()

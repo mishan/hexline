@@ -115,6 +115,25 @@ class RotationPostsTest : ViewModelHarness() {
     }
 
     @Test
+    fun anAnswerThatCouldNotBeKeptIsNotPostedAgainUntilTheAppComesBack() {
+        val waits = mutableListOf<Long>()
+        wait = { seconds ->
+            waits += seconds
+            awaitCancellation()
+        }
+        sent()
+        model()
+        settle()
+        stores.rotationsFail = true
+        answer(Posted.Frozen)
+        assertEquals("no post timed while the disk refuses it", emptyList<Long>(), waits)
+        assertEquals(listOf(HOME), posted())
+        stores.rotationsFail = false
+        front()
+        assertEquals("posted again once the app comes back", listOf(HOME, HOME), posted())
+    }
+
+    @Test
     fun aRotationIsNotPostedAgainWhileAPostOfItIsOut() {
         sent()
         model()

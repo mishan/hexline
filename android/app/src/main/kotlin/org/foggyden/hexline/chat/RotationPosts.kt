@@ -30,7 +30,10 @@ class RotationPosts(
     /**
      * On the main thread: one run at a time, so no record is posted twice at
      * once. When a post is next due, in seconds, or null where none will be,
-     * or another run is under way (which says so itself).
+     * another run is under way (which says so itself), or an answer could not
+     * be kept: the record is still due by its file, and posting it again at
+     * once would load the registrar and the battery for as long as the disk
+     * refuses it, so it waits for the app to come to the front again.
      */
     suspend fun run(): Long? {
         if (running) return null
@@ -38,13 +41,14 @@ class RotationPosts(
         try {
             // Again once a run has posted, as home's publishing makes the others due.
             val asked = mutableSetOf<Pair<String, String>>()
+            var unkept = false
             while (true) {
                 val at = now()
                 val due =
                     withContext(queue.dispatcher) { sentRotations(identities) }.flatMap { r ->
                         r.due(at).filter { (r.from to it.base) !in asked }.map { r to it.base }
                     }
-                if (due.isEmpty()) return withContext(queue.dispatcher) { nextDue(sentRotations(identities), at) }
+                if (due.isEmpty()) return if (unkept) null else withContext(queue.dispatcher) { nextDue(sentRotations(identities), at) }
                 for ((rotation, base) in due) {
                     asked += rotation.from to base
                     var retryAfter: Long? = null
@@ -56,6 +60,7 @@ class RotationPosts(
                             null
                         }
                     val postedAt = now()
+                    var written = false
                     withContext(queue.dispatcher) {
                         stored {
                             // Only while it is still the rotation posted: not once finished, or its successor gone.
@@ -67,8 +72,10 @@ class RotationPosts(
                                 identities.keep(kept.posted(base, answer, postedAt, retryAfter))
                                 published()
                             }
+                            written = true
                         }
                     }
+                    if (!written) unkept = true
                 }
             }
         } finally {
