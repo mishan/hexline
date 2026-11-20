@@ -295,7 +295,8 @@ pub(crate) async fn discovered(
         base.join("/.well-known/hotline").expect("a path").as_str(),
     )
     .await?;
-    if status == 429 {
+    // 503: there, and unable to answer just now.
+    if status == 429 || status == 503 {
         return Err(CoreError::RateLimited {
             retry_after: retry_after(&body),
         });
@@ -429,8 +430,11 @@ async fn card_kept(
     match status {
         200 if Card::parse(&body).is_ok_and(|c| c.identity == *identity) => Ok(Some(body)),
         200 => Err(protocol("the registrar's card is not this identity's")),
+        // The lookup's `successor` is not taken in its place: it is
+        // unauthenticated, and hxd-ng plans a source a phone can verify.
         404 => Ok(None),
-        429 => Err(CoreError::RateLimited {
+        // 503: the registrar cannot check the card just now.
+        429 | 503 => Err(CoreError::RateLimited {
             retry_after: retry_after(&body),
         }),
         _ => Err(refused("server_error")),
@@ -636,6 +640,46 @@ mod tests {
             renewed.embedded_attestations,
             vec![newer("alt"), cbor::decode_canonical(&fresh).unwrap()]
         );
+    }
+
+    /// A registrar answering every request `status`, with no body.
+    async fn answering(status: u16) -> Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let _ = s.read(&mut [0; 4096]).await;
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = s.write_all(reply.as_bytes()).await;
+            }
+        });
+        base
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_registrar_that_cannot_answer_now_is_waited_for_not_taken_for_none() {
+        fn told<T>(r: &Result<T, CoreError>, none: impl Fn(&T) -> bool) -> &'static str {
+            match r {
+                Ok(t) if none(t) => "none",
+                Err(CoreError::RateLimited { .. }) => "wait",
+                _ => "other",
+            }
+        }
+        for (status, want) in [(404, ("none", "other")), (503, ("wait", "wait"))] {
+            let base = answering(status).await;
+            let http = auth::http_client(base.as_str(), None).unwrap();
+            let card = card_kept(&http, &base, &[1; 32]).await;
+            let reg = discovered(&http, &base).await;
+            assert_eq!(
+                (told(&card, Option::is_none), told(&reg, |_| false)),
+                want,
+                "{status}"
+            );
+        }
     }
 
     #[test]
