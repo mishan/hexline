@@ -18,6 +18,7 @@ import kotlinx.coroutines.DisposableHandle
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.MainCoroutineDispatcher
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.coroutines.test.TestDispatcher
@@ -50,6 +51,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.shadows.ShadowConnectivityManager
 import java.io.File
+import java.io.IOException
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
 
@@ -97,6 +99,9 @@ abstract class ViewModelHarness {
     protected var now = ISSUED + DAY
     protected var owner = ViewModelStore()
 
+    /** How the next model waits so many seconds: for ever, unless a test says otherwise. */
+    protected var wait: suspend (Long) -> Unit = { awaitCancellation() }
+
     /** The process's lifecycle the next model is given: whether the app is in front. */
     protected var process = Process()
 
@@ -132,8 +137,12 @@ abstract class ViewModelHarness {
 
         /** Whether a device list written is lost while the write says it was made, as a failed rename can. */
         var losesLists = false
+
+        /** Whether a rotation's file fails to be written, as a full disk does. */
+        var rotationsFail = false
         val identities =
             Identities(app, secrets, identityDir, syncDir = { synced += it }) { file, bytes ->
+                if (rotationsFail && file.name.startsWith("rotation-")) throw IOException("disk full")
                 if (!(losesLists && file.name.startsWith("minted-"))) writeAtomically(file, bytes)
             }
         val keys = FakeHolderKeys()
@@ -181,7 +190,7 @@ abstract class ViewModelHarness {
                         connection(url, sink).also { opened += it }
                     }, { renewing, expecting ->
                         enrollment(renewing, expecting).also { enrollments += it }
-                    }, setups, { now }, process.lifecycle) as T
+                    }, setups, { now }, process.lifecycle, { wait(it) }) as T
             }
         armed = true
         return ViewModelProvider.create(owner, factory)[ChatViewModel::class.java]

@@ -5,6 +5,7 @@ import org.foggyden.hexline.core.HolderSession
 import org.foggyden.hexline.core.HolderSessionInterface
 import org.foggyden.hexline.core.HolderSetup
 import org.foggyden.hexline.core.HolderSetupInterface
+import org.foggyden.hexline.core.Posted
 import org.foggyden.hexline.core.RecoveryCodeSetup
 import org.foggyden.hexline.core.RecoveryCodeSetupInterface
 import org.foggyden.hexline.core.RevokeReason
@@ -97,6 +98,12 @@ interface HolderSetups {
 
     /** [device]'s key as a holder's prompt shows it. */
     fun deviceFingerprint(device: ByteArray): String
+
+    /** A rotation's [record], as signed, posted to [registrar]'s records. */
+    suspend fun postRotation(
+        registrar: String,
+        record: ByteArray,
+    ): Posted
 }
 
 object CoreHolderSetups : HolderSetups {
@@ -161,6 +168,12 @@ object CoreHolderSetups : HolderSetups {
     ) = revokeDevice(identitySeed, registrar, device, reason, until.toULong(), thisDevice)
 
     override fun deviceFingerprint(device: ByteArray) = deviceFingerprintOf(device)
+
+    override suspend fun postRotation(
+        registrar: String,
+        record: ByteArray,
+    ) = org.foggyden.hexline.core
+        .postRotation(registrar, record)
 }
 
 private class CoreSession(

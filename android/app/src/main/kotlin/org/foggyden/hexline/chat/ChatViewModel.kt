@@ -16,6 +16,7 @@ import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -57,6 +58,7 @@ import org.foggyden.hexline.identity.HeldSeeds
 import org.foggyden.hexline.identity.HolderRefusal
 import org.foggyden.hexline.identity.HolderSetups
 import org.foggyden.hexline.identity.Identities
+import org.foggyden.hexline.identity.KeptRotation
 import org.foggyden.hexline.identity.MintedDevice
 import org.foggyden.hexline.identity.NewRecoveryCode
 import org.foggyden.hexline.identity.Renewing
@@ -134,6 +136,8 @@ class ChatViewModel internal constructor(
      */
     @SuppressLint("StaticFieldLeak")
     private val process: Lifecycle,
+    /** Waits so many seconds: a rotation's next post, while the app is in front. */
+    private val wait: suspend (Long) -> Unit = { delay(it * 1000) },
 ) : AndroidViewModel(app) {
     /** The one the app makes: its own stores, the process's queue, the core's connections and the clock. */
     constructor(app: Application) : this(
@@ -181,6 +185,11 @@ class ChatViewModel internal constructor(
     /** Whether [identityList] has been read from the store yet: empty until it has. */
     val identitiesRead: StateFlow<Boolean> = keptRead
 
+    private val postedRotations = MutableStateFlow<Map<String, KeptRotation>>(emptyMap())
+
+    /** Each rotation sent, by the identity it moves away from, as last answered. */
+    val rotations: StateFlow<Map<String, KeptRotation>> = postedRotations
+
     private val heldLost = MutableStateFlow<List<String>>(emptyList())
 
     /**
@@ -204,6 +213,26 @@ class ChatViewModel internal constructor(
     val enrollment: StateFlow<Enrolling> = enrolling
 
     private val quiet = QuietRenewal(identities, queue, enroll, now) { publishIdentities() }
+
+    private val posts = RotationPosts(identities, queue, setups::postRotation, now) { publishIdentities() }
+
+    /** The wait for a rotation's next post: only while the app is in front. */
+    private var postTimer: Job? = null
+
+    private fun postRotations() {
+        viewModelScope.launch { posts.run()?.let(::postAt) }
+    }
+
+    private fun postAt(next: Long) {
+        postTimer?.cancel()
+        if (!foreground) return
+        postTimer =
+            viewModelScope.launch {
+                wait(maxOf(0, next - now()))
+                // A clock set back meanwhile is waited out from where it now reads.
+                if (now() >= next) postRotations() else postAt(next)
+            }
+    }
 
     // Read from the store queue too, to see a forget that came first.
     @Volatile private var connection: Connection? = null
@@ -366,6 +395,7 @@ class ChatViewModel internal constructor(
                 }
             // Apart from the resume, which it is not to hold up: a holder may take minutes.
             launch { quiet.run() }
+            postRotations()
             // A session left without leaving: take it up again, unless let go of while it was read.
             if (found == null || found.second == null || !ask.live) {
                 end(ask)
@@ -1696,6 +1726,7 @@ class ChatViewModel internal constructor(
     // Called on the store queue alone, so a slower read is never shown over a newer one.
     private fun publishIdentities() {
         kept.value = identities.list().filter { it.rotatingFrom == null }.map { if (held.isHeld(it.fingerprint)) it.held() else it }
+        postedRotations.value = sentRotations(identities).associateBy { it.from }
         keptRead.value = true
     }
 
@@ -1942,6 +1973,9 @@ class ChatViewModel internal constructor(
         if (foreground) {
             later { demoteHeld() }
             viewModelScope.launch { quiet.run() }
+            postRotations()
+        } else {
+            postTimer?.cancel()
         }
     }
 
