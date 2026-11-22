@@ -8,6 +8,7 @@ import org.foggyden.hexline.core.HeldRestore
 import org.foggyden.hexline.core.HolderCommitted
 import org.foggyden.hexline.core.HolderKept
 import org.foggyden.hexline.core.HolderRequest
+import org.foggyden.hexline.core.ListedDevice
 import org.foggyden.hexline.core.NewIdentity
 import org.foggyden.hexline.core.PostOutcome
 import org.foggyden.hexline.core.Restored
@@ -262,11 +263,16 @@ class FakeSetups : HolderSetups {
             if (certified || denials.isNotEmpty()) throw CoreException.Refused("used", "", null)
         }
 
+        /** The devices the phone listed as it approved. */
+        var listed: List<ListedDevice>? = null
+
         override suspend fun certify(
             identitySeed: ByteArray,
             manage: Boolean,
             device: ByteArray,
+            listed: List<ListedDevice>,
         ): Certified {
+            this.listed = listed
             yield()
             answerable()
             if (!device.contentEquals(checkNotNull(asked).device)) throw CoreException.Refused("not_asked", "", null)

@@ -1036,7 +1036,7 @@ class ChatViewModel internal constructor(
                             HolderKept(
                                 stored.registrar,
                                 identities.epoch(stored).toULong(),
-                                listed.map { ListedDevice(it.device, it.epoch.toULong()) },
+                                listing(listed),
                             )
                     }
                 }
@@ -1083,6 +1083,8 @@ class ChatViewModel internal constructor(
         }
     }
 
+    private fun listing(devices: List<MintedDevice>) = devices.map { ListedDevice(it.device, it.epoch.toULong()) }
+
     /** [fingerprint]'s device epoch raised to [epoch], learned from its registrars, even as the model goes. */
     private suspend fun learn(
         fingerprint: String,
@@ -1127,8 +1129,13 @@ class ChatViewModel internal constructor(
                     val certified =
                         try {
                             held.use(fingerprint, authorizer) { seed ->
-                                // Read again with the prompt answered: a revocation made meanwhile stands.
-                                if (revokedNow() != Revoked.No) null else opened.certify(seed, manage, device)
+                                // Read again with the prompt answered: a revocation made meanwhile stands, and the
+                                // list the session was opened with may not have read.
+                                if (revokedNow() != Revoked.No) {
+                                    null
+                                } else {
+                                    opened.certify(seed, manage, device, withContext(store) { listing(identities.minted(fingerprint)) })
+                                }
                             } ?: return@keeping asked.copy(revoked = revokedNow())
                         } catch (e: CoreException) {
                             return@keeping certifyEnded(fingerprint, e)

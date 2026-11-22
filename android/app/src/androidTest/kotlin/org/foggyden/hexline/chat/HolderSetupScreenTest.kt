@@ -34,6 +34,7 @@ import org.foggyden.hexline.core.HolderKept
 import org.foggyden.hexline.core.HolderRequest
 import org.foggyden.hexline.core.HolderSetup
 import org.foggyden.hexline.core.HolderSetupInterface
+import org.foggyden.hexline.core.ListedDevice
 import org.foggyden.hexline.core.PostOutcome
 import org.foggyden.hexline.core.Qr
 import org.foggyden.hexline.core.RevokeReason
@@ -468,6 +469,7 @@ class HolderSetupScreenTest {
             identitySeed: ByteArray,
             manage: Boolean,
             device: ByteArray,
+            listed: List<ListedDevice>,
         ): Certified {
             val asked = next.await()
             check(device.contentEquals(asked.device)) { "certified a device not asked about" }

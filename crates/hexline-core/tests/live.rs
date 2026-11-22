@@ -2525,7 +2525,7 @@ async fn approved(
 ) -> Result<hexline_core::Certified, CoreError> {
     let certified = session
         .clone()
-        .certify(seed.to_vec(), manage, device)
+        .certify(seed.to_vec(), manage, device, Vec::new())
         .await?;
     session.clone().deliver().await?;
     Ok(certified)
@@ -2715,7 +2715,7 @@ async fn a_request_asked_about_past_its_session_is_answered_no_more() {
         refused_as(
             &session
                 .clone()
-                .certify(seed, false, asked.device)
+                .certify(seed, false, asked.device, Vec::new())
                 .await
                 .unwrap_err()
         ),
@@ -2763,7 +2763,7 @@ async fn a_request_is_answered_once_for_the_device_asked_about() {
         refused_as(
             &session
                 .clone()
-                .certify(seed.clone(), false, vec![7; 32])
+                .certify(seed.clone(), false, vec![7; 32], Vec::new())
                 .await
                 .unwrap_err()
         ),
@@ -2776,10 +2776,10 @@ async fn a_request_is_answered_once_for_the_device_asked_about() {
     let (one, two) = tokio::join!(
         session
             .clone()
-            .certify(seed.clone(), false, asked.device.clone()),
+            .certify(seed.clone(), false, asked.device.clone(), Vec::new()),
         session
             .clone()
-            .certify(seed.clone(), false, asked.device.clone()),
+            .certify(seed.clone(), false, asked.device.clone(), Vec::new()),
     );
     assert!(one.is_ok() != two.is_ok(), "minted once");
     let again = one.err().or(two.err()).unwrap();
@@ -2822,7 +2822,7 @@ async fn a_request_is_answered_once_for_the_device_asked_about() {
         refused_as(
             &session
                 .clone()
-                .certify(seed.clone(), false, asked.device.clone())
+                .certify(seed.clone(), false, asked.device.clone(), Vec::new())
                 .await
                 .unwrap_err()
         ),

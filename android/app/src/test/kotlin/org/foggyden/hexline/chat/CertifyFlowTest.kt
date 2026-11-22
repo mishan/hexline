@@ -191,8 +191,9 @@ class CertifyFlowTest : ViewModelHarness() {
         val vm = model()
         settle()
         val fingerprint = heldHere(vm)
-        // As a crash between the list's write and the identity's leaves it.
+        // As a crash between the list's write and the identity's leaves it: the identity's not made.
         val device = ByteArray(32) { 9 }
+        stores.identitiesFail = true
         outside {
             identities.minted(
                 fingerprint,
@@ -200,8 +201,57 @@ class CertifyFlowTest : ViewModelHarness() {
                 now,
             )
         }
+        stores.identitiesFail = false
         assertEquals(0L, stored()!!.epoch)
         assertEquals(7uL, shown(vm, fingerprint).kept.epoch)
+    }
+
+    @Test
+    fun aDeviceListThatDidNotOpenForTheSessionIsReadAgainForTheApproval() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val other = ByteArray(32) { 9 }
+        outside {
+            identities.minted(
+                fingerprint,
+                MintedDevice(other, deviceFingerprintOf(other), null, 2_000_000_000, false, epoch = 1),
+                now,
+            )
+        }
+        val list = minted(fingerprint)
+        list.setReadable(false)
+        val session =
+            try {
+                assertFalse("a file's permissions hold, as they do not for root", list.canRead())
+                shown(vm, fingerprint)
+            } finally {
+                list.setReadable(true)
+            }
+        assertEquals("opened knowing none", 0, session.kept.devices.size)
+        asked(vm, fingerprint, session)
+        vm.approveDevice(fingerprint, manage = false, stores.keys.authorizer())
+        settle()
+        assertEquals(listOf(1uL), session.listed?.map { it.epoch })
+    }
+
+    @Test
+    fun aFloorOnlyTheDeviceListHeldOutlivesItsEntryLapsing() {
+        for (identitiesFail in listOf(false, true)) {
+            fresh()
+            val vm = model()
+            settle()
+            val fingerprint = heldHere(vm)
+            stores.identitiesFail = identitiesFail
+            val lapsed = ByteArray(32) { 9 }
+            val other = ByteArray(32) { 8 }
+            outside {
+                identities.minted(fingerprint, MintedDevice(lapsed, deviceFingerprintOf(lapsed), null, 1_000, false, epoch = 7), now)
+                // A write that lets the lapsed entry go.
+                identities.minted(fingerprint, MintedDevice(other, deviceFingerprintOf(other), null, 2_000_000_000, false), now)
+            }
+            assertEquals("$identitiesFail", 7L, outside { identities.epoch(identities.list().single()) })
+        }
     }
 
     @Test

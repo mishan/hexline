@@ -253,6 +253,19 @@ pub(crate) mod tests {
         base
     }
 
+    /// A registrar's address that takes every connection and never answers one.
+    pub(crate) async fn silent() -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = l.accept().await {
+                held.push(s);
+            }
+        });
+        url
+    }
+
     pub(crate) fn reset(id: &IdentityKey, epoch: u64) -> Vec<u8> {
         DeviceEpoch {
             identity: id.public(),
@@ -297,18 +310,7 @@ pub(crate) mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             format!("http://{}", l.local_addr().unwrap())
         };
-        // Takes every connection and never answers one.
-        let silent = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", l.local_addr().unwrap());
-            tokio::spawn(async move {
-                let mut held = Vec::new();
-                while let Ok((s, _)) = l.accept().await {
-                    held.push(s);
-                }
-            });
-            url
-        };
+        let silent = silent().await;
         for (registrars, epoch, revoked) in [
             (vec![paged.clone(), lower.clone()], 5, 1),
             (vec![silent, paged.clone()], 5, 1),

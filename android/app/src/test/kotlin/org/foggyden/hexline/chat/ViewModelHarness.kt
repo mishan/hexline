@@ -138,11 +138,15 @@ abstract class ViewModelHarness {
         /** Whether a device list written is lost while the write says it was made, as a failed rename can. */
         var losesLists = false
 
+        /** Whether an identity's file fails to be written, as a full disk does. */
+        var identitiesFail = false
+
         /** Whether a rotation's file fails to be written, as a full disk does. */
         var rotationsFail = false
         val identities =
             Identities(app, secrets, identityDir, syncDir = { synced += it }) { file, bytes ->
                 if (rotationsFail && file.name.startsWith("rotation-")) throw IOException("disk full")
+                if (identitiesFail && file.name.startsWith("identity-")) throw IOException("disk full")
                 if (!(losesLists && file.name.startsWith("minted-"))) writeAtomically(file, bytes)
             }
         val keys = FakeHolderKeys()

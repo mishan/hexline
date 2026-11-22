@@ -550,8 +550,21 @@ class Identities(
                         given.epoch,
                     )
                 } ?: given
-            // A certificate past [now] is let go of as the list is written, a revoked one kept.
-            val live = minted(fingerprint).filter { it.listed(now) }
+            val all = minted(fingerprint)
+            // The list may hold the only copy of a floor, after a crash between its write and the
+            // identity's: the identity takes it before an entry holding it can go.
+            val floor = (all + device).maxOf { it.epoch }
+            val raised =
+                try {
+                    learned(fingerprint, floor)
+                    true
+                } catch (e: java.io.IOException) {
+                    Log.w(TAG, "device epoch $floor not kept with the identity", e)
+                    false
+                }
+            // A certificate past [now] is let go of as the list is written, a revoked one kept, and
+            // one holding a floor kept nowhere else.
+            val live = all.filter { it.listed(now) || (!raised && it.epoch == floor) }
             writeMinted(fingerprint, live.filter { !it.device.contentEquals(device.device) } + device)
             if (minted(fingerprint).none { it == device }) throw java.io.IOException("not kept")
         }

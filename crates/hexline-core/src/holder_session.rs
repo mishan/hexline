@@ -321,18 +321,22 @@ impl HolderSession {
     /// revoke. Refused `not_asked` for any other device, `manage_not_asked`
     /// for managing where it may not, `used` once the session's one request
     /// is answered or certified, and `canceled` once the session is. One
-    /// the floor has risen past since it was asked is denied, refused
-    /// `signed_out_request`.
+    /// the floor has risen past since it was asked, or that `listed`, the
+    /// devices this phone lists now, shows below it, is denied, refused
+    /// `signed_out_request`: the list the session was opened with may not
+    /// have read.
     #[uniffi::method(async_runtime = "tokio")]
     pub async fn certify(
         self: Arc<Self>,
         identity_seed: Vec<u8>,
         manage: bool,
         device: Vec<u8>,
+        listed: Vec<ListedDevice>,
     ) -> Result<Certified, CoreError> {
         let seed = Zeroizing::new(identity_seed);
+        let listed = pairs(&listed);
         crate::connection::RUNTIME
-            .spawn(async move { self.certifying(&seed, manage, &device).await })
+            .spawn(async move { self.certifying(&seed, manage, &device, &listed).await })
             .await
             .unwrap_or_else(|_| Err(protocol("the session stopped")))
     }
@@ -438,11 +442,7 @@ impl HolderSession {
     ) -> Result<Arc<HolderSession>, CoreError> {
         let parsed = hl_identity::Card::parse(&card).map_err(|_| refused("bad_card"))?;
         let registrars = registrars_of(kept.registrar.as_deref(), &parsed);
-        let listed = kept
-            .devices
-            .iter()
-            .filter_map(|d| Some((d.device.as_slice().try_into().ok()?, d.epoch)))
-            .collect();
+        let listed = pairs(&kept.devices);
         let base = mailbox_base(mailbox)?;
         let http = auth::http_client(base.as_str(), None)?;
         let (enroll, web) = discovered(&http, &base).await?;
@@ -612,6 +612,9 @@ impl HolderSession {
             let published = tokio::select! {
                 p = published_at(&self.registrars, &card.identity, FLOOR_WAIT) => p,
                 _ = canceled.changed() => return Err(refused("canceled")),
+                _ = tokio::time::sleep_until(request_deadline.min(deadline)) => {
+                    return Err(refused("expired"))
+                }
             };
             let floor = at_floor(&card.identity, self.kept.max(published.epoch), |f| f);
             let prev = own_prev(&request, &card.identity);
@@ -651,6 +654,10 @@ impl HolderSession {
             if self.spent.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(refused("used"));
             }
+            let session = *self.deadline.lock().unwrap_or_else(|e| e.into_inner());
+            if tokio::time::Instant::now() >= request_deadline.min(session) {
+                return Err(refused("expired"));
+            }
             return Ok(settle(
                 &self.asked,
                 Asked {
@@ -671,6 +678,7 @@ impl HolderSession {
         seed: &[u8],
         manage: bool,
         device: &[u8],
+        listed: &[(PublicKey, u64)],
     ) -> Result<Certified, CoreError> {
         let seed: &[u8; 32] = seed.try_into().map_err(|_| refused("bad_seed"))?;
         let id = IdentityKey::from_seed(seed);
@@ -710,22 +718,18 @@ impl HolderSession {
         let can_manage = cert.caps.unwrap_or(0) & caps::MANAGE != 0;
         // A `prev` this identity signed was minted at a floor known then.
         let prev = own_prev(&request, &id.public());
+        let listed: Vec<_> = self.listed.iter().chain(listed).copied().collect();
         let minted = at_floor(
             &id.public(),
             prev.as_ref().map_or(0, |p| p.epoch),
             |floor| {
                 // The floor may have risen since the request was shown.
-                (!signed_out(
-                    &request.device,
-                    prev.as_ref(),
-                    floor,
-                    &self.listed,
-                    &published,
-                ))
-                .then(|| {
-                    cert.epoch = floor;
-                    cert.sign(&id)
-                })
+                (!signed_out(&request.device, prev.as_ref(), floor, &listed, &published)).then(
+                    || {
+                        cert.epoch = floor;
+                        cert.sign(&id)
+                    },
+                )
             },
         );
         let Some(signed) = minted else {
@@ -890,6 +894,14 @@ fn decide(
         may_manage: bits & caps::MANAGE != 0,
         lifetime,
     })
+}
+
+/// `devices` as their keys and epochs, any whose key is not one left out.
+fn pairs(devices: &[ListedDevice]) -> Vec<(PublicKey, u64)> {
+    devices
+        .iter()
+        .filter_map(|d| Some((d.device.as_slice().try_into().ok()?, d.epoch)))
+        .collect()
 }
 
 /// `request`'s `prev`, if `identity` signed it for the device asking.
@@ -1233,13 +1245,13 @@ mod tests {
         }
     }
 
-    /// A mailbox with `request`, as signed, pending, taking every answer:
-    /// what it was answered.
-    async fn mailbox(request: &[u8]) -> (String, Arc<Mutex<Vec<Value>>>) {
+    /// A mailbox with `request`, as signed, pending since `received`,
+    /// taking every answer: what it was answered.
+    async fn mailbox(request: &[u8], received: u64) -> (String, Arc<Mutex<Vec<Value>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let pending = json!({ "pending": [{
             "id": "r1",
-            "received": crate::restore::now(),
+            "received": received,
             "request": b64(request),
         }] })
         .to_string();
@@ -1328,7 +1340,7 @@ mod tests {
             };
             let device = DeviceKey::generate();
             let request = EnrollRequest::new(&device, crate::restore::now());
-            let (sessions, answers) = mailbox(&request.sign(&device)).await;
+            let (sessions, answers) = mailbox(&request.sign(&device), crate::restore::now()).await;
             let devices = listed.map(|e| (device.public(), e)).into_iter().collect();
             let s = Arc::new(session(sessions, card, vec![registrar], kept, devices));
             let case = format!("{publishes:?} {kept} {listed:?}");
@@ -1342,7 +1354,7 @@ mod tests {
                 Some(epoch) => {
                     let shown = outcome.unwrap();
                     let certified = s
-                        .certifying(&*id.seed(), false, &shown.device)
+                        .certifying(&*id.seed(), false, &shown.device, &[])
                         .await
                         .unwrap();
                     assert_eq!((certified.epoch, epoch_in(&s)), (epoch, epoch), "{case}");
@@ -1367,13 +1379,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_certificate_is_signed_at_the_floor_as_it_stands_when_it_is_signed() {
         // The floor once the request was shown, the epoch of the `prev` it
-        // renews if it renews one, and the epoch it is certified at, or none
-        // for a renewal the floor has passed since it was asked about.
-        for (floor, prev, want) in [
-            (4, None, Some(4)),
-            (2, Some(5), Some(5)),
-            (3, Some(3), Some(3)),
-            (6, Some(5), None),
+        // renews if it renews one, the epoch the device is listed at when it
+        // is approved, and the epoch it is certified at, or none for a
+        // renewal the floor has passed since it was asked about or a key
+        // listed below it.
+        for (floor, prev, listed, want) in [
+            (4, None, None, Some(4)),
+            (2, Some(5), None, Some(5)),
+            (3, Some(3), None, Some(3)),
+            (6, Some(5), None, None),
+            (2, None, Some(1), None),
+            (2, None, Some(2), Some(2)),
         ] {
             let id = IdentityKey::generate();
             let card = hl_identity::Card::new(&id, "Alice", 10)
@@ -1388,14 +1404,17 @@ mod tests {
                 c.epoch = epoch;
                 c.sign(&id)
             });
-            let (sessions, answers) = mailbox(&request.sign(&device)).await;
+            let (sessions, answers) = mailbox(&request.sign(&device), crate::restore::now()).await;
             // Opened with nothing kept, as a session opened before a reset is.
             let s = Arc::new(session(sessions, card, Vec::new(), 0, Vec::new()));
             let shown = s.waiting().await.unwrap();
             assert_eq!(shown.renewal, prev.is_some());
             at_floor(&id.public(), floor, |_| ());
-            let certified = s.certifying(&*id.seed(), false, &shown.device).await;
-            let case = format!("{floor} {prev:?}");
+            let listed: Vec<_> = listed.map(|e| (device.public(), e)).into_iter().collect();
+            let certified = s
+                .certifying(&*id.seed(), false, &shown.device, &listed)
+                .await;
+            let case = format!("{floor} {prev:?} {listed:?}");
             match want {
                 Some(epoch) => {
                     assert_eq!(certified.unwrap().epoch, epoch, "{case}");
@@ -1414,6 +1433,39 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_is_not_shown_once_it_or_its_session_has_ended() {
+        // How long ago the mailbox received it, how long the session has
+        // left, and whether its registrar never answers.
+        for (age, left, silent) in [(0, 1, true), (REQUEST_SECS + SKEW, SESSION_SECS, false)] {
+            let id = IdentityKey::generate();
+            let card = hl_identity::Card::new(&id, "Alice", 10)
+                .sign(&id, Vec::new())
+                .unwrap();
+            let registrars = if silent {
+                vec![crate::epoch::tests::silent().await]
+            } else {
+                Vec::new()
+            };
+            let device = DeviceKey::generate();
+            let now = crate::restore::now();
+            let (sessions, _) =
+                mailbox(&EnrollRequest::new(&device, now).sign(&device), now - age).await;
+            let s = Arc::new(session(sessions, card, registrars, 0, Vec::new()));
+            *s.deadline.lock().unwrap() = tokio::time::Instant::now() + Duration::from_secs(left);
+            let started = tokio::time::Instant::now();
+            let got = s.waiting().await;
+            assert!(
+                matches!(&got, Err(CoreError::Refused { code, .. }) if code == "expired"),
+                "{age} {left}: {got:?}"
+            );
+            assert!(
+                started.elapsed() < FLOOR_WAIT,
+                "{age} {left}: not waited out"
+            );
         }
     }
 }
