@@ -278,6 +278,28 @@ class CertifyFlowTest : ViewModelHarness() {
     }
 
     @Test
+    fun aFloorTheIdentityCannotTakeOutlivesItsEntryLapsing() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val file = File(stores.identityDir, "identity-" + shortHash(fingerprint.toByteArray()))
+        val kept = file.readBytes()
+        // An identity's file that does not read: the floor has nowhere else to go.
+        file.writeText("not an identity")
+        val lapsed = ByteArray(32) { 9 }
+        val other = ByteArray(32) { 8 }
+        try {
+            outside {
+                identities.minted(fingerprint, MintedDevice(lapsed, deviceFingerprintOf(lapsed), null, 1_000, false, epoch = 7), now)
+                identities.minted(fingerprint, MintedDevice(other, deviceFingerprintOf(other), null, 2_000_000_000, false), now)
+            }
+        } finally {
+            file.writeBytes(kept)
+        }
+        assertEquals(listOf(7L, 0L), onDisk(fingerprint).map { it.epoch })
+    }
+
+    @Test
     fun aDeviceSaidNoToIsToldSoAndNotListed() {
         val vm = model()
         settle()

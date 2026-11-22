@@ -558,7 +558,8 @@ class Identities(
             val raised =
                 try {
                     learned(fingerprint, floor)
-                    true
+                    // Kept only if the identity holds it now: one whose file does not read takes nothing.
+                    load(file(fingerprint))?.let { it.epoch >= floor } == true
                 } catch (e: java.io.IOException) {
                     Log.w(TAG, "device epoch $floor not kept with the identity", e)
                     false
