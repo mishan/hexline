@@ -535,22 +535,23 @@ class Identities(
         now: Long,
     ): Unit =
         synchronized(LOCK) {
+            val all = minted(fingerprint)
+            // A key is never certified again in a lower epoch than its listed one: a lower one
+            // given is an entry read before the latest, and the floor that one lists is kept.
+            val epoch = maxOf(given.epoch, all.find { it.device.contentEquals(given.device) }?.epoch ?: 0)
             // An empty name kept as none, as it reads back.
             val device =
-                given.name?.takeIf { it.isEmpty() }?.let {
-                    MintedDevice(
-                        given.device,
-                        given.fingerprint,
-                        null,
-                        given.expires,
-                        given.canManage,
-                        given.revoked,
-                        given.own,
-                        given.revoking,
-                        given.epoch,
-                    )
-                } ?: given
-            val all = minted(fingerprint)
+                MintedDevice(
+                    given.device,
+                    given.fingerprint,
+                    given.name?.ifEmpty { null },
+                    given.expires,
+                    given.canManage,
+                    given.revoked,
+                    given.own,
+                    given.revoking,
+                    epoch,
+                )
             // The list may hold the only copy of a floor, after a crash between its write and the
             // identity's: the identity takes it before an entry holding it can go.
             val floor = (all + device).maxOf { it.epoch }

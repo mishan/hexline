@@ -100,7 +100,11 @@ pub(crate) async fn published_at(
             let base = registrar_base(&registrar)?;
             let http = auth::http_client(base.as_str(), None)?;
             let reg = discovered(&http, &base).await?;
-            published(&http, &base, &reg, &identity).await
+            let p = published(&http, &base, &reg, &identity).await?;
+            // Kept as it is read, so a wait given up on before the others
+            // answer still learns it.
+            at_floor(&identity, p.epoch, |_| ());
+            Ok::<_, CoreError>(p)
         }));
     }
     let mut all = Published::default();

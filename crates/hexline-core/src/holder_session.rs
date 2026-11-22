@@ -719,19 +719,20 @@ impl HolderSession {
         // A `prev` this identity signed was minted at a floor known then.
         let prev = own_prev(&request, &id.public());
         let listed: Vec<_> = self.listed.iter().chain(listed).copied().collect();
-        let minted = at_floor(
-            &id.public(),
-            prev.as_ref().map_or(0, |p| p.epoch),
-            |floor| {
-                // The floor may have risen since the request was shown.
-                (!signed_out(&request.device, prev.as_ref(), floor, &listed, &published)).then(
-                    || {
-                        cert.epoch = floor;
-                        cert.sign(&id)
-                    },
-                )
-            },
-        );
+        // As does each device listed, certified at a floor known then.
+        let known = listed
+            .iter()
+            .map(|(_, e)| *e)
+            .chain(prev.as_ref().map(|p| p.epoch))
+            .max()
+            .unwrap_or(0);
+        let minted = at_floor(&id.public(), known, |floor| {
+            // The floor may have risen since the request was shown.
+            (!signed_out(&request.device, prev.as_ref(), floor, &listed, &published)).then(|| {
+                cert.epoch = floor;
+                cert.sign(&id)
+            })
+        });
         let Some(signed) = minted else {
             self.answer(json!({ "id": asked_id, "denied": SIGNED_OUT }))
                 .await?;
@@ -1379,17 +1380,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_certificate_is_signed_at_the_floor_as_it_stands_when_it_is_signed() {
         // The floor once the request was shown, the epoch of the `prev` it
-        // renews if it renews one, the epoch the device is listed at when it
-        // is approved, and the epoch it is certified at, or none for a
-        // renewal the floor has passed since it was asked about or a key
-        // listed below it.
+        // renews if it renews one, the devices listed when it is approved
+        // (whether each is the one asking, and its epoch), and the epoch it
+        // is certified at, or none for a renewal the floor has passed since
+        // it was asked about or a key listed below it.
         for (floor, prev, listed, want) in [
-            (4, None, None, Some(4)),
-            (2, Some(5), None, Some(5)),
-            (3, Some(3), None, Some(3)),
-            (6, Some(5), None, None),
-            (2, None, Some(1), None),
-            (2, None, Some(2), Some(2)),
+            (4, None, vec![], Some(4)),
+            (2, Some(5), vec![], Some(5)),
+            (3, Some(3), vec![], Some(3)),
+            (6, Some(5), vec![], None),
+            (2, None, vec![(true, 1)], None),
+            (2, None, vec![(true, 2)], Some(2)),
+            // Another listed device was certified at a floor learned since.
+            (0, None, vec![(false, 7)], Some(7)),
+            (0, None, vec![(true, 1), (false, 7)], None),
         ] {
             let id = IdentityKey::generate();
             let card = hl_identity::Card::new(&id, "Alice", 10)
@@ -1410,7 +1414,10 @@ mod tests {
             let shown = s.waiting().await.unwrap();
             assert_eq!(shown.renewal, prev.is_some());
             at_floor(&id.public(), floor, |_| ());
-            let listed: Vec<_> = listed.map(|e| (device.public(), e)).into_iter().collect();
+            let listed: Vec<_> = listed
+                .into_iter()
+                .map(|(asking, e)| (if asking { device.public() } else { [9; 32] }, e))
+                .collect();
             let certified = s
                 .certifying(&*id.seed(), false, &shown.device, &listed)
                 .await;
@@ -1439,14 +1446,21 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_request_is_not_shown_once_it_or_its_session_has_ended() {
         // How long ago the mailbox received it, how long the session has
-        // left, and whether its registrar never answers.
+        // left, and whether one registrar never answers beside one that
+        // publishes 5, whose floor is kept all the same.
         for (age, left, silent) in [(0, 1, true), (REQUEST_SECS + SKEW, SESSION_SECS, false)] {
             let id = IdentityKey::generate();
             let card = hl_identity::Card::new(&id, "Alice", 10)
                 .sign(&id, Vec::new())
                 .unwrap();
             let registrars = if silent {
-                vec![crate::epoch::tests::silent().await]
+                let five = vec![crate::epoch::tests::reset(&id, 5)];
+                vec![
+                    crate::epoch::tests::silent().await,
+                    crate::epoch::tests::registrar_publishing(five, 8)
+                        .await
+                        .to_string(),
+                ]
             } else {
                 Vec::new()
             };
@@ -1454,7 +1468,7 @@ mod tests {
             let now = crate::restore::now();
             let (sessions, _) =
                 mailbox(&EnrollRequest::new(&device, now).sign(&device), now - age).await;
-            let s = Arc::new(session(sessions, card, registrars, 0, Vec::new()));
+            let s = Arc::new(session(sessions, card.clone(), registrars, 0, Vec::new()));
             *s.deadline.lock().unwrap() = tokio::time::Instant::now() + Duration::from_secs(left);
             let started = tokio::time::Instant::now();
             let got = s.waiting().await;
@@ -1466,6 +1480,8 @@ mod tests {
                 started.elapsed() < FLOOR_WAIT,
                 "{age} {left}: not waited out"
             );
+            let kept = if silent { 5 } else { 0 };
+            assert_eq!(crate::epoch::held_floor(card), kept, "{age} {left}");
         }
     }
 }

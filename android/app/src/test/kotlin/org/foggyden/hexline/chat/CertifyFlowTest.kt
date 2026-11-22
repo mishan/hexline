@@ -255,6 +255,29 @@ class CertifyFlowTest : ViewModelHarness() {
     }
 
     @Test
+    fun aFloorOnlyTheDeviceListHoldsOutlivesAnOlderEntryForTheSameKey() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        stores.identitiesFail = true
+        val device = ByteArray(32) { 9 }
+        val listed = MintedDevice(device, deviceFingerprintOf(device), null, 2_000_000_000, false, epoch = 7)
+        outside {
+            identities.minted(fingerprint, listed, now)
+            // As a screen read before the latest certificate would revoke it.
+            identities.minted(
+                fingerprint,
+                MintedDevice(device, deviceFingerprintOf(device), null, 2_000_000_000, false, revoked = true),
+                now,
+            )
+        }
+        stores.identitiesFail = false
+        val kept = outside { identities.minted(fingerprint) }.single()
+        assertEquals(listOf(true, 7L), listOf(kept.revoked, kept.epoch))
+        assertEquals(7L, outside { identities.epoch(identities.list().single()) })
+    }
+
+    @Test
     fun aDeviceSaidNoToIsToldSoAndNotListed() {
         val vm = model()
         settle()
