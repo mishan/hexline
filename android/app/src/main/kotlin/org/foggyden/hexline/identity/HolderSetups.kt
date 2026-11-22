@@ -1,6 +1,7 @@
 package org.foggyden.hexline.identity
 
 import org.foggyden.hexline.core.HeldRestore
+import org.foggyden.hexline.core.HolderKept
 import org.foggyden.hexline.core.HolderSession
 import org.foggyden.hexline.core.HolderSessionInterface
 import org.foggyden.hexline.core.HolderSetup
@@ -14,6 +15,7 @@ import org.foggyden.hexline.core.backupDelete
 import org.foggyden.hexline.core.backupPassphrase
 import org.foggyden.hexline.core.checkHolderRegistrar
 import org.foggyden.hexline.core.deviceFingerprintOf
+import org.foggyden.hexline.core.heldFloor
 import org.foggyden.hexline.core.holderRenew
 import org.foggyden.hexline.core.openHolderSession
 import org.foggyden.hexline.core.restoreIdentityToHold
@@ -58,12 +60,13 @@ interface HolderSetups {
         deviceName: String,
     ): HeldRestore
 
-    /** A new certificate for this phone's device (the core's `holder_renew`). */
+    /** A new certificate for this phone's device (the core's `holder_renew`), [epoch] the device epoch kept. */
     fun renew(
         identitySeed: ByteArray,
         card: ByteArray,
         deviceSeed: ByteArray,
         cert: ByteArray,
+        epoch: Long,
     ): ByteArray
 
     suspend fun putPassphrase(
@@ -80,10 +83,11 @@ interface HolderSetups {
 
     fun newRecoveryCode(): NewRecoveryCode
 
-    /** A session at [mailbox] to certify another device for the identity whose card is [card]. */
+    /** A session at [mailbox] to certify another device for the identity whose card is [card], of which this phone keeps [kept]. */
     suspend fun openSession(
         mailbox: String,
         card: ByteArray,
+        kept: HolderKept,
     ): CertifySession
 
     /** [device] revoked at [registrar] by the identity's key, for [reason], its certificate ending at [until]. */
@@ -98,6 +102,9 @@ interface HolderSetups {
 
     /** [device]'s key as a holder's prompt shows it. */
     fun deviceFingerprint(device: ByteArray): String
+
+    /** The highest device epoch the core has learned for the identity whose card is [card] (the core's `held_floor`). */
+    fun floor(card: ByteArray): Long
 
     /** A rotation's [record], as signed, posted to [registrar]'s records. */
     suspend fun postRotation(
@@ -137,7 +144,8 @@ object CoreHolderSetups : HolderSetups {
         card: ByteArray,
         deviceSeed: ByteArray,
         cert: ByteArray,
-    ) = holderRenew(identitySeed, card, deviceSeed, cert)
+        epoch: Long,
+    ) = holderRenew(identitySeed, card, deviceSeed, cert, epoch.toULong())
 
     override suspend fun putPassphrase(
         identitySeed: ByteArray,
@@ -156,7 +164,8 @@ object CoreHolderSetups : HolderSetups {
     override suspend fun openSession(
         mailbox: String,
         card: ByteArray,
-    ): CertifySession = CoreSession(openHolderSession(mailbox, card))
+        kept: HolderKept,
+    ): CertifySession = CoreSession(openHolderSession(mailbox, card, kept))
 
     override suspend fun revoke(
         identitySeed: ByteArray,
@@ -168,6 +177,8 @@ object CoreHolderSetups : HolderSetups {
     ) = revokeDevice(identitySeed, registrar, device, reason, until.toULong(), thisDevice)
 
     override fun deviceFingerprint(device: ByteArray) = deviceFingerprintOf(device)
+
+    override fun floor(card: ByteArray) = heldFloor(card).toLong()
 
     override suspend fun postRotation(
         registrar: String,

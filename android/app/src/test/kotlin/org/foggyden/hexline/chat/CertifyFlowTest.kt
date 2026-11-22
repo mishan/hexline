@@ -140,6 +140,71 @@ class CertifyFlowTest : ViewModelHarness() {
     }
 
     @Test
+    fun aDeviceIsKeptAtTheEpochItWasCertifiedInAndTheNextSessionIsOpenedWithIt() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val first = shown(vm, fingerprint)
+        assertEquals(listOf("reg.example", 0uL, 0), first.kept.let { listOf(it.registrar, it.epoch, it.devices.size) })
+        first.epoch = 4uL
+        asked(vm, fingerprint, first)
+        vm.approveDevice(fingerprint, manage = false, stores.keys.authorizer())
+        settle()
+        assertEquals(4L, (vm.certify.value as Certifying.Approved).device.epoch)
+        assertEquals("the identity's epoch raised", 4L, stored()!!.epoch)
+        // A process started again opens the next session with what was kept.
+        val again = model2()
+        val next = shown(again, fingerprint)
+        assertEquals(4uL, next.kept.epoch)
+        val listed = next.kept.devices.single()
+        assertArrayEquals(first.device, listed.device)
+        assertEquals(4uL, listed.epoch)
+    }
+
+    @Test
+    fun aFloorReadForARequestIsKeptWhateverTheRequestCameTo() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        setups.floor = 6
+        val session = shown(vm, fingerprint)
+        session.next.completeExceptionally(CoreException.Refused("signed_out_request", "", null))
+        settle()
+        assertEquals(Certifying.Ended(fingerprint, CertifyEnd.SIGNED_OUT), vm.certify.value)
+        assertEquals(6L, stored()!!.epoch)
+    }
+
+    @Test
+    fun aFloorReadForARequestIsKeptWhenTheModelGoesWhileItWaits() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        setups.floor = 6
+        shown(vm, fingerprint)
+        owner.clear()
+        settle()
+        assertEquals(6L, stored()!!.epoch)
+    }
+
+    @Test
+    fun aFloorTheDeviceListAloneKeptIsTheOneASessionIsOpenedWith() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        // As a crash between the list's write and the identity's leaves it.
+        val device = ByteArray(32) { 9 }
+        outside {
+            identities.minted(
+                fingerprint,
+                MintedDevice(device, deviceFingerprintOf(device), null, 2_000_000_000, false, epoch = 7),
+                now,
+            )
+        }
+        assertEquals(0L, stored()!!.epoch)
+        assertEquals(7uL, shown(vm, fingerprint).kept.epoch)
+    }
+
+    @Test
     fun aDeviceSaidNoToIsToldSoAndNotListed() {
         val vm = model()
         settle()
@@ -167,6 +232,7 @@ class CertifyFlowTest : ViewModelHarness() {
             "stale_request" to CertifyEnd.STALE,
             "unreadable_request" to CertifyEnd.UNREADABLE,
             "no_login_request" to CertifyEnd.NO_LOGIN,
+            "signed_out_request" to CertifyEnd.SIGNED_OUT,
         )) {
             val session = shown(vm, fingerprint)
             session.next.completeExceptionally(CoreException.Refused(code, "", null))

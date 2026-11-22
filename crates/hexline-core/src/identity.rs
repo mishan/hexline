@@ -43,6 +43,9 @@ pub struct CertInfo {
     pub can_vouch: bool,
     pub can_manage: bool,
     pub name: Option<String>,
+    /// The device epoch it was certified in (identity-registrar.md section 4.10).
+    #[uniffi(default = 0)]
+    pub epoch: u64,
 }
 
 /// Read `cert` and `card` as a device would keep them: the certificate
@@ -93,6 +96,7 @@ pub fn cert_info(
         can_vouch: c.allows(caps::VOUCH),
         can_manage: c.allows(caps::MANAGE),
         name: c.name,
+        epoch: c.epoch,
     })
 }
 
@@ -209,6 +213,7 @@ mod tests {
                 can_vouch: false,
                 can_manage: false,
                 name: None,
+                epoch: 0,
             }
         );
         assert_eq!(

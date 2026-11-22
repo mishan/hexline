@@ -157,6 +157,11 @@ async fn restore(
     // Before the key is opened: it is held for its signatures and the
     // reissue alone.
     let kept_card = card_kept(&http, &base, &identity).await?;
+    // This device's certificate has no epoch kept anywhere to fall back
+    // on: one minted below a reset would be refused at once.
+    let floor = crate::epoch::published(&http, &base, &reg, &identity)
+        .await?
+        .epoch;
 
     let id = envelope
         .open(&identity, &keys)
@@ -165,7 +170,9 @@ async fn restore(
         .map_err(|e| protocol(&format!("the envelope did not open: {e}")))?;
     drop(keys);
     let device = DeviceKey::generate();
-    let cert = certify(&id, &device, device_name)?;
+    let cert = crate::epoch::at_floor(&identity, floor, |floor| {
+        certify(&id, &device, device_name, floor)
+    })?;
     let (card, new_card) = match kept_card {
         Some(card) => (card, false),
         None => (
@@ -198,17 +205,20 @@ async fn restore(
 
 /// The phone's certificate: login, messages and managing, no vouch, since
 /// the identity key that could is not kept (design §8); as long as
-/// recommended, and read back as a server will read it.
+/// recommended, in device epoch `epoch`, and read back as a server will
+/// read it.
 pub(crate) fn certify(
     id: &IdentityKey,
     device: &DeviceKey,
     name: &str,
+    epoch: u64,
 ) -> Result<Vec<u8>, CoreError> {
     let mut cert =
         DeviceCert::for_keys(id, device.public(), device.public_enc(), issued(), LIFETIME)
             .map_err(|e| protocol(&e.to_string()))?;
     cert.caps = Some(caps::LOGIN | caps::MESSAGE | caps::MANAGE);
     cert.name = Some(name.to_owned());
+    cert.epoch = epoch;
     let cert = cert.sign(id);
     if DeviceCert::parse(&cert).is_err() || cert.len() > MAX_CERT {
         return Err(refused("bad_device_name"));
@@ -222,9 +232,11 @@ const MAX_CERT: usize = 512;
 
 /// Whether `name` makes a certificate a server reads: one signed with
 /// keys made for the purpose, so no fetch is charged for a name that
-/// would make the restored device useless.
+/// would make the restored device useless. At the highest epoch, so the
+/// name fits whatever floor it is minted at.
 pub(crate) fn check_name(name: &str) -> Result<(), CoreError> {
-    certify(&IdentityKey::generate(), &DeviceKey::generate(), name).map(drop)
+    let (id, device) = (IdentityKey::generate(), DeviceKey::generate());
+    certify(&id, &device, name, hl_identity::cert::EPOCH_MAX).map(drop)
 }
 
 /// The base a registrar is reached at: `https://host` for a host, or a
@@ -717,16 +729,20 @@ mod tests {
     type Asked = std::sync::Arc<std::sync::Mutex<Vec<Option<[u8; 32]>>>>;
 
     /// A registrar keeping `id`'s envelope under `passphrase`, answering
-    /// its card's fetch with `card`, and attesting every registration.
+    /// its card's fetch with `card`, attesting every registration, and
+    /// publishing `id`'s device epoch `floor`, 0 for none, or failing the
+    /// records' fetch for none at all.
     async fn registrar_serving(
         id: &IdentityKey,
         passphrase: &str,
         card: (u16, Vec<u8>),
+        floor: Option<u64>,
     ) -> (Url, Asked) {
         use tokio::io::AsyncWriteExt;
         let (envelope, _) = KeyEnvelope::seal(id, &Secret::Passphrase(passphrase)).unwrap();
         let reg = hl_identity::ServerKey::from_seed(&[3; 32]);
         let identity = id.public();
+        let opened = IdentityKey::from_seed(&id.seed());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
         let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -774,6 +790,24 @@ mod tests {
                         json(json!({ "attestation": b64(&attestation.sign(&reg)) }))
                     }
                     path if path.starts_with("/identity/card/") => card.clone(),
+                    path if path.starts_with("/registrar/records/") => match floor {
+                        Some(floor) => {
+                            let list = hl_identity::SignedList {
+                                registrar: "127.0.0.1".into(),
+                                issued: 1,
+                                expires: u64::MAX / 2,
+                                fingerprint: Some(Fingerprint::of(&identity).0),
+                                since: None,
+                                more: false,
+                                entries: (floor > 0)
+                                    .then(|| (1, crate::epoch::tests::reset(&opened, floor)))
+                                    .into_iter()
+                                    .collect(),
+                            };
+                            (200, list.sign(hl_identity::ListKind::Records, &reg))
+                        }
+                        None => (500, Vec::new()),
+                    },
                     _ => (404, Vec::new()),
                 };
                 let head = format!(
@@ -826,7 +860,7 @@ mod tests {
             ((503, Vec::new()), Err("wait"), vec![]),
         ];
         for (case, (served, want, want_asked)) in cases.into_iter().enumerate() {
-            let (base, asked) = registrar_serving(&id, "correct horse", served).await;
+            let (base, asked) = registrar_serving(&id, "correct horse", served, Some(0)).await;
             let got: Got = match restore(
                 base.as_str(),
                 "alice",
@@ -852,6 +886,30 @@ mod tests {
             };
             assert_eq!(got, want, "case {case}");
             assert_eq!(*asked.lock().unwrap(), want_asked, "case {case}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restored_device_is_certified_at_its_registrars_floor_and_never_without_it() {
+        let id = IdentityKey::generate();
+        let card = Card::new(&id, "Alice", 10).sign(&id, Vec::new()).unwrap();
+        for (floor, want) in [(Some(0), Ok(0)), (Some(4), Ok(4)), (None, Err("protocol"))] {
+            let (base, _) =
+                registrar_serving(&id, "correct horse", (200, card.clone()), floor).await;
+            let restored = restore(
+                base.as_str(),
+                "alice",
+                SecretKind::Passphrase,
+                Zeroizing::new("correct horse".into()),
+                "Pixel",
+            )
+            .await;
+            let got = match restored {
+                Ok((r, _)) => Ok(DeviceCert::parse(&r.cert).unwrap().epoch),
+                Err(CoreError::Protocol { .. }) => Err("protocol"),
+                Err(_) => Err("other"),
+            };
+            assert_eq!(got, want, "{floor:?}");
         }
     }
 

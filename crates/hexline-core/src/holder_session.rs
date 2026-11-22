@@ -8,13 +8,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hl_identity::enroll::PAIRING_SECRET_BYTES;
-use hl_identity::{caps, Bundle, DeviceCert, EnrollRequest, Fingerprint, IdentityKey};
+use hl_identity::{caps, Bundle, DeviceCert, EnrollRequest, Fingerprint, IdentityKey, PublicKey};
 use hxng_client::auth;
 use hxng_client::reqwest::Url;
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
 use crate::enroll::mailbox_base;
+use crate::epoch::{at_floor, published_at, registrars_of, signed_out, Published};
 use crate::restore::{b64, endpoint, issued};
 use crate::CoreError;
 
@@ -39,6 +40,12 @@ const SESSION_SECS: u64 = 600;
 /// latest certificate (registrar §4.4).
 const UNKNOWN_UNTIL: u64 = 2 * 365 * 24 * 3600;
 const DAY: u64 = 24 * 3600;
+/// How long a request waits for each of its identity's registrars to say
+/// where its floor is before it is shown at the floor the rest, and this
+/// phone, know.
+const FLOOR_WAIT: Duration = Duration::from_secs(10);
+/// What a device whose key may be a copy is told: only a new key helps.
+const SIGNED_OUT: &str = "this device's key was signed out; make a new one and enroll again";
 
 /// A session at a mailbox, for one device to be enrolled by this phone's
 /// identity. The code admits one request.
@@ -54,6 +61,10 @@ pub struct HolderSession {
     /// poll is doing.
     deadline: Mutex<tokio::time::Instant>,
     card: Vec<u8>,
+    /// Where the identity's floor is read, and what this phone keeps of it.
+    registrars: Vec<String>,
+    kept: u64,
+    listed: Vec<(PublicKey, u64)>,
     /// Drawn for the QR code, where there is one: a request carrying `pair`
     /// was scanned from it.
     pairing: Option<Zeroizing<[u8; PAIRING_SECRET_BYTES]>>,
@@ -132,6 +143,8 @@ struct Asked {
     bundle: Option<Vec<u8>>,
     /// When the mailbox lets the request go: no answer after.
     deadline: tokio::time::Instant,
+    /// What the identity's registrars said of its devices as it arrived.
+    published: Published,
 }
 
 /// What a request may be certified for (§6, §8).
@@ -153,6 +166,30 @@ pub struct Certified {
     pub name: Option<String>,
     pub can_manage: bool,
     pub expires: u64,
+    /// The device epoch it was minted in: the highest floor known for the
+    /// identity, for the phone to keep.
+    #[uniffi(default = 0)]
+    pub epoch: u64,
+}
+
+/// What this phone keeps of an identity it holds, for a session to mint
+/// at its floor and to know which keys a reset signed out.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct HolderKept {
+    /// The registrar it was set up or restored at, read beside those its
+    /// card's attestations name.
+    pub registrar: Option<String>,
+    /// The device epoch last learned for it.
+    pub epoch: u64,
+    /// The devices it certified.
+    pub devices: Vec<ListedDevice>,
+}
+
+/// A device a holder certified, and the epoch it certified it in.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ListedDevice {
+    pub device: Vec<u8>,
+    pub epoch: u64,
 }
 
 /// Why a device is revoked, as the registrar's record says it (registrar §4.4).
@@ -188,6 +225,9 @@ pub enum CertifyEnd {
     Unreadable,
     /// A request for a certificate that signs in nowhere, said no to unasked.
     NoLogin,
+    /// A request for a key a reset or a revocation signed out, said no to
+    /// unasked: the device is to make a new one.
+    SignedOut,
 }
 
 /// The end a session's refusal `code` says, if it is one.
@@ -200,6 +240,7 @@ pub fn certify_end(code: String) -> Option<CertifyEnd> {
         "stale_request" => CertifyEnd::Stale,
         "unreadable_request" => CertifyEnd::Unreadable,
         "no_login_request" => CertifyEnd::NoLogin,
+        "signed_out_request" => CertifyEnd::SignedOut,
         _ => return None,
     })
 }
@@ -213,15 +254,16 @@ pub fn device_fingerprint_of(device: Vec<u8>) -> Result<String, CoreError> {
 }
 
 /// Opens a session at `mailbox` (a host, or a server's address) for the
-/// identity whose card is `card`. Refused `no_mailbox` where it serves
-/// none, as the enrollee's are.
+/// identity whose card is `card`, of which this phone keeps `kept`.
+/// Refused `no_mailbox` where it serves none, as the enrollee's are.
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn open_holder_session(
     mailbox: String,
     card: Vec<u8>,
+    kept: HolderKept,
 ) -> Result<Arc<HolderSession>, CoreError> {
     crate::connection::RUNTIME
-        .spawn(async move { HolderSession::open(&mailbox, card).await })
+        .spawn(async move { HolderSession::open(&mailbox, card, kept).await })
         .await
         .unwrap_or_else(|_| Err(protocol("the session stopped")))
 }
@@ -258,9 +300,10 @@ impl HolderSession {
     /// The request the session is sent, waited for. Refused `expired` once
     /// the session is gone, `canceled` by [`HolderSession::cancel`], and
     /// `used` once its one request is answered. A request that does not
-    /// read, whose pairing does not hold, or made too long ago, is denied
-    /// unasked, spending the code: refused `unreadable_request`,
-    /// `unpaired_request` or `stale_request`.
+    /// read, whose pairing does not hold, made too long ago, or for a key
+    /// signed out, is denied unasked, spending the code: refused
+    /// `unreadable_request`, `unpaired_request`, `stale_request` or
+    /// `signed_out_request`.
     #[uniffi::method(async_runtime = "tokio")]
     pub async fn next_request(self: Arc<Self>) -> Result<HolderRequest, CoreError> {
         crate::connection::RUNTIME
@@ -271,12 +314,15 @@ impl HolderSession {
 
     /// Certifies `device`, the device asked about, with the identity whose
     /// seed is `identity_seed`: for what it gets, managing with `manage`
-    /// where it may, under the name it asked for. The certificate is kept
+    /// where it may, under the name it asked for, at the identity's floor as
+    /// it stands as the certificate is signed. The certificate is kept
     /// here until [`HolderSession::deliver`] sends it, so the caller can
     /// record it first: one that may be out in the world is one it can
     /// revoke. Refused `not_asked` for any other device, `manage_not_asked`
     /// for managing where it may not, `used` once the session's one request
-    /// is answered or certified, and `canceled` once the session is.
+    /// is answered or certified, and `canceled` once the session is. One
+    /// the floor has risen past since it was asked is denied, refused
+    /// `signed_out_request`.
     #[uniffi::method(async_runtime = "tokio")]
     pub async fn certify(
         self: Arc<Self>,
@@ -385,8 +431,18 @@ impl HolderSession {
         })
     }
 
-    async fn open(mailbox: &str, card: Vec<u8>) -> Result<Arc<HolderSession>, CoreError> {
-        hl_identity::Card::parse(&card).map_err(|_| refused("bad_card"))?;
+    async fn open(
+        mailbox: &str,
+        card: Vec<u8>,
+        kept: HolderKept,
+    ) -> Result<Arc<HolderSession>, CoreError> {
+        let parsed = hl_identity::Card::parse(&card).map_err(|_| refused("bad_card"))?;
+        let registrars = registrars_of(kept.registrar.as_deref(), &parsed);
+        let listed = kept
+            .devices
+            .iter()
+            .filter_map(|d| Some((d.device.as_slice().try_into().ok()?, d.epoch)))
+            .collect();
         let base = mailbox_base(mailbox)?;
         let http = auth::http_client(base.as_str(), None)?;
         let (enroll, web) = discovered(&http, &base).await?;
@@ -439,6 +495,9 @@ impl HolderSession {
             expires_in,
             deadline: Mutex::new(tokio::time::Instant::now() + Duration::from_secs(expires_in)),
             card,
+            registrars,
+            kept: kept.epoch,
+            listed,
             pairing,
             qr,
             #[cfg(feature = "live-tests")]
@@ -547,6 +606,26 @@ impl HolderSession {
                     .await;
             }
             let card = hl_identity::Card::parse(&self.card).map_err(|_| refused("bad_card"))?;
+            // Read before the request is shown, so what the person is asked
+            // about is not a key a reset signed out; a registrar that does
+            // not answer leaves the floor the rest, and this phone, know.
+            let published = tokio::select! {
+                p = published_at(&self.registrars, &card.identity, FLOOR_WAIT) => p,
+                _ = canceled.changed() => return Err(refused("canceled")),
+            };
+            let floor = at_floor(&card.identity, self.kept.max(published.epoch), |f| f);
+            let prev = own_prev(&request, &card.identity);
+            if signed_out(
+                &request.device,
+                prev.as_ref(),
+                floor,
+                &self.listed,
+                &published,
+            ) {
+                return self
+                    .refuse_unasked(&id, SIGNED_OUT, "signed_out_request")
+                    .await;
+            }
             let decided = match decide(&request, &card.identity, crate::restore::now()) {
                 Ok(decided) => decided,
                 Err((why, code)) => return self.refuse_unasked(&id, why, code).await,
@@ -581,6 +660,7 @@ impl HolderSession {
                     shown: asked,
                     bundle: None,
                     deadline: request_deadline,
+                    published,
                 },
             ));
         }
@@ -600,9 +680,11 @@ impl HolderSession {
         }
         let _answering = self.answering.lock().await;
         let Asked {
+            id: asked_id,
             request,
             decided,
             bundle,
+            published,
             ..
         } = self.unanswered()?;
         if bundle.is_some() {
@@ -626,7 +708,32 @@ impl HolderSession {
         cert.name = request.name.clone();
         let expires = cert.expires;
         let can_manage = cert.caps.unwrap_or(0) & caps::MANAGE != 0;
-        let signed = cert.sign(&id);
+        // A `prev` this identity signed was minted at a floor known then.
+        let prev = own_prev(&request, &id.public());
+        let minted = at_floor(
+            &id.public(),
+            prev.as_ref().map_or(0, |p| p.epoch),
+            |floor| {
+                // The floor may have risen since the request was shown.
+                (!signed_out(
+                    &request.device,
+                    prev.as_ref(),
+                    floor,
+                    &self.listed,
+                    &published,
+                ))
+                .then(|| {
+                    cert.epoch = floor;
+                    cert.sign(&id)
+                })
+            },
+        );
+        let Some(signed) = minted else {
+            self.answer(json!({ "id": asked_id, "denied": SIGNED_OUT }))
+                .await?;
+            return Err(refused("signed_out_request"));
+        };
+        let epoch = cert.epoch;
         DeviceCert::parse(&signed).map_err(|_| refused("bad_device_name"))?;
         let bundle = Bundle {
             cert: signed,
@@ -640,6 +747,7 @@ impl HolderSession {
             name: request.name,
             can_manage,
             expires,
+            epoch,
         })
     }
 
@@ -782,6 +890,14 @@ fn decide(
         may_manage: bits & caps::MANAGE != 0,
         lifetime,
     })
+}
+
+/// `request`'s `prev`, if `identity` signed it for the device asking.
+fn own_prev(request: &EnrollRequest, identity: &PublicKey) -> Option<DeviceCert> {
+    request
+        .prev_cert()
+        .and_then(Result::ok)
+        .filter(|p| p.identity == *identity)
 }
 
 /// A revocation's `until`: the latest expiry known for the device, or as
@@ -1029,6 +1145,7 @@ mod tests {
                 shown,
                 bundle: None,
                 deadline: tokio::time::Instant::now(),
+                published: Published::default(),
             }
         };
         let slot = Mutex::new(None);
@@ -1081,6 +1198,222 @@ mod tests {
             (0, NOW + UNKNOWN_UNTIL),
         ] {
             assert_eq!(revocation_until(known, NOW), until, "{known}");
+        }
+    }
+
+    /// A session at `sessions` for `card`'s identity, as [`HolderSession::open`]
+    /// makes one, reading its floor from `registrars`.
+    fn session(
+        sessions: String,
+        card: Vec<u8>,
+        registrars: Vec<String>,
+        kept: u64,
+        listed: Vec<(PublicKey, u64)>,
+    ) -> HolderSession {
+        HolderSession {
+            http: auth::http_client("http://127.0.0.1", None).unwrap(),
+            sessions,
+            secret: Zeroizing::new("s".into()),
+            code: "K7PM-QX2D".into(),
+            host: "127.0.0.1".into(),
+            expires_in: SESSION_SECS,
+            deadline: Mutex::new(tokio::time::Instant::now() + Duration::from_secs(SESSION_SECS)),
+            card,
+            registrars,
+            kept,
+            listed,
+            pairing: None,
+            qr: None,
+            #[cfg(feature = "live-tests")]
+            qr_url: None,
+            asked: Mutex::new(None),
+            spent: Default::default(),
+            answering: Default::default(),
+            canceled: tokio::sync::watch::channel(false).0,
+        }
+    }
+
+    /// A mailbox with `request`, as signed, pending, taking every answer:
+    /// what it was answered.
+    async fn mailbox(request: &[u8]) -> (String, Arc<Mutex<Vec<Value>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let pending = json!({ "pending": [{
+            "id": "r1",
+            "received": crate::restore::now(),
+            "request": b64(request),
+        }] })
+        .to_string();
+        let answers = Arc::new(Mutex::new(Vec::new()));
+        let kept = answers.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/sessions", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut got = Vec::new();
+                let mut buf = [0; 4096];
+                // The head, and as much of the body as it says there is.
+                let (head, body) = loop {
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    got.extend_from_slice(&buf[..n]);
+                    let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        if n == 0 {
+                            break (String::new(), Vec::new());
+                        }
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&got[..end]).to_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .map_or(0, |n| n.trim().parse().unwrap());
+                    if got.len() >= end + 4 + len || n == 0 {
+                        break (head, got[end + 4..].to_vec());
+                    }
+                };
+                let reply = if head.starts_with("get ") {
+                    pending.clone()
+                } else {
+                    if head.starts_with("post ") {
+                        kept.lock()
+                            .unwrap()
+                            .push(serde_json::from_slice(&body).unwrap());
+                    }
+                    "{}".into()
+                };
+                let out = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                let _ = s.write_all(out.as_bytes()).await;
+            }
+        });
+        (base, answers)
+    }
+
+    fn epoch_in(certified: &HolderSession) -> u64 {
+        let bundle = certified.lock().as_ref().unwrap().bundle.clone().unwrap();
+        DeviceCert::parse(&Bundle::parse(&bundle).unwrap().cert)
+            .unwrap()
+            .epoch
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_is_shown_and_certified_at_the_floor_its_registrars_publish() {
+        let gone = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        // What the registrar publishes (none for one not reached), the
+        // epoch kept, the epoch the device is listed at, and the epoch it
+        // is certified at, or none for a key signed out.
+        for (publishes, kept, listed, want) in [
+            (Some(3), 1, None, Some(3)),
+            (None, 2, None, Some(2)),
+            (Some(3), 0, Some(1), None),
+            (Some(3), 0, Some(3), Some(3)),
+        ] {
+            let id = IdentityKey::generate();
+            let card = hl_identity::Card::new(&id, "Alice", 10)
+                .sign(&id, Vec::new())
+                .unwrap();
+            let registrar = match publishes {
+                Some(epoch) => {
+                    let records = vec![crate::epoch::tests::reset(&id, epoch)];
+                    crate::epoch::tests::registrar_publishing(records, 8)
+                        .await
+                        .to_string()
+                }
+                None => gone.clone(),
+            };
+            let device = DeviceKey::generate();
+            let request = EnrollRequest::new(&device, crate::restore::now());
+            let (sessions, answers) = mailbox(&request.sign(&device)).await;
+            let devices = listed.map(|e| (device.public(), e)).into_iter().collect();
+            let s = Arc::new(session(sessions, card, vec![registrar], kept, devices));
+            let case = format!("{publishes:?} {kept} {listed:?}");
+            let outcome = s.waiting().await;
+            assert_eq!(
+                crate::epoch::held_floor(s.card.clone()),
+                publishes.unwrap_or(kept),
+                "{case}: the floor read is the app's to keep, whatever the request came to"
+            );
+            match want {
+                Some(epoch) => {
+                    let shown = outcome.unwrap();
+                    let certified = s
+                        .certifying(&*id.seed(), false, &shown.device)
+                        .await
+                        .unwrap();
+                    assert_eq!((certified.epoch, epoch_in(&s)), (epoch, epoch), "{case}");
+                    assert!(answers.lock().unwrap().is_empty(), "{case}");
+                }
+                None => {
+                    let refused = outcome.unwrap_err();
+                    assert!(
+                        matches!(&refused, CoreError::Refused { code, .. } if code == "signed_out_request"),
+                        "{case}: {refused:?}"
+                    );
+                    assert_eq!(
+                        *answers.lock().unwrap(),
+                        vec![json!({ "id": "r1", "denied": SIGNED_OUT })],
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_certificate_is_signed_at_the_floor_as_it_stands_when_it_is_signed() {
+        // The floor once the request was shown, the epoch of the `prev` it
+        // renews if it renews one, and the epoch it is certified at, or none
+        // for a renewal the floor has passed since it was asked about.
+        for (floor, prev, want) in [
+            (4, None, Some(4)),
+            (2, Some(5), Some(5)),
+            (3, Some(3), Some(3)),
+            (6, Some(5), None),
+        ] {
+            let id = IdentityKey::generate();
+            let card = hl_identity::Card::new(&id, "Alice", 10)
+                .sign(&id, Vec::new())
+                .unwrap();
+            let device = DeviceKey::generate();
+            let now = crate::restore::now();
+            let mut request = EnrollRequest::new(&device, now);
+            request.prev = prev.map(|epoch| {
+                let mut c = DeviceCert::for_device(&id, &device, now - DAY, 30 * DAY).unwrap();
+                c.caps = Some(LM);
+                c.epoch = epoch;
+                c.sign(&id)
+            });
+            let (sessions, answers) = mailbox(&request.sign(&device)).await;
+            // Opened with nothing kept, as a session opened before a reset is.
+            let s = Arc::new(session(sessions, card, Vec::new(), 0, Vec::new()));
+            let shown = s.waiting().await.unwrap();
+            assert_eq!(shown.renewal, prev.is_some());
+            at_floor(&id.public(), floor, |_| ());
+            let certified = s.certifying(&*id.seed(), false, &shown.device).await;
+            let case = format!("{floor} {prev:?}");
+            match want {
+                Some(epoch) => {
+                    assert_eq!(certified.unwrap().epoch, epoch, "{case}");
+                    assert_eq!(epoch_in(&s), epoch, "{case}");
+                }
+                None => {
+                    assert!(
+                        matches!(&certified, Err(CoreError::Refused { code, .. }) if code == "signed_out_request"),
+                        "{case}: {:?}",
+                        certified.map(|c| c.epoch)
+                    );
+                    assert_eq!(
+                        *answers.lock().unwrap(),
+                        vec![json!({ "id": "r1", "denied": SIGNED_OUT })],
+                        "{case}"
+                    );
+                }
+            }
         }
     }
 }

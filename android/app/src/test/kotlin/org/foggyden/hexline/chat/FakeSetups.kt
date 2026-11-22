@@ -6,6 +6,7 @@ import org.foggyden.hexline.core.Certified
 import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.HeldRestore
 import org.foggyden.hexline.core.HolderCommitted
+import org.foggyden.hexline.core.HolderKept
 import org.foggyden.hexline.core.HolderRequest
 import org.foggyden.hexline.core.NewIdentity
 import org.foggyden.hexline.core.PostOutcome
@@ -84,7 +85,7 @@ class FakeSetups : HolderSetups {
         deviceName: String,
     ): HeldRestore {
         val identity = checkNotNull(restores)
-        val minted = holderMint(identity.seed, identity.card, deviceName)
+        val minted = holderMint(identity.seed, identity.card, deviceName, 0uL)
         val seed = identity.seed.copyOf().also { handed += it }
         return HeldRestore(Restored(minted.deviceSeed, minted.cert, identity.card, identity.fingerprint, false, true), seed)
     }
@@ -97,9 +98,10 @@ class FakeSetups : HolderSetups {
         card: ByteArray,
         deviceSeed: ByteArray,
         cert: ByteArray,
+        epoch: Long,
     ): ByteArray {
         renewals += identitySeed.copyOf() to cert
-        return holderRenew(identitySeed, card, deviceSeed, cert)
+        return holderRenew(identitySeed, card, deviceSeed, cert, epoch.toULong())
     }
 
     /** Each backup the registrar was asked for, as what and the registrar. */
@@ -149,13 +151,14 @@ class FakeSetups : HolderSetups {
     override suspend fun openSession(
         mailbox: String,
         card: ByteArray,
+        kept: HolderKept,
     ): CertifySession {
         opening?.await()
         openFails?.let {
             openFails = null
             throw it
         }
-        return FakeSession(mailbox, card).also { sessions += it }
+        return FakeSession(mailbox, card, kept).also { sessions += it }
     }
 
     class Revocation(
@@ -194,10 +197,16 @@ class FakeSetups : HolderSetups {
 
     override fun deviceFingerprint(device: ByteArray) = deviceFingerprintOf(device)
 
+    /** The device epoch the core says it learned, for every identity. */
+    var floor = 0L
+
+    override fun floor(card: ByteArray) = floor
+
     /** A session at a mailbox: what a device asks it, and how it ends, the test's; answered once, as the core's. */
     inner class FakeSession(
         val mailbox: String,
         val card: ByteArray,
+        val kept: HolderKept,
     ) : CertifySession {
         /** The request a device makes, or what the mailbox ends the wait with. */
         val next = CompletableDeferred<HolderRequest>()
@@ -228,9 +237,10 @@ class FakeSetups : HolderSetups {
 
         override suspend fun answerEnds() = ends.await()
 
-        /** The device certified: its key and when its certificate ends. */
+        /** The device certified: its key, when its certificate ends and the epoch it is in. */
         val device = ByteArray(32) { 7 }
         val expires = 2_000_000_000uL
+        var epoch = 0uL
 
         override fun code() = "K7PM-QX2D"
 
@@ -263,7 +273,7 @@ class FakeSetups : HolderSetups {
             certified = true
             onCertify()
             approvals += identitySeed to manage
-            return Certified(device, checkNotNull(asked).name, manage, expires)
+            return Certified(device, checkNotNull(asked).name, manage, expires, epoch)
         }
 
         /** Called as a send is begun, before anything is checked. */
@@ -376,7 +386,7 @@ class FakeSetups : HolderSetups {
             if (successor != null || !recoveryConfirmed) throw CoreException.Refused("unconfirmed", "", null)
             // As the core does: a device minted again is not yet the one held.
             held = false
-            return holderMint(identity.seed, identity.card, deviceName).also { minted = true }
+            return holderMint(identity.seed, identity.card, deviceName, 0uL).also { minted = true }
         }
 
         override fun recoveryCode() = recovery.toByteArray().takeIf { !recoveryConfirmed }?.also { codes += it }

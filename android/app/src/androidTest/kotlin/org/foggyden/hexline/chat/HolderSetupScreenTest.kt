@@ -30,6 +30,7 @@ import org.foggyden.hexline.core.Caps
 import org.foggyden.hexline.core.Certified
 import org.foggyden.hexline.core.HeldRestore
 import org.foggyden.hexline.core.HolderCommitted
+import org.foggyden.hexline.core.HolderKept
 import org.foggyden.hexline.core.HolderRequest
 import org.foggyden.hexline.core.HolderSetup
 import org.foggyden.hexline.core.HolderSetupInterface
@@ -393,7 +394,8 @@ class HolderSetupScreenTest {
             card: ByteArray,
             deviceSeed: ByteArray,
             cert: ByteArray,
-        ) = holderRenew(identitySeed, card, deviceSeed, cert)
+            epoch: Long,
+        ) = holderRenew(identitySeed, card, deviceSeed, cert, epoch.toULong())
 
         override suspend fun putPassphrase(
             identitySeed: ByteArray,
@@ -414,6 +416,7 @@ class HolderSetupScreenTest {
         override suspend fun openSession(
             mailbox: String,
             card: ByteArray,
+            kept: HolderKept,
         ): CertifySession = Mailbox(mailbox, card).also { session = it }
 
         override suspend fun revoke(
@@ -426,6 +429,8 @@ class HolderSetupScreenTest {
         ): Unit = error("no registrar here")
 
         override fun deviceFingerprint(device: ByteArray) = deviceFingerprintOf(device)
+
+        override fun floor(card: ByteArray) = 0L
 
         override suspend fun postRotation(
             registrar: String,
@@ -467,7 +472,7 @@ class HolderSetupScreenTest {
             val asked = next.await()
             check(device.contentEquals(asked.device)) { "certified a device not asked about" }
             // A certificate the seed it was handed makes: which identity's it is says whose seed that was.
-            val minted = holderMint(identitySeed, card, "Tablet")
+            val minted = holderMint(identitySeed, card, "Tablet", 0uL)
             val info = certForDevice(minted.cert, card, minted.deviceSeed)
             certifiedBy = info.fingerprint
             return Certified(device, asked.name, manage, info.expires)

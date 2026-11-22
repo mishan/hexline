@@ -8,6 +8,7 @@ import org.foggyden.hexline.core.newIdentity
 import org.foggyden.hexline.identity.Backed
 import org.foggyden.hexline.identity.BackingUp
 import org.foggyden.hexline.identity.HolderRefusal
+import org.foggyden.hexline.identity.Identities
 import org.foggyden.hexline.identity.Renewing
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
@@ -447,6 +448,20 @@ class HolderSetupFlowTest : ViewModelHarness() {
                 .single()
                 .held,
         )
+    }
+
+    @Test
+    fun aHeldIdentitysDeviceIsRenewedInTheEpochKeptWhichOutlivesTheProcess() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        outside { identities.learned(fingerprint, 3) }
+        vm.renewHeld(fingerprint, stores.keys.authorizer())
+        settle()
+        assertEquals(Renewing.Done(fingerprint), vm.renewing.value)
+        assertEquals("renewed in it", 3uL, keptIdentities().single().info.epoch)
+        val started = Identities(app, secrets, stores.identityDir)
+        assertEquals("read again from the disk", 3L, outside { started.list().single().epoch })
     }
 
     @Test

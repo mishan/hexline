@@ -19,7 +19,7 @@ import org.robolectric.annotation.Config
 @Config(application = Application::class)
 class HeldRenewalTest {
     private val made = newIdentity("Carol")
-    private val minted = holderMint(made.seed, made.card, "Pixel")
+    private val minted = holderMint(made.seed, made.card, "Pixel", 0uL)
     private val kept =
         StoredIdentity("carol", minted.cert, made.card, certForDevice(minted.cert, made.card, minted.deviceSeed), "reg.example").held()
     private val server = Server("wss://a.example/ng", "", SignIn.Identity(kept.fingerprint))

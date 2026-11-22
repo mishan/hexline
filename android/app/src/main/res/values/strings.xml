@@ -253,6 +253,7 @@
         <item quantity="other">%d minutes</item>
     </plurals>
     <string name="certify_no_login">A device asked for a certificate that signs in nowhere, and was told no. Show a new code to try again.</string>
+    <string name="certify_signed_out">A device asked with a key that was signed out, and was told to make a new one. Show a new code once it has.</string>
     <string name="certify_approve">Approve</string>
     <string name="certify_deny">Deny</string>
     <string name="certify_approved">%1$s can now use this identity.</string>
