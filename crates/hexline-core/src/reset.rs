@@ -662,12 +662,21 @@ pub(crate) async fn reset_all<D: Desk>(
         }
     }))
     .await;
+    // A list past the target, or at it with another's record, leaves the
+    // target signing out nothing, here as in a round.
+    passed |= lists
+        .iter()
+        .flatten()
+        .any(|c| posted_at.is_some_and(|t| c.epoch > t || (c.epoch == t && !ours(c, &posted))));
     for (s, c) in slots.iter_mut().zip(lists) {
         if let Some(c) = c {
             published = published.max(c.epoch);
-            if !passed && posted_at == Some(c.epoch) && ours(&c, &posted) {
+            if posted_at == Some(c.epoch) && ours(&c, &posted) {
                 s.state = State::Done;
             }
+        }
+        if passed && matches!(s.state, State::Done) {
+            s.state = State::Open;
         }
     }
     kept.raise(published);
@@ -1081,6 +1090,8 @@ mod tests {
         let report = report.unwrap();
         assert_eq!((report.target, report.published), (11, 50));
         assert_eq!(kept, 50);
+        // Its floor leaves epoch 11 signing nothing out: done nowhere.
+        assert_eq!(report.done, Vec::<String>::new());
     }
 
     #[tokio::test]
