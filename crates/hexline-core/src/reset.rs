@@ -1186,7 +1186,7 @@ async fn retrying(retry: Vec<u8>, card: Vec<u8>) -> Result<ResetRetried, CoreErr
         })
         .collect();
     let desks = chains.into_iter().zip(remotes.iter_mut()).collect();
-    Ok(retry_all(retry, desks, &Floors(identity), now()).await)
+    Ok(retry_all(retry, desks, &Floors(identity), now).await)
 }
 
 /// What a retry came to at one registrar.
@@ -1196,14 +1196,17 @@ enum Caught {
     NotDone(Refusal),
 }
 
-/// Bring every one of `desks` due at `at` to `retry`'s epoch, side by
-/// side: `retry` with its chains taken out, each beside its desk.
+/// Bring every one of `desks` due by `clock` to `retry`'s epoch, side by
+/// side: `retry` with its chains taken out, each beside its desk. A wait
+/// is counted from when the asking is done, which can be long after it
+/// began.
 async fn retry_all<D: Desk>(
     retry: Retry,
     desks: Vec<(Chain, &mut D)>,
     kept: &impl Kept,
-    at: u64,
+    clock: impl Fn() -> u64,
 ) -> ResetRetried {
+    let at = clock();
     let (desks, waiting): (Vec<_>, Vec<_>) = desks.into_iter().partition(|(c, _)| is_due(c, at));
     let mut left: Vec<Chain> = waiting.into_iter().map(|(c, _)| c).collect();
     let caught = join_all(desks.into_iter().map(|(chain, desk)| {
@@ -1214,6 +1217,7 @@ async fn retry_all<D: Desk>(
         }
     }))
     .await;
+    let at = clock();
     let mut out = ResetRetried {
         epoch: retry.epoch,
         published: 0,
@@ -1282,7 +1286,11 @@ async fn catch_up<D: Desk>(
             Some(caught) => (c.epoch, caught),
             None => (c.epoch.max(cur.epoch), Caught::NotDone(why)),
         },
-        Err(_) => (cur.epoch, Caught::NotDone(why)),
+        // Of the two, the one asking to be left longer.
+        Err(r) => match r.retry_after > why.retry_after {
+            true => (cur.epoch, Caught::NotDone(r)),
+            false => (cur.epoch, Caught::NotDone(why)),
+        },
     }
 }
 
@@ -1394,8 +1402,10 @@ mod tests {
         silent_reads: bool,
         /// Each read answered after this long.
         slow_reads: Option<Duration>,
-        /// Each read refused as a 429 asking for this wait.
+        /// Each read refused as a 429 asking for this wait, after the
+        /// first `limited_after`.
         limited_reads: Option<u64>,
+        limited_after: usize,
         silent_posts: bool,
         /// Posts answered 503 before one lands.
         failing: usize,
@@ -1452,7 +1462,10 @@ mod tests {
             if let Some(after) = self.slow_reads {
                 tokio::time::sleep(after).await;
             }
-            if let Some(retry_after) = self.limited_reads {
+            if let Some(retry_after) = self
+                .limited_reads
+                .filter(|_| self.reads >= self.limited_after)
+            {
                 return Err(unread(CoreError::RateLimited {
                     retry_after: Some(retry_after),
                 }));
@@ -2293,9 +2306,17 @@ mod tests {
         retry_at(retry, sims, later()).await
     }
 
-    /// What `retry` comes to posted at `at` to `sims`, each at the `r{i}`
-    /// its chain names.
     async fn retry_at(retry: &Retry, sims: &mut [&mut Sim], at: u64) -> ResetRetried {
+        retry_by(retry, sims, || at).await
+    }
+
+    /// What `retry` comes to posted to `sims` by `clock`, each at the
+    /// `r{i}` its chain names.
+    async fn retry_by(
+        retry: &Retry,
+        sims: &mut [&mut Sim],
+        clock: impl Fn() -> u64,
+    ) -> ResetRetried {
         let desks = sims
             .iter_mut()
             .enumerate()
@@ -2311,7 +2332,7 @@ mod tests {
             chains: vec![],
             ..retry.clone()
         };
-        retry_all(header, desks, &Mem::at(0), at).await
+        retry_all(header, desks, &Mem::at(0), clock).await
     }
 
     /// What a reset or a retry handed back.
@@ -2763,5 +2784,52 @@ mod tests {
         let sims = &mut [&mut good, &mut limited, &mut down];
         let got = retry_at(&kept_of(&got.retry), sims, at - RETRY_MOST - 1).await;
         assert_eq!(got, retried(1, 1, &["r1"], vec![]));
+    }
+
+    #[tokio::test]
+    async fn a_wait_is_counted_from_when_the_retry_is_done_asking() {
+        // Asked at `at` and done asking 90 s later: `r0` asks for a
+        // minute, and `r1` is not due.
+        let at = now();
+        let mut limited = Sim {
+            limited_reads: Some(60),
+            ..Sim::default()
+        };
+        let mut untouched = Sim::default();
+        let mut kept = for_r0(1, Current::default(), vec![]);
+        let mut r1 = kept.chains[0].clone();
+        (r1.registrar, r1.due) = ("r1".into(), at + 3600);
+        kept.chains.push(r1);
+        let ticks = std::cell::Cell::new(0);
+        let clock = || {
+            ticks.set(ticks.get() + 1);
+            at + 90 * (ticks.get() - 1)
+        };
+        let got = retry_by(&kept, &mut [&mut limited, &mut untouched], clock).await;
+        let dues: Vec<u64> = kept_of(&got.retry).chains.iter().map(|c| c.due).collect();
+        assert_eq!(dues, vec![at + 3600, at + 90 + 60]);
+        assert_eq!(got.retry_in, Some(60));
+        assert_eq!(untouched.reads, 0);
+    }
+
+    #[tokio::test]
+    async fn a_wait_the_confirming_read_asks_for_is_kept() {
+        // Takes the post, then refuses the read that would confirm it.
+        let mut sim = Sim {
+            limited_reads: Some(3600),
+            limited_after: 1,
+            ..Sim::default()
+        };
+        let got = retry(&for_r0(1, Current::default(), vec![]), &mut [&mut sim]).await;
+        assert_eq!(sim.epochs(), vec![1]);
+        assert_eq!(
+            got.not_done,
+            vec![NotYetReset {
+                retry_after: Some(3600),
+                ..not_done("r0", NotYet::Refused, Some("rate_limited"))
+            }],
+            "not done until a list shows it"
+        );
+        assert_eq!(got.retry_in, Some(3600));
     }
 }
