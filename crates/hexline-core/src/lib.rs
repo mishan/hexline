@@ -44,7 +44,7 @@ pub use kept_rotation::{
 };
 pub use model::{ChatLine, HistoryPage, Status, User};
 pub use names::{parts_hash, short_hash};
-pub use reset::{reset_devices, DevicesReset, NotYet, NotYetReset};
+pub use reset::{reset_devices, retry_reset, DevicesReset, NotYet, NotYetReset, ResetRetried};
 pub use restore::{restore_identity, restore_identity_to_hold, HeldRestore, Restored, SecretKind};
 pub use rotation::{post_rotation, PostOutcome, Posted, RotationSetup};
 pub use rotation_notice::{rotation_notice, RotationNotice, RotationNoticeKind};
