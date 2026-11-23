@@ -324,7 +324,7 @@ pub(crate) async fn discovered(
 /// is there: none unless it names itself by the host it was reached at, as
 /// what it signs for is that host's, and a registrar naming another could
 /// gather requests signed for that one.
-fn registrar_of(doc: &Value, base: &Url) -> Result<Registrar, CoreError> {
+pub(crate) fn registrar_of(doc: &Value, base: &Url) -> Result<Registrar, CoreError> {
     let block = doc
         .get("registrar")
         .ok_or_else(|| refused("not_a_registrar"))?;

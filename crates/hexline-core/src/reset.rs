@@ -12,6 +12,7 @@
 //! once more, an epoch further.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -25,7 +26,9 @@ use zeroize::Zeroizing;
 
 use crate::epoch::{at_floor, floor_of, next_floor, published, registrars_of};
 use crate::holder::{refused, seed32};
-use crate::restore::{b64, certify, discovered, endpoint, now, registrar_base, unb64, Registrar};
+use crate::restore::{
+    b64, certify, endpoint, now, registrar_base, registrar_of, retry_after, unb64, Registrar,
+};
 use crate::CoreError;
 
 /// How far one published device epoch may move a registrar's floor
@@ -96,6 +99,9 @@ pub struct DevicesReset {
     /// The registrars whose list shows the reset.
     pub done: Vec<String>,
     pub not_done: Vec<NotYetReset>,
+    /// Origins only the card names whose discovery says no registrar is
+    /// there: a 404, or a document with no registrar in it.
+    pub not_registrars: Vec<String>,
     /// This phone's certificate minted again at the floor, above the one
     /// passed, for the same key and name and, as this phone's own always
     /// is, to log in, message and manage: to keep in its place.
@@ -104,15 +110,39 @@ pub struct DevicesReset {
     pub cert_epoch: u64,
 }
 
-/// A registrar the reset is not at yet, and why, in this core's words.
+/// A registrar the reset is not at yet, and why.
 #[derive(Debug, PartialEq, Eq, uniffi::Record)]
 pub struct NotYetReset {
     pub registrar: String,
-    pub why: String,
+    pub why: NotYet,
     /// The code it refused the reset with, if it did.
     pub code: Option<String>,
     /// Seconds it asked to be left before it is asked again.
     pub retry_after: Option<u64>,
+}
+
+/// Why a registrar is not reset yet: a code for the app to put in words of
+/// its own, as nothing a registrar says is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum NotYet {
+    /// It could not be reached, or did not answer in time.
+    Unreachable,
+    /// Its host refused the connection: down, or no registrar there.
+    ConnectionRefused,
+    /// It refused, as `code` says where it said.
+    Refused,
+    /// It answers, and takes no device epochs.
+    Unsupported,
+    /// What it answered its list does not bear out.
+    Unconfirmed,
+    /// What it serves does not read as a registrar's discovery or list.
+    Malformed,
+    /// More posts than a reset makes did not bring it to the target.
+    TooFarBehind,
+    /// Another holder reset past this reset's epoch meanwhile.
+    Overtaken,
+    /// Its last reset is dated ahead of this phone's clock.
+    DatedAhead,
 }
 
 /// Signs out every device the identity whose seed is `identity_seed`
@@ -163,11 +193,13 @@ async fn resetting(
     if targets.is_empty() {
         return Err(refused("no_registrar"));
     }
+    let origin = |r: &str| registrar_base(r).ok().map(|b| b.origin());
     let mut remotes: Vec<Remote> = targets
         .iter()
         .map(|t| Remote {
             target: t.clone(),
             identity: id.public(),
+            kept: registrars.iter().any(|k| origin(k) == origin(t)),
             reg: None,
         })
         .collect();
@@ -186,6 +218,7 @@ async fn resetting(
         published: report.published,
         done: report.done,
         not_done: report.not_done,
+        not_registrars: report.not_registrars,
         cert,
         cert_epoch,
     })
@@ -202,10 +235,17 @@ pub(crate) struct Current {
     pub(crate) hash: Option<[u8; 32]>,
 }
 
+/// Why a registrar's discovery found none.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Unfound {
+    NotARegistrar,
+    Not(Refusal),
+}
+
 /// What a reset needs of a registrar.
 pub(crate) trait Desk {
     /// Its discovery read, naming itself as it is reached.
-    async fn discover(&mut self) -> Result<(), String>;
+    async fn discover(&mut self) -> Result<(), Unfound>;
     /// Its per-identity list read past any cache, verified against its
     /// keys, reduced to the current device epoch record.
     async fn read(&mut self) -> Result<Current, Refusal>;
@@ -219,26 +259,58 @@ pub(crate) trait Desk {
 struct Remote {
     target: String,
     identity: PublicKey,
+    /// One the app keeps, so a registrar, whatever answers there now.
+    kept: bool,
     reg: Option<(Client, Url, Registrar)>,
 }
 
 impl Desk for Remote {
-    async fn discover(&mut self) -> Result<(), String> {
-        let found = async {
-            let base = registrar_base(&self.target)?;
-            let http = hxng_client::auth::http_client(base.as_str(), None)?;
-            let reg = discovered(&http, &base).await?;
-            Ok::<_, CoreError>((http, base, reg))
+    async fn discover(&mut self) -> Result<(), Unfound> {
+        let not = |why| Err(Unfound::Not(Refusal::because(why)));
+        let Ok(base) = registrar_base(&self.target) else {
+            return not(NotYet::Malformed);
         };
-        self.reg = Some(found.await.map_err(|e| e.to_string())?);
-        Ok(())
+        let Ok(http) = hxng_client::auth::http_client(base.as_str(), None) else {
+            return not(NotYet::Unreachable);
+        };
+        let url = base.join("/.well-known/hotline").expect("a path");
+        let (status, body) = match hxng_client::auth::get(&http, url.as_str()).await {
+            Ok(got) => got,
+            Err(_) if refuses(&base).await => return not(NotYet::ConnectionRefused),
+            Err(_) => return not(NotYet::Unreachable),
+        };
+        let doc = serde_json::from_slice::<Value>(&body).ok();
+        // Said only of an origin the app does not keep, and only where
+        // the answer says so: a registrar down, or kept from view on the
+        // path, must not look like no registrar and be left out.
+        let none_here = status == 404
+            || (status == 200 && doc.as_ref().is_some_and(|d| d.get("registrar").is_none()));
+        if none_here && !self.kept {
+            return Err(Unfound::NotARegistrar);
+        }
+        match (status, doc) {
+            (429 | 503, _) => Err(Unfound::Not(Refusal {
+                why: NotYet::Refused,
+                code: Some("rate_limited".into()),
+                retry_after: retry_after(&body).map(|s| s.min(RETRY_MOST)),
+            })),
+            (200, Some(doc)) => match registrar_of(&doc, &base) {
+                Ok(reg) => {
+                    self.reg = Some((http, base, reg));
+                    Ok(())
+                }
+                Err(_) => not(NotYet::Malformed),
+            },
+            (200, None) => not(NotYet::Malformed),
+            _ => not(NotYet::Unreachable),
+        }
     }
 
     async fn read(&mut self) -> Result<Current, Refusal> {
         let (http, base, reg) = self
             .reg
             .as_ref()
-            .ok_or_else(|| Refusal::because("not discovered".into()))?;
+            .ok_or_else(|| Refusal::because(NotYet::Unreachable))?;
         let p = published(http, base, reg, &self.identity)
             .await
             .map_err(unread)?;
@@ -274,6 +346,20 @@ impl Desk for Remote {
     }
 }
 
+/// Whether `base`'s host refuses a connection to its port: nothing listens
+/// there.
+async fn refuses(base: &Url) -> bool {
+    let (Some(host), Some(port)) = (base.host_str(), base.port_or_known_default()) else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let connect = tokio::net::TcpStream::connect((host, port));
+    matches!(
+        tokio::time::timeout(Duration::from_secs(5), connect).await,
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused
+    )
+}
+
 /// A registrar's reply to a device epoch.
 #[derive(Debug, PartialEq, Eq)]
 enum Answer {
@@ -284,21 +370,20 @@ enum Answer {
         hash: [u8; 32],
     },
     /// No reply, or a failure on the registrar's side.
-    Lost(String),
+    Lost,
     Refused(Refusal),
 }
 
-/// Why a registrar is not done, as the app is told it: no words of the
-/// registrar's own, which the app would show as this core's.
+/// Why a registrar is not done, as the app is told it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Refusal {
-    why: String,
+    why: NotYet,
     code: Option<String>,
     retry_after: Option<u64>,
 }
 
 impl Refusal {
-    fn because(why: String) -> Refusal {
+    fn because(why: NotYet) -> Refusal {
         Refusal {
             why,
             code: None,
@@ -311,18 +396,31 @@ impl Refusal {
 fn unread(e: CoreError) -> Refusal {
     match e {
         CoreError::RateLimited { retry_after } => Refusal {
-            why: "it asked to be left a while".into(),
+            why: NotYet::Refused,
             code: Some("rate_limited".into()),
             retry_after: retry_after.map(|s| s.min(RETRY_MOST)),
         },
-        e => Refusal::because(e.to_string()),
+        CoreError::Refused { code, .. } => Refusal {
+            code: code_of(&code),
+            ..Refusal::because(NotYet::Refused)
+        },
+        CoreError::Protocol { .. } => Refusal::because(NotYet::Malformed),
+        _ => Refusal::because(NotYet::Unreachable),
     }
+}
+
+/// A registrar's `code`, if it is one: never words of its own, which the
+/// app would show as this core's.
+fn code_of(code: &str) -> Option<String> {
+    let is_code =
+        (1..=32).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    is_code.then(|| code.to_owned())
 }
 
 fn answer(reply: Result<(u16, Value), String>) -> Answer {
     let (status, body) = match reply {
         Ok(r) => r,
-        Err(e) => return Answer::Lost(e),
+        Err(_) => return Answer::Lost,
     };
     if status == 200 {
         let hash = body["hash"]
@@ -330,21 +428,15 @@ fn answer(reply: Result<(u16, Value), String>) -> Answer {
             .and_then(|h| unb64(h)?.try_into().ok());
         return match (body["epoch"].as_u64(), hash) {
             (Some(epoch), Some(hash)) => Answer::At { epoch, hash },
-            _ => Answer::Refused(Refusal::because("it does not take device epochs".into())),
+            _ => Answer::Refused(Refusal::because(NotYet::Unsupported)),
         };
     }
     if status >= 500 {
-        return Answer::Lost(format!("it answered {status}"));
+        return Answer::Lost;
     }
     Answer::Refused(Refusal {
-        why: "it refused the reset".into(),
-        code: body["error"]
-            .as_str()
-            .filter(|c| {
-                (1..=32).contains(&c.len())
-                    && c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
-            })
-            .map(str::to_owned),
+        why: NotYet::Refused,
+        code: body["error"].as_str().and_then(code_of),
         retry_after: body["retry_after"].as_u64().map(|s| s.min(RETRY_MOST)),
     })
 }
@@ -356,31 +448,37 @@ enum Step {
     /// its list must bear out before it is done.
     Answered,
     /// Every reply was lost, so a post may have landed: its list says.
-    Lost(String),
+    Lost,
     NotDone(Refusal),
     /// It answered above what was posted, or at it with a record this
     /// reset did not post: another holder's reset, if its list bears it
     /// out.
     Claimed(u64),
+    /// Not posted to again, as another registrar claimed the target.
+    Stopped,
 }
 
 /// Bring a registrar whose current record is `cur` to `target`, `cur +
 /// 16` at a time, each post signed afresh at the later of now and the
 /// registrar's current record's `time`, its hash kept in `posted` before
-/// it is sent.
+/// it is sent. A claim at or past the target sets `stop`, and a drive
+/// that finds it set posts nothing more: the target is stale everywhere,
+/// and the other registrars' daily resets are not spent on it.
 async fn drive<D: Desk>(
     target: u64,
     mut cur: Current,
     id: &IdentityKey,
-    posted: &mut Vec<[u8; 32]>,
+    posted: &Mutex<Vec<[u8; 32]>>,
+    stop: &AtomicBool,
     desk: &mut D,
 ) -> Result<Step, CoreError> {
     let mut lost = 0;
     for _ in 0..POSTS_MAX {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(Step::Stopped);
+        }
         if cur.time > now().saturating_add(SKEW) {
-            return Ok(Step::NotDone(Refusal::because(
-                "its last reset is dated ahead of this phone's clock".into(),
-            )));
+            return Ok(Step::NotDone(Refusal::because(NotYet::DatedAhead)));
         }
         let epoch = target.min(cur.epoch.saturating_add(STEP_MAX));
         let time = now().max(cur.time);
@@ -392,18 +490,22 @@ async fn drive<D: Desk>(
         .sign(id)
         .map_err(|e| protocol(&format!("the device epoch does not sign: {e}")))?;
         let hash: [u8; 32] = Sha256::digest(&bytes).into();
-        if !posted.contains(&hash) {
-            posted.push(hash);
+        {
+            let mut mine = posted.lock().unwrap_or_else(|e| e.into_inner());
+            if !mine.contains(&hash) {
+                mine.push(hash);
+            }
         }
         match answer(desk.post(&bytes).await) {
             Answer::At { epoch: e, hash: h } => {
                 lost = 0;
                 if e < epoch {
-                    return Ok(Step::NotDone(Refusal::because(format!(
-                        "it answered epoch {e} to a post of {epoch}"
-                    ))));
+                    return Ok(Step::NotDone(Refusal::because(NotYet::Unconfirmed)));
                 }
-                if e > epoch || !posted.contains(&h) {
+                if e > epoch || !mine(posted, &h) {
+                    if e >= target {
+                        stop.store(true, Ordering::SeqCst);
+                    }
                     return Ok(Step::Claimed(e));
                 }
                 if e == target {
@@ -415,19 +517,25 @@ async fn drive<D: Desk>(
                     hash: Some(h),
                 };
             }
-            Answer::Lost(why) => {
+            Answer::Lost => {
                 lost += 1;
                 if lost >= TRIES {
-                    return Ok(Step::Lost(why));
+                    return Ok(Step::Lost);
                 }
                 desk.pause().await;
             }
             Answer::Refused(r) => return Ok(Step::NotDone(r)),
         }
     }
-    Ok(Step::NotDone(Refusal::because(format!(
-        "{POSTS_MAX} posts did not bring it to epoch {target}"
-    ))))
+    Ok(Step::NotDone(Refusal::because(NotYet::TooFarBehind)))
+}
+
+/// Whether this reset posted the record whose hash is `hash`.
+fn mine(posted: &Mutex<Vec<[u8; 32]>>, hash: &[u8; 32]) -> bool {
+    posted
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(hash)
 }
 
 // --- A reset at every registrar ---------------------------------------------
@@ -436,10 +544,11 @@ enum State {
     Open,
     /// Answered at the target; to be read again.
     Answered,
-    /// Its replies lost, with why; to be read again.
-    Lost(String),
+    /// Its replies lost; to be read again.
+    Lost,
     Done,
-    Out(String),
+    Out(Refusal),
+    NotARegistrar,
 }
 
 struct Slot<'a, D> {
@@ -451,8 +560,6 @@ struct Slot<'a, D> {
     claim: Option<u64>,
     /// Discovered, so its list counts.
     trusted: bool,
-    /// The refusal it was given up on for, if it refused.
-    refusal: Option<Refusal>,
 }
 
 /// The floor a reset keeps, shared with the reads that raise it as they
@@ -484,6 +591,7 @@ pub(crate) struct Report {
     pub(crate) published: u64,
     pub(crate) done: Vec<String>,
     pub(crate) not_done: Vec<NotYetReset>,
+    pub(crate) not_registrars: Vec<String>,
 }
 
 /// Reset at every one of `desks`, from `floor`. `kept` keeps a floor
@@ -502,14 +610,15 @@ pub(crate) async fn reset_all<D: Desk>(
     let found = join_all(desks.iter_mut().map(|(_, desk)| async move {
         tokio::time::timeout(WAIT, desk.discover())
             .await
-            .unwrap_or_else(|_| Err(LATE.into()))
+            .unwrap_or_else(|_| Err(Unfound::Not(Refusal::because(NotYet::Unreachable))))
     }))
     .await;
     let mut slots: Vec<Slot<D>> = Vec::new();
     for ((target, desk), found) in desks.into_iter().zip(found) {
         let state = match found {
             Ok(()) => State::Open,
-            Err(e) => State::Out(e),
+            Err(Unfound::NotARegistrar) => State::NotARegistrar,
+            Err(Unfound::Not(r)) => State::Out(r),
         };
         slots.push(Slot {
             target,
@@ -518,11 +627,11 @@ pub(crate) async fn reset_all<D: Desk>(
             state,
             cur: Current::default(),
             claim: None,
-            refusal: None,
         });
     }
-    let mut posted: Vec<[u8; 32]> = Vec::new();
-    let ours = |c: &Current, posted: &[[u8; 32]]| c.hash.is_some_and(|h| posted.contains(&h));
+    let posted = Mutex::new(Vec::new());
+    let ours =
+        |c: &Current, posted: &Mutex<Vec<[u8; 32]>>| c.hash.is_some_and(|h| mine(posted, &h));
     let mut known = floor;
     let mut target = 0;
     // The target last posted, which a re-target in the last round passed.
@@ -534,7 +643,7 @@ pub(crate) async fn reset_all<D: Desk>(
         let mut read = Vec::new();
         let lists = join_all(slots.iter_mut().map(|s| async move {
             match s.state {
-                State::Out(_) => None,
+                State::Out(_) | State::NotARegistrar => None,
                 _ => Some(read_in_time(&mut *s.desk, kept).await),
             }
         }))
@@ -546,18 +655,15 @@ pub(crate) async fn reset_all<D: Desk>(
                     s.cur = c;
                     read.push(i);
                 }
-                Some(Err(r)) => {
-                    let why = format!("its list could not be read: {}", r.why);
-                    s.state = State::Out(why.clone());
-                    s.refusal = Some(Refusal { why, ..r });
-                }
+                Some(Err(r)) => s.state = State::Out(r),
             }
         }
         if round == 0 && read.is_empty() {
             let why: Vec<String> = slots
                 .iter()
                 .filter_map(|s| match &s.state {
-                    State::Out(why) => Some(format!("{}: {why}", s.target)),
+                    State::Out(r) => Some(format!("{}: {:?}", s.target, r.why)),
+                    State::NotARegistrar => Some(format!("{}: not a registrar", s.target)),
                     _ => None,
                 })
                 .collect();
@@ -577,8 +683,8 @@ pub(crate) async fn reset_all<D: Desk>(
         for s in &mut slots {
             let landed = s.cur.epoch == target && ours(&s.cur, &posted);
             match (&s.state, landed) {
-                (State::Open | State::Answered | State::Lost(_), true) => s.state = State::Done,
-                (State::Lost(why), false) => s.state = State::Out(why.clone()),
+                (State::Open | State::Answered | State::Lost, true) => s.state = State::Done,
+                (State::Lost, false) => s.state = State::Out(Refusal::because(NotYet::Unreachable)),
                 // Read again and no longer there, as after a restore.
                 (State::Done, false) => s.state = State::Open,
                 _ => {}
@@ -589,10 +695,7 @@ pub(crate) async fn reset_all<D: Desk>(
                 _ => continue,
             };
             s.state = match s.cur.epoch < claim {
-                true => State::Out(format!(
-                    "it answered epoch {claim}, and its list shows {}",
-                    s.cur.epoch
-                )),
+                true => State::Out(Refusal::because(NotYet::Unconfirmed)),
                 false => State::Open,
             };
         }
@@ -624,31 +727,32 @@ pub(crate) async fn reset_all<D: Desk>(
         }
         posted_at = Some(target);
         passed = false;
-        for s in &mut slots {
-            if !matches!(s.state, State::Open) {
-                continue;
+        // Side by side, so the round's posts take one wait however many
+        // registrars stall.
+        let stop = AtomicBool::new(false);
+        let steps = join_all(slots.iter_mut().map(|s| {
+            let open = matches!(s.state, State::Open);
+            let driven = drive(target, s.cur, id, &posted, &stop, &mut *s.desk);
+            async move {
+                if !open {
+                    return None;
+                }
+                // Given up on, a post may have landed: its list says.
+                Some(
+                    tokio::time::timeout(WAIT, driven)
+                        .await
+                        .unwrap_or(Ok(Step::Lost)),
+                )
             }
-            let driven = drive(target, s.cur, id, &mut posted, &mut *s.desk);
-            // Given up on, a post may have landed: its list says.
-            let step = match tokio::time::timeout(WAIT, driven).await {
-                Ok(step) => step?,
-                Err(_) => Step::Lost(LATE.into()),
-            };
-            match step {
-                Step::Answered => s.state = State::Answered,
-                Step::Lost(why) => s.state = State::Lost(why),
-                Step::NotDone(r) => {
-                    s.state = State::Out(r.why.clone());
-                    s.refusal = Some(r);
-                }
-                Step::Claimed(e) => {
-                    s.claim = Some(e);
-                    // The target is stale for everyone; the rest's daily
-                    // resets are not spent on it.
-                    if e >= target {
-                        break;
-                    }
-                }
+        }))
+        .await;
+        for (s, step) in slots.iter_mut().zip(steps) {
+            match step.transpose()? {
+                Some(Step::Answered) => s.state = State::Answered,
+                Some(Step::Lost) => s.state = State::Lost,
+                Some(Step::NotDone(r)) => s.state = State::Out(r),
+                Some(Step::Claimed(e)) => s.claim = Some(e),
+                Some(Step::Stopped) | None => {}
             }
         }
     }
@@ -685,6 +789,7 @@ pub(crate) async fn reset_all<D: Desk>(
         published,
         done: Vec::new(),
         not_done: Vec::new(),
+        not_registrars: Vec::new(),
     };
     for s in slots {
         let r = match s.state {
@@ -692,11 +797,13 @@ pub(crate) async fn reset_all<D: Desk>(
                 report.done.push(s.target);
                 continue;
             }
-            State::Out(why) | State::Lost(why) => s.refusal.unwrap_or(Refusal::because(why)),
-            State::Open | State::Answered => Refusal::because(format!(
-                "another holder reset past epoch {} meanwhile",
-                report.target
-            )),
+            State::NotARegistrar => {
+                report.not_registrars.push(s.target);
+                continue;
+            }
+            State::Out(r) => r,
+            State::Lost => Refusal::because(NotYet::Unreachable),
+            State::Open | State::Answered => Refusal::because(NotYet::Overtaken),
         };
         report.not_done.push(NotYetReset {
             registrar: s.target,
@@ -708,15 +815,12 @@ pub(crate) async fn reset_all<D: Desk>(
     Ok(report)
 }
 
-/// Why a registrar given [`WAIT`] and no more is left behind.
-const LATE: &str = "it did not answer in time";
-
 /// `desk`'s list, or why not, in [`WAIT`], its floor kept as it lands so
 /// a mint meanwhile signs at it.
 async fn read_in_time<D: Desk>(desk: &mut D, kept: &impl Kept) -> Result<Current, Refusal> {
     let read = tokio::time::timeout(WAIT, desk.read())
         .await
-        .unwrap_or_else(|_| Err(Refusal::because(LATE.into())))?;
+        .unwrap_or(Err(Refusal::because(NotYet::Unreachable)))?;
     kept.raise(read.epoch);
     Ok(read)
 }
@@ -736,6 +840,7 @@ mod tests {
     #[derive(Default)]
     struct Sim {
         unreachable: bool,
+        not_a_registrar: bool,
         /// Published, in order: epoch, time, hash.
         held: Vec<(u64, u64, [u8; 32])>,
         /// Posts whose reply is lost after they land.
@@ -814,10 +919,11 @@ mod tests {
     }
 
     impl Desk for Sim {
-        async fn discover(&mut self) -> Result<(), String> {
-            match self.unreachable {
-                true => Err("connection refused".into()),
-                false => Ok(()),
+        async fn discover(&mut self) -> Result<(), Unfound> {
+            match (self.unreachable, self.not_a_registrar) {
+                (true, _) => Err(Unfound::Not(Refusal::because(NotYet::Unreachable))),
+                (_, true) => Err(Unfound::NotARegistrar),
+                _ => Ok(()),
             }
         }
 
@@ -836,7 +942,7 @@ mod tests {
             self.reads += 1;
             if self.unread > 0 || self.fail_read == Some(self.reads) {
                 self.unread = self.unread.saturating_sub(1);
-                return Err(Refusal::because("connection reset".into()));
+                return Err(Refusal::because(NotYet::Unreachable));
             }
             if self.rollback_at == Some(self.reads) {
                 self.held.pop();
@@ -974,13 +1080,14 @@ mod tests {
             published: target,
             done: (0..n).map(|i| format!("r{i}")).collect(),
             not_done: vec![],
+            not_registrars: vec![],
         }
     }
 
-    fn not_done(registrar: &str, why: &str, code: Option<&str>) -> NotYetReset {
+    fn not_done(registrar: &str, why: NotYet, code: Option<&str>) -> NotYetReset {
         NotYetReset {
             registrar: registrar.into(),
-            why: why.into(),
+            why,
             code: code.map(str::to_owned),
             retry_after: None,
         }
@@ -1027,7 +1134,7 @@ mod tests {
         assert_eq!(report.done, Vec::<String>::new());
         assert_eq!(
             report.not_done,
-            vec![not_done("r0", "connection reset", None)]
+            vec![not_done("r0", NotYet::Unreachable, None)]
         );
     }
 
@@ -1131,7 +1238,7 @@ mod tests {
 
     #[tokio::test]
     async fn another_holders_record_at_or_past_the_target_is_reset_past_everywhere() {
-        for theirs in [1, 5] {
+        for (theirs, b_first) in [(1, false), (5, false), (5, true)] {
             let mut a = Sim::default();
             // Signed a little later than this holder signs, so the bytes
             // are not this holder's own.
@@ -1139,10 +1246,18 @@ mod tests {
                 race: Some(signed(theirs, now() + 5)),
                 ..Sim::default()
             };
-            let (report, kept) = reset(0, &mut [&mut a, &mut b]).await;
+            let (report, kept) = match b_first {
+                true => reset(0, &mut [&mut b, &mut a]).await,
+                false => reset(0, &mut [&mut a, &mut b]).await,
+            };
             let target = theirs + 1;
             assert_eq!(report.unwrap(), all_done(target, 2), "theirs at {theirs}");
-            assert_eq!(a.epochs(), vec![1, target]);
+            // Once `b` shows the target stale, `a` is not posted it.
+            let a_at = match b_first {
+                true => vec![target],
+                false => vec![1, target],
+            };
+            assert_eq!(a.epochs(), a_at, "b first: {b_first}");
             assert_eq!(b.epochs(), vec![theirs, target]);
             assert_eq!(kept, target);
         }
@@ -1162,11 +1277,8 @@ mod tests {
                 target: 1,
                 published: 1,
                 done: vec!["r1".into()],
-                not_done: vec![not_done(
-                    "r0",
-                    "it answered epoch 1000000, and its list shows 0",
-                    None
-                )],
+                not_done: vec![not_done("r0", NotYet::Unconfirmed, None)],
+                not_registrars: vec![],
             }
         );
         assert_eq!((honest.epochs(), honest.posts), (vec![1], 1));
@@ -1187,7 +1299,7 @@ mod tests {
             report.not_done,
             vec![NotYetReset {
                 retry_after: Some(3600),
-                ..not_done("r0", "it refused the reset", Some("rate_limited"))
+                ..not_done("r0", NotYet::Refused, Some("rate_limited"))
             }],
             "no words of the registrar's own"
         );
@@ -1213,11 +1325,7 @@ mod tests {
         assert_eq!((report.target, &report.done), (3, &vec!["r1".to_string()]));
         assert_eq!(
             report.not_done,
-            vec![not_done(
-                "r0",
-                "its last reset is dated ahead of this phone's clock",
-                None
-            )]
+            vec![not_done("r0", NotYet::DatedAhead, None)]
         );
         assert_eq!(ahead.posts, 0);
 
@@ -1264,11 +1372,7 @@ mod tests {
             report.not_done,
             vec![NotYetReset {
                 retry_after: Some(RETRY_MOST),
-                ..not_done(
-                    "r0",
-                    "its list could not be read: it asked to be left a while",
-                    Some("rate_limited")
-                )
+                ..not_done("r0", NotYet::Refused, Some("rate_limited"))
             }]
         );
     }
@@ -1313,24 +1417,35 @@ mod tests {
             silent_posts: true,
             ..Sim::default()
         };
+        let mut also_stalls = Sim {
+            silent_posts: true,
+            ..Sim::default()
+        };
         let mut good = Sim::default();
         let began = tokio::time::Instant::now();
         let report = reset(
             0,
-            &mut [&mut quiet, &mut also_quiet, &mut stalls, &mut good],
+            &mut [
+                &mut quiet,
+                &mut also_quiet,
+                &mut stalls,
+                &mut also_stalls,
+                &mut good,
+            ],
         )
         .await
         .0
         .unwrap();
-        // The reads in round 0, the stalled post, and the last reads.
+        // The reads in round 0, the stalled posts together, and the last
+        // reads.
         assert!(began.elapsed() <= 3 * WAIT, "{:?}", began.elapsed());
-        assert_eq!((report.target, &report.done), (1, &vec!["r3".to_string()]));
+        assert_eq!((report.target, &report.done), (1, &vec!["r4".to_string()]));
         let late: Vec<_> = report
             .not_done
             .iter()
             .map(|n| n.registrar.as_str())
             .collect();
-        assert_eq!(late, vec!["r0", "r1", "r2"]);
+        assert_eq!(late, vec!["r0", "r1", "r2", "r3"]);
         assert_eq!(good.epochs(), vec![1]);
     }
 
@@ -1475,12 +1590,148 @@ mod tests {
                 published: 0,
                 done: vec![],
                 not_done: vec![
-                    not_done("r0", "it answered epoch 1, and its list shows 0", None),
-                    not_done("r1", "it answered epoch 0 to a post of 1", None),
-                    not_done("r2", "it refused the reset", Some("not_registered")),
+                    not_done("r0", NotYet::Unconfirmed, None),
+                    not_done("r1", NotYet::Unconfirmed, None),
+                    not_done("r2", NotYet::Refused, Some("not_registered")),
                 ],
+                not_registrars: vec![],
             }
         );
         assert_eq!((pretender.posts, below.posts), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn an_origin_that_is_no_registrar_is_told_apart_from_one_not_reset() {
+        let mut guess = Sim {
+            not_a_registrar: true,
+            ..Sim::default()
+        };
+        let mut good = Sim::default();
+        let report = reset(0, &mut [&mut guess, &mut good]).await.0.unwrap();
+        assert_eq!(
+            report,
+            Report {
+                not_registrars: vec!["r0".into()],
+                done: vec!["r1".into()],
+                ..all_done(1, 0)
+            }
+        );
+
+        let mut guess = Sim {
+            not_a_registrar: true,
+            ..Sim::default()
+        };
+        match reset(0, &mut [&mut guess]).await.0 {
+            Err(CoreError::Refused { code, .. }) => assert_eq!(code, "no_registrar_reached"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_origin_only_the_card_names_is_no_registrar_only_where_its_answer_says_so() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let gone = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        // An origin answering every request with `status` and `body`.
+        let answering = |status: u16, body: &'static str| async move {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", l.local_addr().unwrap());
+            tokio::spawn(async move {
+                while let Ok((mut s, _)) = l.accept().await {
+                    let _ = s.read(&mut [0; 8192]).await;
+                    let reply = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(reply.as_bytes()).await;
+                }
+            });
+            url
+        };
+        let missing = answering(404, "").await;
+        let website = answering(200, r#"{"server": {}}"#).await;
+        let failing = answering(502, "").await;
+        let garbled = answering(200, "<html>").await;
+        let limited = answering(429, r#"{"retry_after": 60}"#).await;
+        let registrar = crate::epoch::tests::registrar_publishing(vec![], 8)
+            .await
+            .to_string();
+        let not = |why| Err(Unfound::Not(Refusal::because(why)));
+        for (target, kept, found) in [
+            (&missing, false, Err(Unfound::NotARegistrar)),
+            (&website, false, Err(Unfound::NotARegistrar)),
+            // A registrar down, or kept from view, is no evidence.
+            (&gone, false, not(NotYet::ConnectionRefused)),
+            (&failing, false, not(NotYet::Unreachable)),
+            (&garbled, false, not(NotYet::Malformed)),
+            (
+                &limited,
+                false,
+                Err(Unfound::Not(Refusal {
+                    code: Some("rate_limited".into()),
+                    retry_after: Some(60),
+                    ..Refusal::because(NotYet::Refused)
+                })),
+            ),
+            // One the app keeps is a registrar, whatever answers there.
+            (&missing, true, not(NotYet::Unreachable)),
+            (&website, true, not(NotYet::Malformed)),
+            (&registrar, false, Ok(())),
+        ] {
+            let mut remote = Remote {
+                target: target.clone(),
+                identity: alice().public(),
+                kept,
+                reg: None,
+            };
+            assert_eq!(remote.discover().await, found, "{target}, kept: {kept}");
+        }
+    }
+
+    #[test]
+    fn a_list_read_is_told_by_what_stopped_it() {
+        let refused = CoreError::Refused {
+            code: "not_a_registrar".into(),
+            detail: "Down for maintenance".into(),
+            successor: None,
+        };
+        let connect = CoreError::Connect {
+            detail: "connection reset".into(),
+        };
+        for (e, why, code) in [
+            (refused, NotYet::Refused, Some("not_a_registrar")),
+            (protocol("the records do not read"), NotYet::Malformed, None),
+            (connect, NotYet::Unreachable, None),
+        ] {
+            let r = unread(e);
+            assert_eq!((r.why, r.code.as_deref()), (why, code));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registrar_more_posts_behind_than_a_reset_makes_is_told_so() {
+        // Answers each step as taken and publishes none, so the target,
+        // more than `POSTS_MAX` steps off, is never reached.
+        let mut far = Sim {
+            pretend: true,
+            ..Sim::default()
+        };
+        let floor = STEP_MAX * POSTS_MAX as u64 + 1;
+        let report = reset(floor, &mut [&mut far]).await.0.unwrap();
+        assert_eq!(
+            report.not_done,
+            vec![not_done("r0", NotYet::TooFarBehind, None)]
+        );
+        assert_eq!(far.posts, POSTS_MAX);
+    }
+
+    #[test]
+    fn a_registrar_answering_a_device_epoch_with_no_epoch_takes_none() {
+        assert_eq!(
+            answer(Ok((200, json!({ "seq": 1, "published": true })))),
+            Answer::Refused(Refusal::because(NotYet::Unsupported))
+        );
     }
 }
