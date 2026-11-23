@@ -3383,14 +3383,17 @@ async fn logs_in(server: &Server, seed: &[u8], cert: &[u8], card: &[u8]) -> Resu
 /// at, so a reset is never done there.
 const CARD_NAME: &str = "127.0.0.1";
 
-/// The registrars a reset is not done at.
-fn not_reached(reset: &hexline_core::DevicesReset) -> Vec<&str> {
+/// The registrars a reset is not done at, and why.
+fn not_reached(reset: &hexline_core::DevicesReset) -> Vec<(&str, hexline_core::NotYet)> {
+    assert_eq!(reset.not_registrars, Vec::<String>::new());
     reset
         .not_done
         .iter()
-        .map(|n| n.registrar.as_str())
+        .map(|n| (n.registrar.as_str(), n.why))
         .collect()
 }
+
+const REFUSED: hexline_core::NotYet = hexline_core::NotYet::ConnectionRefused;
 
 /// The epoch a certificate was minted at.
 fn epoch_of(cert: &[u8]) -> u64 {
@@ -3426,7 +3429,7 @@ async fn a_reset_signs_out_the_devices_certified_before_it_and_not_this_phone() 
         (reset.epoch, reset.published, &reset.done),
         (1, 1, &vec![server.http.clone()])
     );
-    assert_eq!(not_reached(&reset), vec![CARD_NAME]);
+    assert_eq!(not_reached(&reset), vec![(CARD_NAME, REFUSED)]);
     let own = reset.cert;
     assert_eq!((epoch_of(&own), reset.cert_epoch), (1, 1));
 
@@ -3478,7 +3481,7 @@ async fn a_reset_whose_reply_is_lost_is_posted_again_and_published_once() {
     .await
     .unwrap();
     assert_eq!((reset.epoch, &reset.done), (1, &vec![front.url.clone()]));
-    assert_eq!(not_reached(&reset), vec![CARD_NAME]);
+    assert_eq!(not_reached(&reset), vec![(CARD_NAME, REFUSED)]);
     assert_eq!(front.posts.load(Ordering::SeqCst), 2);
     let id = hl_identity::IdentityKey::from_seed(&seed.try_into().unwrap());
     assert_eq!(epochs_at(&server, &id).await, vec![1]);
@@ -3509,7 +3512,13 @@ async fn a_registrar_down_at_a_reset_is_caught_up_by_the_next() {
     front.down.store(true, Ordering::SeqCst);
     let first = reset(minted.cert.clone()).await.unwrap();
     assert_eq!((first.epoch, &first.done), (1, &vec![home.http.clone()]));
-    assert_eq!(not_reached(&first), vec![front.url.as_str(), CARD_NAME]);
+    assert_eq!(
+        not_reached(&first),
+        vec![
+            (front.url.as_str(), hexline_core::NotYet::Unreachable),
+            (CARD_NAME, REFUSED)
+        ]
+    );
 
     front.down.store(false, Ordering::SeqCst);
     let second = reset(first.cert).await.unwrap();

@@ -474,14 +474,18 @@ async fn behind_reset(
 ) -> Result<(), CoreError> {
     let cert = DeviceCert::parse(cert_bytes).map_err(|e| protocol(&e.to_string()))?;
     let card = Card::parse(card).map_err(|e| protocol(&e.to_string()))?;
-    let mut registrars = crate::epoch::registrars_of(&[], &card);
-    let host = mailbox.host_str().unwrap_or_default();
+    let host = |r: &str| {
+        let base = crate::restore::registrar_base(r).ok()?;
+        base.host_str().map(str::to_owned)
+    };
+    let attested = crate::epoch::registrars_of(&[], &card);
     let at_mailbox = mailbox.origin().ascii_serialization();
-    if registrars.iter().any(|r| r == host)
-        && crate::restore::registrar_base(host).ok().as_ref() != Some(mailbox)
-    {
-        registrars.push(at_mailbox);
-    }
+    let mailbox_host = host(&at_mailbox);
+    let registrars =
+        match mailbox_host.is_some() && attested.iter().any(|r| host(r) == mailbox_host) {
+            true => crate::epoch::registrars_of(&[at_mailbox], &card),
+            false => attested,
+        };
     let published = crate::epoch::published_at(&registrars, &card.identity, wait).await;
     if cert.check_floor(published.epoch).is_err() {
         return Err(refused("behind_reset"));
@@ -767,6 +771,8 @@ mod tests {
             (1, "127.0.0.1", Some("behind_reset")),
             (2, "127.0.0.1", None),
             (3, "127.0.0.1", None),
+            // The mailbox's host as a URL reads it.
+            (1, "127.0.0.1.", Some("behind_reset")),
             // A floor the card names no registrar for is not learned.
             (1, "elsewhere.invalid", None),
         ] {
