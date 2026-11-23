@@ -1286,8 +1286,9 @@ async fn catch_up<D: Desk>(
             Some(caught) => (c.epoch, caught),
             None => (c.epoch.max(cur.epoch), Caught::NotDone(why)),
         },
-        // Of the two, the one asking to be left longer.
-        Err(r) => match r.retry_after > why.retry_after {
+        // What the posts came to stands where it is final; otherwise the
+        // one of the two asking to be left longer.
+        Err(r) => match waits(&why) && r.retry_after > why.retry_after {
             true => (cur.epoch, Caught::NotDone(r)),
             false => (cur.epoch, Caught::NotDone(why)),
         },
@@ -2831,5 +2832,23 @@ mod tests {
             "not done until a list shows it"
         );
         assert_eq!(got.retry_in, Some(3600));
+    }
+
+    #[tokio::test]
+    async fn a_registrar_a_chain_can_never_reach_is_dropped_whatever_the_confirming_read_asks() {
+        // Reset since by another holder, dated after the kept records, then
+        // refusing the read after it.
+        let mut sim = Sim {
+            limited_reads: Some(3600),
+            limited_after: 1,
+            ..Sim::default()
+        };
+        sim.land(&signed(2, now() + 50)).unwrap();
+        let got = retry(&for_r0(40, Current::default(), vec![]), &mut [&mut sim]).await;
+        assert_eq!(
+            got,
+            retried(40, 2, &[], vec![not_done("r0", NotYet::DatedBefore, None)])
+        );
+        assert_eq!(sim.posts, 0);
     }
 }
