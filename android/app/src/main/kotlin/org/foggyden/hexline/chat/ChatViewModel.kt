@@ -8,6 +8,7 @@ import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.Lifecycle
@@ -17,6 +18,7 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -33,7 +35,9 @@ import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.CoreUpdate
 import org.foggyden.hexline.core.DeviceIdentity
 import org.foggyden.hexline.core.Enrollment
+import org.foggyden.hexline.core.HolderKept
 import org.foggyden.hexline.core.KeptRotation
+import org.foggyden.hexline.core.ListedDevice
 import org.foggyden.hexline.core.LoginInfo
 import org.foggyden.hexline.core.Restored
 import org.foggyden.hexline.core.RevokeReason
@@ -701,8 +705,9 @@ class ChatViewModel internal constructor(
                             withContext(store) { identities.device(fingerprint)?.also { deviceSeed = it.second } }?.first
                                 ?: return@keeping Renewing.Idle
                         val device = checkNotNull(deviceSeed)
+                        val epoch = withContext(store) { identities.epoch(kept) }
                         val cert =
-                            held.use(fingerprint, authorizer) { seed -> setups.renew(seed, kept.card, device, kept.cert) }
+                            held.use(fingerprint, authorizer) { seed -> setups.renew(seed, kept.card, device, kept.cert, epoch) }
                                 ?: return@keeping Renewing.Idle
                         // Only in place of the certificate it began from: one installed meanwhile stands.
                         withContext(store) { identities.renewed(fingerprint, cert, replacing = kept.cert)?.also { publishIdentities() } }
@@ -731,8 +736,11 @@ class ChatViewModel internal constructor(
                 keeping(Renewing::Failed) {
                     val kept =
                         withContext(store) { identities.list().find { it.fingerprint == fingerprint } } ?: return@keeping Renewing.Idle
+                    val epoch = withContext(store) { identities.epoch(kept) }
                     val minted =
-                        held.use(fingerprint, authorizer) { seed -> holderMint(seed, kept.card, kept.info.name ?: "Hexline") }
+                        held.use(fingerprint, authorizer) { seed ->
+                            holderMint(seed, kept.card, kept.info.name ?: "Hexline", epoch.toULong())
+                        }
                             ?: return@keeping Renewing.Idle
                     try {
                         val at = servers.generation()
@@ -1014,10 +1022,27 @@ class ChatViewModel internal constructor(
         val number = ++sessions
         certifying.value = Certifying.Opening(fingerprint)
         viewModelScope.launch {
-            val card = withContext(store) { identities.list().find { it.fingerprint == fingerprint } }?.card
+            val kept =
+                withContext(store) {
+                    identities.list().find { it.fingerprint == fingerprint }?.let { stored ->
+                        // A list that does not read lists nothing here; it blocks the approval instead.
+                        val listed =
+                            try {
+                                identities.minted(fingerprint)
+                            } catch (_: IOException) {
+                                emptyList()
+                            }
+                        stored.card to
+                            HolderKept(
+                                stored.registrar,
+                                identities.epoch(stored).toULong(),
+                                listing(listed),
+                            )
+                    }
+                }
             val opened =
                 try {
-                    card?.let { setups.openSession(mailbox, it) }
+                    kept?.let { (card, held) -> setups.openSession(mailbox, card, held) }
                 } catch (e: CoreException) {
                     if (number == sessions) certifying.value = certifyEnded(fingerprint, e)
                     return@launch
@@ -1031,6 +1056,7 @@ class ChatViewModel internal constructor(
             sessionFor = fingerprint
             certifying.value =
                 Certifying.Showing(fingerprint, opened.identity(), opened.code(), opened.host(), opened.expiresIn().toLong(), opened.qr())
+            val card = checkNotNull(kept).first
             val asked =
                 try {
                     opened.nextRequest()
@@ -1039,6 +1065,9 @@ class ChatViewModel internal constructor(
                     closeSession()
                     certifying.value = certifyEnded(fingerprint, e)
                     return@launch
+                } finally {
+                    // A floor read for a request said no to, given up on, or outlived by the model is kept all the same.
+                    learn(fingerprint, setups.floor(card))
                 }
             val revoked = withContext(store) { revokedHere(fingerprint, asked.device) }
             if (number != sessions) return@launch
@@ -1051,6 +1080,21 @@ class ChatViewModel internal constructor(
                 closeSession()
                 certifying.value = Certifying.Ended(fingerprint, CertifyEnd.EXPIRED)
             }
+        }
+    }
+
+    private fun listing(devices: List<MintedDevice>) = devices.map { ListedDevice(it.device, it.epoch.toULong()) }
+
+    /** [fingerprint]'s device epoch raised to [epoch], learned from its registrars, even as the model goes. */
+    private suspend fun learn(
+        fingerprint: String,
+        epoch: Long,
+    ) = withContext(NonCancellable + store) {
+        try {
+            identities.learned(fingerprint, epoch)
+        } catch (e: IOException) {
+            // A cache, and the device list a second copy: the registrars are asked again at the next mint.
+            Log.w("hexline", "device epoch $epoch not kept", e)
         }
     }
 
@@ -1085,8 +1129,13 @@ class ChatViewModel internal constructor(
                     val certified =
                         try {
                             held.use(fingerprint, authorizer) { seed ->
-                                // Read again with the prompt answered: a revocation made meanwhile stands.
-                                if (revokedNow() != Revoked.No) null else opened.certify(seed, manage, device)
+                                // Read again with the prompt answered: a revocation made meanwhile stands, and the
+                                // list the session was opened with may not have read.
+                                if (revokedNow() != Revoked.No) {
+                                    null
+                                } else {
+                                    opened.certify(seed, manage, device, withContext(store) { listing(identities.minted(fingerprint)) })
+                                }
                             } ?: return@keeping asked.copy(revoked = revokedNow())
                         } catch (e: CoreException) {
                             return@keeping certifyEnded(fingerprint, e)
@@ -1098,11 +1147,13 @@ class ChatViewModel internal constructor(
                             certified.name,
                             certified.expires.toLong(),
                             certified.canManage,
+                            epoch = certified.epoch.toLong(),
                         )
                     // A certificate this phone cannot list is not sent: nothing has left it.
                     if (!withContext(store) { keep(fingerprint, minted, held = false) }) {
                         return@keeping Certifying.Failed(fingerprint, SetupProblem.NotKept)
                     }
+                    learn(fingerprint, minted.epoch)
                     refreshDevices(fingerprint)
                     try {
                         try {

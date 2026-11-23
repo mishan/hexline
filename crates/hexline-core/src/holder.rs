@@ -14,6 +14,7 @@ use hxng_client::auth;
 use serde_json::json;
 use zeroize::Zeroizing;
 
+use crate::epoch::at_floor;
 use crate::restore::{
     b64, bytes, certify, discovered, endpoint, issued, now, ours, registrar_base, with_attestation,
 };
@@ -55,11 +56,14 @@ pub struct HolderMinted {
 /// `device_name`, certified by it as a holder's own: to log in, message and
 /// manage, never to vouch (design §2.3). `card` must be that identity's,
 /// so a seed paired with another's card is refused rather than minted for.
+/// It is minted at the highest device epoch known, of `epoch`, the one this
+/// phone keeps, and what this process has learned.
 #[uniffi::export]
 pub fn holder_mint(
     identity_seed: Vec<u8>,
     card: Vec<u8>,
     device_name: String,
+    epoch: u64,
 ) -> Result<HolderMinted, CoreError> {
     let seed = Zeroizing::new(identity_seed);
     let seed: &[u8; 32] = seed
@@ -72,7 +76,9 @@ pub fn holder_mint(
         return Err(refused("wrong_identity"));
     }
     let device = DeviceKey::generate();
-    let cert = certify(&id, &device, &device_name)?;
+    let cert = at_floor(&id.public(), epoch, |floor| {
+        certify(&id, &device, &device_name, floor)
+    })?;
     Ok(HolderMinted {
         device_seed: device.seed().to_vec(),
         cert,
@@ -82,7 +88,9 @@ pub fn holder_mint(
 /// A new certificate for this phone's own device, `device_seed`'s, by the
 /// identity whose seed is `identity_seed`: a holder's own, as long as
 /// recommended from now, under the name `cert`, the one it renews, gave
-/// it, lapsed or not. Refused `wrong_identity` unless `cert` and `card` are
+/// it, lapsed or not. In the highest device epoch known, of `epoch`, the
+/// one this phone keeps, and `cert`'s: no fetch, as a renewal may be
+/// made offline. Refused `wrong_identity` unless `cert` and `card` are
 /// that identity's and the device's.
 #[uniffi::export]
 pub fn holder_renew(
@@ -90,6 +98,7 @@ pub fn holder_renew(
     card: Vec<u8>,
     device_seed: Vec<u8>,
     cert: Vec<u8>,
+    epoch: u64,
 ) -> Result<Vec<u8>, CoreError> {
     let (seed, device) = (seed32(identity_seed)?, seed32(device_seed)?);
     let id = IdentityKey::from_seed(&seed);
@@ -99,7 +108,10 @@ pub fn holder_renew(
     if info.fingerprint != id.fingerprint().to_string() {
         return Err(refused("wrong_identity"));
     }
-    certify(&id, &device, info.name.as_deref().unwrap_or("Hexline"))
+    let name = info.name.as_deref().unwrap_or("Hexline");
+    at_floor(&id.public(), epoch.max(info.epoch), |floor| {
+        certify(&id, &device, name, floor)
+    })
 }
 
 /// What Renew does for an identity this phone holds, by what servers said
@@ -289,7 +301,8 @@ impl HolderSetup {
         let mut s = self.confirmed_idle()?;
         let id = IdentityKey::from_seed(&s.seed);
         let device = DeviceKey::generate();
-        let cert = certify(&id, &device, &device_name)?;
+        // A new identity: no registrar holds a device epoch for it yet.
+        let cert = certify(&id, &device, &device_name, 0)?;
         s.device = Some((device.seed(), cert.clone()));
         // Not the device the app said it keeps, until it says so of this one.
         s.held = false;
@@ -742,7 +755,8 @@ mod tests {
     #[test]
     fn a_holder_mints_its_own_device_to_log_in_message_and_manage_and_never_vouch() {
         let made = new_identity("Alice".into()).unwrap();
-        let minted = holder_mint(made.seed.clone(), made.card.clone(), "Hexline".into()).unwrap();
+        let minted =
+            holder_mint(made.seed.clone(), made.card.clone(), "Hexline".into(), 0).unwrap();
         let info =
             crate::identity::cert_for_device(minted.cert.clone(), made.card, minted.device_seed)
                 .unwrap();
@@ -829,7 +843,7 @@ mod tests {
         card.successor = Some([7; 32]);
         let card = card.sign(&id, Vec::new()).unwrap();
         let device = DeviceKey::generate();
-        let cert = certify(&id, &device, "Pixel").unwrap();
+        let cert = certify(&id, &device, "Pixel", 0).unwrap();
         let resume = |seed: Vec<u8>, card: Vec<u8>, device: Vec<u8>, cert: Vec<u8>| {
             HolderSetup::resume(seed, card, "reg.example".into(), "bob".into(), device, cert)
         };
@@ -840,7 +854,7 @@ mod tests {
         assert_ne!(resumed.recovery_code(), first.recovery_code());
         assert!(resumed.confirm_recovery(resumed.recovery_code().unwrap()));
         assert_eq!(resumed.identity_seed().unwrap(), id.seed().to_vec());
-        let other = certify(&id, &DeviceKey::generate(), "Pixel").unwrap();
+        let other = certify(&id, &DeviceKey::generate(), "Pixel", 0).unwrap();
         for (seed, card, device, cert, code) in [
             (
                 id.seed().to_vec(),
@@ -897,12 +911,13 @@ mod tests {
     #[test]
     fn a_holder_renews_its_own_device_under_its_name_and_no_other() {
         let made = new_identity("Alice".into()).unwrap();
-        let minted = holder_mint(made.seed.clone(), made.card.clone(), "Pixel".into()).unwrap();
+        let minted = holder_mint(made.seed.clone(), made.card.clone(), "Pixel".into(), 0).unwrap();
         let renewed = holder_renew(
             made.seed.clone(),
             made.card.clone(),
             minted.device_seed.clone(),
             minted.cert.clone(),
+            0,
         )
         .unwrap();
         let info = crate::identity::cert_for_device(
@@ -915,7 +930,7 @@ mod tests {
         assert_eq!(info.name.as_deref(), Some("Pixel"));
         assert!(info.can_manage && !info.can_vouch);
         let bob = new_identity("Bob".into()).unwrap();
-        let theirs = holder_mint(bob.seed.clone(), bob.card.clone(), "Pixel".into()).unwrap();
+        let theirs = holder_mint(bob.seed.clone(), bob.card.clone(), "Pixel".into(), 0).unwrap();
         for (seed, card, device, cert) in [
             (
                 bob.seed.clone(),
@@ -937,7 +952,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                refused_as(holder_renew(seed, card, device, cert)),
+                refused_as(holder_renew(seed, card, device, cert, 0)),
                 "wrong_identity"
             );
         }
@@ -964,6 +979,7 @@ mod tests {
             made.card.clone(),
             device.seed().to_vec(),
             lapsed.clone(),
+            0,
         )
         .unwrap();
         let was =
@@ -989,10 +1005,47 @@ mod tests {
             (alice.seed[..31].to_vec(), alice.card.clone(), "bad_seed"),
             (alice.seed.clone(), b"not a card".to_vec(), "bad_card"),
         ] {
-            match holder_mint(seed, card, "Hexline".into()) {
+            match holder_mint(seed, card, "Hexline".into(), 0) {
                 Err(CoreError::Refused { code: c, .. }) => assert_eq!(c, code),
                 other => panic!("{code}: {:?}", other.map(|_| ())),
             }
+        }
+    }
+
+    #[test]
+    fn a_holders_own_device_is_minted_and_renewed_at_the_highest_epoch_known() {
+        let epoch_of = |cert: &[u8]| DeviceCert::parse(cert).unwrap().epoch;
+        // The epoch this phone keeps, the renewed certificate's, and the
+        // one renewed and then minted at.
+        let max = hl_identity::cert::EPOCH_MAX;
+        // One past any epoch, from a damaged file: minted at the highest.
+        for (kept, had, renewed, minted) in [
+            (0, 0, 0, 0),
+            (3, 0, 3, 3),
+            (2, 5, 5, 5),
+            (4, 1, 4, 4),
+            (u64::MAX, 0, max, max),
+        ] {
+            let made = new_identity("Alice".into()).unwrap();
+            let id = IdentityKey::from_seed(&made.seed.clone().try_into().unwrap());
+            let device = DeviceKey::generate();
+            let prev = certify(&id, &device, "Pixel", had).unwrap();
+            let cert = holder_renew(
+                made.seed.clone(),
+                made.card.clone(),
+                device.seed().to_vec(),
+                prev,
+                kept,
+            )
+            .unwrap();
+            assert_eq!(
+                epoch_of(&cert),
+                renewed,
+                "renewed from {had} with {kept} kept"
+            );
+            // What the renewal learned is kept here, whatever the app passes.
+            let new = holder_mint(made.seed, made.card, "Tablet".into(), 0).unwrap();
+            assert_eq!(epoch_of(&new.cert), minted, "minted after");
         }
     }
 }

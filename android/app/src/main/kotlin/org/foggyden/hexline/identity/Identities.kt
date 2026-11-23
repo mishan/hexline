@@ -66,6 +66,11 @@ data class StoredIdentity(
     val rotatingFrom: String? = null,
     /** The rotation record that made it a successor, shown at each identity login. */
     val rotation: ByteArray? = null,
+    /**
+     * The highest device epoch learned for it: what a holder mints at
+     * while it cannot ask its registrars, a cache they correct. Only rises.
+     */
+    val epoch: Long = 0,
 ) {
     /** As held here, the model's word for it. */
     fun held(): StoredIdentity = copy(held = true)
@@ -143,6 +148,7 @@ class Identities(
                     // A new device of a successor, as a renewal makes, is still one.
                     rotatingFrom = rotatingFrom ?: before?.rotatingFrom,
                     rotation = rotation ?: before?.rotation,
+                    epoch = maxOf(info.epoch.toLong(), before?.epoch ?: 0),
                 )
             write(file, stored)
             before?.let { old ->
@@ -231,7 +237,36 @@ class Identities(
             val file = file(fingerprint)
             val stored = load(file)?.takeIf { it.cert.contentEquals(replacing) } ?: return null
             val info = certInfo(cert, stored.card, stored.info.device, stored.info.deviceEnc)
-            stored.copy(cert = cert, info = info, renewTried = 0, noHolder = false).also { write(file, it) }
+            stored
+                .copy(cert = cert, info = info, renewTried = 0, noHolder = false, epoch = maxOf(stored.epoch, info.epoch.toLong()))
+                .also { write(file, it) }
+        }
+
+    /**
+     * The device epoch to mint [stored]'s certificates at: its own, or one a
+     * device listed for it was certified in, whichever is higher, so a floor
+     * written to the list and not yet to the identity is not lost.
+     */
+    fun epoch(stored: StoredIdentity): Long =
+        synchronized(LOCK) {
+            val listed =
+                try {
+                    minted(stored.fingerprint).maxOfOrNull { it.epoch } ?: 0
+                } catch (_: java.io.IOException) {
+                    0
+                }
+            maxOf(stored.epoch, listed)
+        }
+
+    /** [fingerprint]'s device epoch raised to [epoch], learned from its registrars; nothing if it is not kept or knew it. */
+    fun learned(
+        fingerprint: String,
+        epoch: Long,
+    ): Unit =
+        synchronized(LOCK) {
+            val file = file(fingerprint)
+            val stored = load(file)?.takeIf { it.epoch < epoch } ?: return
+            write(file, stored.copy(epoch = epoch))
         }
 
     /** [fingerprint]'s setup, its key gone before it was committed: no longer to be finished. */
@@ -454,6 +489,7 @@ class Identities(
                         json.optBoolean("manage"),
                         json.optBoolean("revoked"),
                         revoking = json.optBoolean("revoking"),
+                        epoch = json.optLong("epoch"),
                     )
                 }
             } catch (e: Exception) {
@@ -499,22 +535,38 @@ class Identities(
         now: Long,
     ): Unit =
         synchronized(LOCK) {
+            val all = minted(fingerprint)
+            // A key is never certified again in a lower epoch than its listed one: a lower one
+            // given is an entry read before the latest, and the floor that one lists is kept.
+            val epoch = maxOf(given.epoch, all.find { it.device.contentEquals(given.device) }?.epoch ?: 0)
             // An empty name kept as none, as it reads back.
             val device =
-                given.name?.takeIf { it.isEmpty() }?.let {
-                    MintedDevice(
-                        given.device,
-                        given.fingerprint,
-                        null,
-                        given.expires,
-                        given.canManage,
-                        given.revoked,
-                        given.own,
-                        given.revoking,
-                    )
-                } ?: given
-            // A certificate past [now] is let go of as the list is written, a revoked one kept.
-            val live = minted(fingerprint).filter { it.listed(now) }
+                MintedDevice(
+                    given.device,
+                    given.fingerprint,
+                    given.name?.ifEmpty { null },
+                    given.expires,
+                    given.canManage,
+                    given.revoked,
+                    given.own,
+                    given.revoking,
+                    epoch,
+                )
+            // The list may hold the only copy of a floor, after a crash between its write and the
+            // identity's: the identity takes it before an entry holding it can go.
+            val floor = (all + device).maxOf { it.epoch }
+            val raised =
+                try {
+                    learned(fingerprint, floor)
+                    // Kept only if the identity holds it now: one whose file does not read takes nothing.
+                    load(file(fingerprint))?.let { it.epoch >= floor } == true
+                } catch (e: java.io.IOException) {
+                    Log.w(TAG, "device epoch $floor not kept with the identity", e)
+                    false
+                }
+            // A certificate past [now] is let go of as the list is written, a revoked one kept, and
+            // one holding a floor kept nowhere else.
+            val live = all.filter { it.listed(now) || (!raised && it.epoch == floor) }
             writeMinted(fingerprint, live.filter { !it.device.contentEquals(device.device) } + device)
             if (minted(fingerprint).none { it == device }) throw java.io.IOException("not kept")
         }
@@ -534,6 +586,7 @@ class Identities(
                         if (d.canManage) put("manage", true)
                         if (d.revoked) put("revoked", true)
                         if (d.revoking) put("revoking", true)
+                        if (d.epoch != 0L) put("epoch", d.epoch)
                     },
             )
         }
@@ -611,6 +664,7 @@ class Identities(
                 json.optBoolean("unrecoverable"),
                 rotatingFrom = json.optString("rotating_from").ifEmpty { null },
                 rotation = json.optString("rotation").ifEmpty { null }?.let(::unb64),
+                epoch = json.optLong("epoch"),
             )
         } catch (_: Exception) {
             null
@@ -637,6 +691,7 @@ class Identities(
                     if (stored.unrecoverable) put("unrecoverable", true)
                     stored.rotatingFrom?.let { put("rotating_from", it) }
                     stored.rotation?.let { put("rotation", b64(it)) }
+                    if (stored.epoch != 0L) put("epoch", stored.epoch)
                 }
         commit(file, json.toString().toByteArray())
     }

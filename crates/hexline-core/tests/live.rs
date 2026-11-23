@@ -1325,6 +1325,16 @@ async fn a_restored_device_is_vouched_for_where_unattested_identities_are_guests
 }
 
 /// What enrolling a device asks: refused with this code.
+/// What a phone holding an identity set up at `registrar` keeps of it,
+/// before any device epoch is learned.
+fn kept(registrar: &str) -> hexline_core::HolderKept {
+    hexline_core::HolderKept {
+        registrar: Some(registrar.to_owned()),
+        epoch: 0,
+        devices: Vec::new(),
+    }
+}
+
 fn refused_as(e: &CoreError) -> &str {
     match e {
         CoreError::Refused { code, .. } => code,
@@ -1766,7 +1776,7 @@ async fn a_holder_made_on_the_phone_logs_in_attested_and_is_restored_by_its_reco
         card.successor,
         "the commitment kept from the registrar's card"
     );
-    holder_mint(held.identity_seed, held.device.card, "Tablet".into()).unwrap();
+    holder_mint(held.identity_seed, held.device.card, "Tablet".into(), 0).unwrap();
 
     let conn = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
     let device = DeviceIdentity {
@@ -2237,6 +2247,7 @@ async fn a_holders_renewed_certificate_logs_its_device_in() {
         card.clone(),
         minted.device_seed.clone(),
         minted.cert.clone(),
+        0,
     )
     .unwrap();
     let conn = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
@@ -2315,9 +2326,10 @@ async fn asked_by(
     hexline_core::HolderRequest,
     tokio::task::JoinHandle<Result<hexline_core::Enrolled, CoreError>>,
 ) {
-    let session = hexline_core::open_holder_session(server.http.clone(), card.to_vec())
-        .await
-        .unwrap();
+    let session =
+        hexline_core::open_holder_session(server.http.clone(), card.to_vec(), kept(&server.http))
+            .await
+            .unwrap();
     assert_eq!(
         session.host(),
         server.http.trim_start_matches("http://"),
@@ -2419,7 +2431,7 @@ async fn a_code_shown_past_its_time_ends_the_wait_and_admits_nobody() {
     use hexline_core::Enrollee;
     let server = Server::with_registrar(&[]).await;
     let (_, _, card) = held(&server, "sol").await;
-    let session = hexline_core::open_holder_session(server.http.clone(), card)
+    let session = hexline_core::open_holder_session(server.http.clone(), card, kept(&server.http))
         .await
         .unwrap();
     session.run_out();
@@ -2513,7 +2525,7 @@ async fn approved(
 ) -> Result<hexline_core::Certified, CoreError> {
     let certified = session
         .clone()
-        .certify(seed.to_vec(), manage, device)
+        .certify(seed.to_vec(), manage, device, Vec::new())
         .await?;
     session.clone().deliver().await?;
     Ok(certified)
@@ -2579,9 +2591,10 @@ async fn sent(
     Arc<hexline_core::HolderSession>,
     Result<hexline_core::HolderRequest, CoreError>,
 ) {
-    let session = hexline_core::open_holder_session(server.http.clone(), card.to_vec())
-        .await
-        .unwrap();
+    let session =
+        hexline_core::open_holder_session(server.http.clone(), card.to_vec(), kept(&server.http))
+            .await
+            .unwrap();
     let device = hl_identity::DeviceKey::generate();
     post_request(server, &session.code(), &made(&device)).await;
     let asked = within(session.clone().next_request()).await;
@@ -2646,9 +2659,10 @@ async fn a_device_gets_the_days_it_asked_for_and_a_renewal_only_in_its_time() {
     use hl_identity::{DeviceCert, EnrollRequest, IdentityKey};
     let server = Server::with_registrar(&[]).await;
     let (seed, _, card) = held(&server, "uma").await;
-    let session = hexline_core::open_holder_session(server.http.clone(), card.clone())
-        .await
-        .unwrap();
+    let session =
+        hexline_core::open_holder_session(server.http.clone(), card.clone(), kept(&server.http))
+            .await
+            .unwrap();
     let device = hl_identity::DeviceKey::generate();
     let mut request = EnrollRequest::new(&device, unix_now());
     request.days = Some(7);
@@ -2701,7 +2715,7 @@ async fn a_request_asked_about_past_its_session_is_answered_no_more() {
         refused_as(
             &session
                 .clone()
-                .certify(seed, false, asked.device)
+                .certify(seed, false, asked.device, Vec::new())
                 .await
                 .unwrap_err()
         ),
@@ -2749,7 +2763,7 @@ async fn a_request_is_answered_once_for_the_device_asked_about() {
         refused_as(
             &session
                 .clone()
-                .certify(seed.clone(), false, vec![7; 32])
+                .certify(seed.clone(), false, vec![7; 32], Vec::new())
                 .await
                 .unwrap_err()
         ),
@@ -2762,10 +2776,10 @@ async fn a_request_is_answered_once_for_the_device_asked_about() {
     let (one, two) = tokio::join!(
         session
             .clone()
-            .certify(seed.clone(), false, asked.device.clone()),
+            .certify(seed.clone(), false, asked.device.clone(), Vec::new()),
         session
             .clone()
-            .certify(seed.clone(), false, asked.device.clone()),
+            .certify(seed.clone(), false, asked.device.clone(), Vec::new()),
     );
     assert!(one.is_ok() != two.is_ok(), "minted once");
     let again = one.err().or(two.err()).unwrap();
@@ -2808,7 +2822,7 @@ async fn a_request_is_answered_once_for_the_device_asked_about() {
         refused_as(
             &session
                 .clone()
-                .certify(seed.clone(), false, asked.device.clone())
+                .certify(seed.clone(), false, asked.device.clone(), Vec::new())
                 .await
                 .unwrap_err()
         ),
@@ -2824,9 +2838,10 @@ async fn a_request_is_answered_once_for_the_device_asked_about() {
 async fn a_session_canceled_before_its_wait_ends_that_wait_at_once() {
     let server = Server::with_registrar(&[]).await;
     let (_, _, card) = held(&server, "wes").await;
-    let session = hexline_core::open_holder_session(server.http.clone(), card.clone())
-        .await
-        .unwrap();
+    let session =
+        hexline_core::open_holder_session(server.http.clone(), card.clone(), kept(&server.http))
+            .await
+            .unwrap();
     assert_eq!(
         session.identity(),
         hl_identity::Fingerprint::of(&hl_identity::Card::parse(&card).unwrap().identity).short(),
@@ -2888,9 +2903,10 @@ async fn scanned(server: &Server, url: &str, pair: bool) {
 async fn a_device_that_scanned_the_holders_qr_code_is_taken_by_its_pairing() {
     let server = Server::with_registrar_and_web(true).await;
     let (seed, _, card) = held(&server, "sam").await;
-    let session = hexline_core::open_holder_session(server.http.clone(), card.clone())
-        .await
-        .unwrap();
+    let session =
+        hexline_core::open_holder_session(server.http.clone(), card.clone(), kept(&server.http))
+            .await
+            .unwrap();
     let qr = session
         .qr()
         .expect("a web client on the server's own origin");
@@ -2908,7 +2924,7 @@ async fn a_device_that_scanned_the_holders_qr_code_is_taken_by_its_pairing() {
     let certified = approved(&session, &seed, true, asked.device).await.unwrap();
     assert!(certified.can_manage, "managing, when the holder says so");
 
-    let forged = hexline_core::open_holder_session(server.http.clone(), card)
+    let forged = hexline_core::open_holder_session(server.http.clone(), card, kept(&server.http))
         .await
         .unwrap();
     scanned(&server, &forged.qr_url().unwrap(), false).await;
@@ -2933,7 +2949,7 @@ async fn a_web_client_on_another_origin_gets_no_qr_code() {
         "a web client advertised, on another origin"
     );
     let (_, _, card) = held(&server, "sid").await;
-    let session = hexline_core::open_holder_session(server.http.clone(), card)
+    let session = hexline_core::open_holder_session(server.http.clone(), card, kept(&server.http))
         .await
         .unwrap();
     assert!(session.qr().is_none(), "a code typed, never one scanned");

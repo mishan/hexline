@@ -289,7 +289,7 @@ class IdentitiesTest {
     @Test
     fun aStartDiscardsASuccessorWhoseRotationWasNeverSentAndNothingElse() {
         val k0 = newIdentity("Bob")
-        val device = holderMint(k0.seed, k0.card, "Pixel")
+        val device = holderMint(k0.seed, k0.card, "Pixel", 0uL)
         identities().save(device.deviceSeed, device.cert, k0.card, null, null)
         identities().keep(KeptRotation(k0.fingerprint, FINGERPRINT, CARD, RotationState.HOLDING))
         assertEquals("held, and not yet kept", listOf(k0.fingerprint to FINGERPRINT), identities().unsentRotations())

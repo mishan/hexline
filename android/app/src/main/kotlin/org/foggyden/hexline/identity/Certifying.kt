@@ -137,11 +137,13 @@ class MintedDevice(
     val own: Boolean = false,
     /** Asked of the registrar, whose answer was not had: counted as revoked, and to be asked again. */
     val revoking: Boolean = false,
+    /** The device epoch it was certified in. */
+    val epoch: Long = 0,
 ) {
     fun with(
         revoked: Boolean = this.revoked,
         revoking: Boolean = this.revoking,
-    ) = MintedDevice(device, fingerprint, name, expires, canManage, revoked, own, revoking)
+    ) = MintedDevice(device, fingerprint, name, expires, canManage, revoked, own, revoking, epoch)
 
     override fun equals(other: Any?) =
         other is MintedDevice &&
@@ -152,7 +154,8 @@ class MintedDevice(
             canManage == other.canManage &&
             revoked == other.revoked &&
             own == other.own &&
-            revoking == other.revoking
+            revoking == other.revoking &&
+            epoch == other.epoch
 
     /**
      * Whether it is still listed at [now]: revoked or being revoked, as that

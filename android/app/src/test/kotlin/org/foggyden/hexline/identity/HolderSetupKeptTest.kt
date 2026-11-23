@@ -49,7 +49,7 @@ class HolderSetupKeptTest {
     /** A holder's device kept as a setup leaves it before its commit. */
     private fun keptUnfinished(): Pair<NewIdentity, StoredIdentity> {
         val made = newIdentity("Carol")
-        val minted = holderMint(made.seed, made.card, "Pixel")
+        val minted = holderMint(made.seed, made.card, "Pixel", 0uL)
         return made to identities().save(minted.deviceSeed, minted.cert, made.card, "carol", "reg.example", unfinished = true)
     }
 
@@ -97,7 +97,7 @@ class HolderSetupKeptTest {
     @Test
     fun aRenewalBegunFromACertificateNoLongerKeptWritesNothing() {
         val (made, kept) = keptUnfinished()
-        val other = holderMint(made.seed, made.card, "Pixel").cert
+        val other = holderMint(made.seed, made.card, "Pixel", 0uL).cert
         assertNull(identities().renewed(kept.fingerprint, kept.cert, replacing = other))
         assertArrayEquals(kept.cert, identities().list().single().cert)
         assertNotNull(identities().renewed(kept.fingerprint, kept.cert, replacing = kept.cert))

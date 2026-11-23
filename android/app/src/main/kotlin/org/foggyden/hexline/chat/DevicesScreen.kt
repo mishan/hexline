@@ -313,6 +313,7 @@ private fun describe(why: CertifyEnd): String =
             CertifyEnd.STALE -> R.string.certify_stale
             CertifyEnd.UNREADABLE -> R.string.certify_unreadable
             CertifyEnd.NO_LOGIN -> R.string.certify_no_login
+            CertifyEnd.SIGNED_OUT -> R.string.certify_signed_out
         },
     )
 
