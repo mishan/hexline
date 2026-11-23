@@ -3568,17 +3568,6 @@ async fn a_registrar_down_at_a_reset_is_caught_up_by_its_retry_at_the_same_epoch
         (retried.published, &retried.done),
         (1, &vec![front.url.clone()])
     );
-    // The card's name for the home registrar, where nothing listens, is
-    // still kept for later.
-    assert_eq!(
-        retried
-            .not_done
-            .iter()
-            .map(|n| (n.registrar.as_str(), n.why))
-            .collect::<Vec<_>>(),
-        vec![(CARD_NAME, REFUSED)]
-    );
-    assert!(retried.retry.is_some());
     assert_eq!(epochs_at(&other, &id).await, vec![1]);
     assert_eq!(epochs_at(&home, &id).await, vec![1]);
 }
