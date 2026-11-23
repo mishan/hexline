@@ -252,7 +252,7 @@ impl Enrollee {
         let enrolled = self
             .ask(&http, code.as_deref(), prev.as_ref(), name)
             .await?;
-        behind_reset(&enrolled.cert, &enrolled.card, &http.base).await?;
+        behind_reset(&enrolled.cert, &enrolled.card, &http.base, FLOOR_WAIT).await?;
         Ok(enrolled)
     }
 
@@ -457,14 +457,22 @@ impl Enrollee {
     }
 }
 
+/// How long an enrollee reads its new certificate's floor for.
+const FLOOR_WAIT: Duration = Duration::from_secs(10);
+
 /// Refused `behind_reset` for a certificate below the floor its card's
-/// registrars publish, each read for up to `FLOOR_WAIT`, and the mailbox
-/// that sent it where it is one of them by host: the holder that answered
-/// had not learned of a reset, and servers that have refuse the
-/// certificate. One not read in time is passed over.
-async fn behind_reset(cert: &[u8], card: &[u8], mailbox: &Url) -> Result<(), CoreError> {
-    const FLOOR_WAIT: Duration = Duration::from_secs(10);
-    let cert = DeviceCert::parse(cert).map_err(|e| protocol(&e.to_string()))?;
+/// registrars publish, each read for up to `wait`, and the mailbox that
+/// sent it where it is one of them by host: the holder that answered had
+/// not learned of a reset, and servers that have refuse the certificate.
+/// One not read in time is passed over. The certificate's time is read
+/// again after, as the wait may have outlasted it.
+async fn behind_reset(
+    cert_bytes: &[u8],
+    card: &[u8],
+    mailbox: &Url,
+    wait: Duration,
+) -> Result<(), CoreError> {
+    let cert = DeviceCert::parse(cert_bytes).map_err(|e| protocol(&e.to_string()))?;
     let card = Card::parse(card).map_err(|e| protocol(&e.to_string()))?;
     let mut registrars = crate::epoch::registrars_of(&[], &card);
     let host = mailbox.host_str().unwrap_or_default();
@@ -474,11 +482,11 @@ async fn behind_reset(cert: &[u8], card: &[u8], mailbox: &Url) -> Result<(), Cor
     {
         registrars.push(at_mailbox);
     }
-    let published = crate::epoch::published_at(&registrars, &card.identity, FLOOR_WAIT).await;
-    match cert.check_floor(published.epoch) {
-        Ok(()) => Ok(()),
-        Err(_) => Err(refused("behind_reset")),
+    let published = crate::epoch::published_at(&registrars, &card.identity, wait).await;
+    if cert.check_floor(published.epoch).is_err() {
+        return Err(refused("behind_reset"));
     }
+    crate::identity::in_time(cert_bytes)
 }
 
 /// Clears an enrollment's in-flight mark however it ends, aborted before
@@ -762,12 +770,46 @@ mod tests {
             // A floor the card names no registrar for is not learned.
             (1, "elsewhere.invalid", None),
         ] {
-            let got = behind_reset(&cert(epoch), &card(attested), &mailbox).await;
+            let got = behind_reset(&cert(epoch), &card(attested), &mailbox, FLOOR_WAIT).await;
             let got = got.err().map(|e| match e {
                 CoreError::Refused { code, .. } => code,
                 e => panic!("{e:?}"),
             });
             assert_eq!(got.as_deref(), refused_as, "epoch {epoch} at {attested}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_certificate_that_lapses_while_its_floor_is_read_is_refused() {
+        use hl_identity::{Attestation, IdentityKey, ServerKey};
+        let id = IdentityKey::generate();
+        // Its one registrar takes the connection and never answers.
+        let mailbox = Url::parse(&crate::epoch::tests::silent().await).unwrap();
+        let key = ServerKey::from_seed(&[5; 32]);
+        let att = Attestation {
+            identity: id.public(),
+            registrar: "127.0.0.1".into(),
+            registrar_key: key.public(),
+            handle: "alice".into(),
+            registered: 1,
+            issued: 1,
+            expires: u64::MAX / 2,
+            level: None,
+        }
+        .sign(&key);
+        let att = hl_identity::cbor::decode_canonical(&att).unwrap();
+        let card = Card::new(&id, "Alice", 10).sign(&id, vec![att]).unwrap();
+        // In its time for a second more, by the skew a server allows.
+        let issued = now() - 1_000;
+        let life = now() + 1 - hxng_client::auth::CLOCK_SKEW - issued;
+        let cert = DeviceCert::for_device(&id, &DeviceKey::generate(), issued, life)
+            .unwrap()
+            .sign(&id);
+        crate::identity::in_time(&cert).unwrap();
+        let got = behind_reset(&cert, &card, &mailbox, Duration::from_secs(3)).await;
+        match got {
+            Err(CoreError::Refused { code, .. }) => assert_eq!(code, "cert_expired"),
+            other => panic!("{other:?}"),
         }
     }
 

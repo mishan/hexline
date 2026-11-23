@@ -3378,6 +3378,20 @@ async fn logs_in(server: &Server, seed: &[u8], cert: &[u8], card: &[u8]) -> Resu
         .map(drop)
 }
 
+/// The name a card from this server's registrar attests it by: reached as
+/// `https://127.0.0.1`, where nothing listens, beside the URL it is kept
+/// at, so a reset is never done there.
+const CARD_NAME: &str = "127.0.0.1";
+
+/// The registrars a reset is not done at.
+fn not_reached(reset: &hexline_core::DevicesReset) -> Vec<&str> {
+    reset
+        .not_done
+        .iter()
+        .map(|n| n.registrar.as_str())
+        .collect()
+}
+
 /// The epoch a certificate was minted at.
 fn epoch_of(cert: &[u8]) -> u64 {
     hl_identity::DeviceCert::parse(cert).unwrap().epoch
@@ -3412,9 +3426,9 @@ async fn a_reset_signs_out_the_devices_certified_before_it_and_not_this_phone() 
         (reset.epoch, reset.published, &reset.done),
         (1, 1, &vec![server.http.clone()])
     );
-    assert!(reset.not_done.is_empty(), "{:?}", reset.not_done);
+    assert_eq!(not_reached(&reset), vec![CARD_NAME]);
     let own = reset.cert;
-    assert_eq!(epoch_of(&own), 1);
+    assert_eq!((epoch_of(&own), reset.cert_epoch), (1, 1));
 
     // Past the records the server holds, which it fetched at that login.
     tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -3464,7 +3478,7 @@ async fn a_reset_whose_reply_is_lost_is_posted_again_and_published_once() {
     .await
     .unwrap();
     assert_eq!((reset.epoch, &reset.done), (1, &vec![front.url.clone()]));
-    assert!(reset.not_done.is_empty(), "{:?}", reset.not_done);
+    assert_eq!(not_reached(&reset), vec![CARD_NAME]);
     assert_eq!(front.posts.load(Ordering::SeqCst), 2);
     let id = hl_identity::IdentityKey::from_seed(&seed.try_into().unwrap());
     assert_eq!(epochs_at(&server, &id).await, vec![1]);
@@ -3495,14 +3509,7 @@ async fn a_registrar_down_at_a_reset_is_caught_up_by_the_next() {
     front.down.store(true, Ordering::SeqCst);
     let first = reset(minted.cert.clone()).await.unwrap();
     assert_eq!((first.epoch, &first.done), (1, &vec![home.http.clone()]));
-    assert_eq!(
-        first
-            .not_done
-            .iter()
-            .map(|n| n.registrar.as_str())
-            .collect::<Vec<_>>(),
-        vec![front.url.as_str()]
-    );
+    assert_eq!(not_reached(&first), vec![front.url.as_str(), CARD_NAME]);
 
     front.down.store(false, Ordering::SeqCst);
     let second = reset(first.cert).await.unwrap();
@@ -3510,7 +3517,7 @@ async fn a_registrar_down_at_a_reset_is_caught_up_by_the_next() {
         (second.epoch, &second.done),
         (2, &vec![home.http.clone(), front.url.clone()])
     );
-    assert_eq!(epoch_of(&second.cert), 2);
+    assert_eq!((epoch_of(&second.cert), second.cert_epoch), (2, 2));
     assert_eq!(epochs_at(&home, &id).await, vec![1, 2]);
     assert_eq!(
         epochs_at(&other, &id).await,

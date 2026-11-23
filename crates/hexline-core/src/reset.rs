@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::epoch::{at_floor, next_floor, published, registrars_of};
+use crate::epoch::{at_floor, floor_of, next_floor, published, registrars_of};
 use crate::holder::{refused, seed32};
 use crate::restore::{b64, certify, discovered, endpoint, now, registrar_base, unb64, Registrar};
 use crate::CoreError;
@@ -100,6 +100,8 @@ pub struct DevicesReset {
     /// passed, for the same key and name and, as this phone's own always
     /// is, to log in, message and manage: to keep in its place.
     pub cert: Vec<u8>,
+    /// The epoch `cert` was minted at.
+    pub cert_epoch: u64,
 }
 
 /// A registrar the reset is not at yet, and why, in this core's words.
@@ -170,12 +172,14 @@ async fn resetting(
         })
         .collect();
     let desks = targets.into_iter().zip(remotes.iter_mut()).collect();
-    let floor = at_floor(&id.public(), epoch.max(info.epoch), |f| f);
-    let report = reset_all(&id, floor, desks, &mut Floors(id.public())).await?;
+    // Kept only once a list is read: a reset no registrar heard of
+    // raises nothing.
+    let floor = floor_of(&id.public()).max(epoch).max(info.epoch);
+    let report = reset_all(&id, floor, desks, &Floors(id.public())).await?;
     let name = info.name.as_deref().unwrap_or("Hexline");
     // The floor is past the target by now, which is past `info.epoch`.
-    let cert = at_floor(&id.public(), report.published, |floor| {
-        certify(&id, &device, name, floor)
+    let (cert, cert_epoch) = at_floor(&id.public(), report.published, |floor| {
+        certify(&id, &device, name, floor).map(|c| (c, floor))
     })?;
     Ok(DevicesReset {
         epoch: report.target,
@@ -183,6 +187,7 @@ async fn resetting(
         done: report.done,
         not_done: report.not_done,
         cert,
+        cert_epoch,
     })
 }
 
@@ -203,7 +208,7 @@ pub(crate) trait Desk {
     async fn discover(&mut self) -> Result<(), String>;
     /// Its per-identity list read past any cache, verified against its
     /// keys, reduced to the current device epoch record.
-    async fn read(&mut self) -> Result<Current, String>;
+    async fn read(&mut self) -> Result<Current, Refusal>;
     /// Post a record: the status and JSON body, or why there was none.
     async fn post(&mut self, record: &[u8]) -> Result<(u16, Value), String>;
     /// Before a post whose reply was lost is tried again.
@@ -229,11 +234,14 @@ impl Desk for Remote {
         Ok(())
     }
 
-    async fn read(&mut self) -> Result<Current, String> {
-        let (http, base, reg) = self.reg.as_ref().ok_or("not discovered")?;
+    async fn read(&mut self) -> Result<Current, Refusal> {
+        let (http, base, reg) = self
+            .reg
+            .as_ref()
+            .ok_or_else(|| Refusal::because("not discovered".into()))?;
         let p = published(http, base, reg, &self.identity)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(unread)?;
         Ok(Current {
             epoch: p.epoch,
             time: p.time,
@@ -283,7 +291,7 @@ enum Answer {
 /// Why a registrar is not done, as the app is told it: no words of the
 /// registrar's own, which the app would show as this core's.
 #[derive(Debug, PartialEq, Eq)]
-struct Refusal {
+pub(crate) struct Refusal {
     why: String,
     code: Option<String>,
     retry_after: Option<u64>,
@@ -296,6 +304,18 @@ impl Refusal {
             code: None,
             retry_after: None,
         }
+    }
+}
+
+/// Why a list could not be read: a wait it asked for kept, held to a day.
+fn unread(e: CoreError) -> Refusal {
+    match e {
+        CoreError::RateLimited { retry_after } => Refusal {
+            why: "it asked to be left a while".into(),
+            code: Some("rate_limited".into()),
+            retry_after: retry_after.map(|s| s.min(RETRY_MOST)),
+        },
+        e => Refusal::because(e.to_string()),
     }
 }
 
@@ -355,13 +375,13 @@ async fn drive<D: Desk>(
     posted: &mut Vec<[u8; 32]>,
     desk: &mut D,
 ) -> Result<Step, CoreError> {
-    if cur.time > now().saturating_add(SKEW) {
-        return Ok(Step::NotDone(Refusal::because(
-            "its last reset is dated ahead of this phone's clock".into(),
-        )));
-    }
     let mut lost = 0;
     for _ in 0..POSTS_MAX {
+        if cur.time > now().saturating_add(SKEW) {
+            return Ok(Step::NotDone(Refusal::because(
+                "its last reset is dated ahead of this phone's clock".into(),
+            )));
+        }
         let epoch = target.min(cur.epoch.saturating_add(STEP_MAX));
         let time = now().max(cur.time);
         let bytes = DeviceEpoch {
@@ -435,23 +455,24 @@ struct Slot<'a, D> {
     refusal: Option<Refusal>,
 }
 
-/// The floor a reset keeps.
+/// The floor a reset keeps, shared with the reads that raise it as they
+/// land.
 pub(crate) trait Kept {
     /// Raise it to at least `epoch`.
-    fn raise(&mut self, epoch: u64);
+    fn raise(&self, epoch: u64);
     /// A target past it and `known`, kept as it in the same step.
-    fn next(&mut self, known: u64) -> Result<u64, CoreError>;
+    fn next(&self, known: u64) -> Result<u64, CoreError>;
 }
 
 /// The process's floor for an identity, which every mint signs under.
 struct Floors(PublicKey);
 
 impl Kept for Floors {
-    fn raise(&mut self, epoch: u64) {
+    fn raise(&self, epoch: u64) {
         at_floor(&self.0, epoch, |_| ());
     }
 
-    fn next(&mut self, known: u64) -> Result<u64, CoreError> {
+    fn next(&self, known: u64) -> Result<u64, CoreError> {
         next_floor(&self.0, known).ok_or_else(|| refused("no_epoch_left"))
     }
 }
@@ -475,7 +496,7 @@ pub(crate) async fn reset_all<D: Desk>(
     id: &IdentityKey,
     floor: u64,
     desks: Vec<(String, &mut D)>,
-    kept: &mut impl Kept,
+    kept: &impl Kept,
 ) -> Result<Report, CoreError> {
     let mut desks = desks;
     let found = join_all(desks.iter_mut().map(|(_, desk)| async move {
@@ -507,12 +528,14 @@ pub(crate) async fn reset_all<D: Desk>(
     // The target last posted, which a re-target in the last round passed.
     let mut posted_at = None;
     let mut published = 0;
+    // The target posted was found stale and not posted past.
+    let mut passed = false;
     for round in 0..ROUNDS {
         let mut read = Vec::new();
         let lists = join_all(slots.iter_mut().map(|s| async move {
             match s.state {
                 State::Out(_) => None,
-                _ => Some(read_in_time(&mut *s.desk).await),
+                _ => Some(read_in_time(&mut *s.desk, kept).await),
             }
         }))
         .await;
@@ -523,7 +546,11 @@ pub(crate) async fn reset_all<D: Desk>(
                     s.cur = c;
                     read.push(i);
                 }
-                Some(Err(e)) => s.state = State::Out(format!("its list could not be read: {e}")),
+                Some(Err(r)) => {
+                    let why = format!("its list could not be read: {}", r.why);
+                    s.state = State::Out(why.clone());
+                    s.refusal = Some(Refusal { why, ..r });
+                }
             }
         }
         if round == 0 && read.is_empty() {
@@ -579,6 +606,7 @@ pub(crate) async fn reset_all<D: Desk>(
         // The last round only reads: past its target, it keeps the floor
         // it read and reserves no target it would not post.
         let last = round + 1 == ROUNDS;
+        passed |= stale && posted_at.is_some();
         if stale {
             if !last {
                 target = kept.next(known)?;
@@ -595,6 +623,7 @@ pub(crate) async fn reset_all<D: Desk>(
             break;
         }
         posted_at = Some(target);
+        passed = false;
         for s in &mut slots {
             if !matches!(s.state, State::Open) {
                 continue;
@@ -628,7 +657,7 @@ pub(crate) async fn reset_all<D: Desk>(
     // reset's record after all.
     let lists = join_all(slots.iter_mut().map(|s| async move {
         match s.trusted && matches!(s.state, State::Out(_)) {
-            true => read_in_time(&mut *s.desk).await.ok(),
+            true => read_in_time(&mut *s.desk, kept).await.ok(),
             false => None,
         }
     }))
@@ -636,7 +665,7 @@ pub(crate) async fn reset_all<D: Desk>(
     for (s, c) in slots.iter_mut().zip(lists) {
         if let Some(c) = c {
             published = published.max(c.epoch);
-            if posted_at == Some(c.epoch) && ours(&c, &posted) {
+            if !passed && posted_at == Some(c.epoch) && ours(&c, &posted) {
                 s.state = State::Done;
             }
         }
@@ -673,11 +702,14 @@ pub(crate) async fn reset_all<D: Desk>(
 /// Why a registrar given [`WAIT`] and no more is left behind.
 const LATE: &str = "it did not answer in time";
 
-/// `desk`'s list, or why not, in [`WAIT`].
-async fn read_in_time<D: Desk>(desk: &mut D) -> Result<Current, String> {
-    tokio::time::timeout(WAIT, desk.read())
+/// `desk`'s list, or why not, in [`WAIT`], its floor kept as it lands so
+/// a mint meanwhile signs at it.
+async fn read_in_time<D: Desk>(desk: &mut D, kept: &impl Kept) -> Result<Current, Refusal> {
+    let read = tokio::time::timeout(WAIT, desk.read())
         .await
-        .unwrap_or_else(|_| Err(LATE.into()))
+        .unwrap_or_else(|_| Err(Refusal::because(LATE.into())))?;
+    kept.raise(read.epoch);
+    Ok(read)
 }
 
 fn protocol(detail: &str) -> CoreError {
@@ -728,6 +760,10 @@ mod tests {
         minted_at: Vec<u64>,
         /// Never answers a read, or a post.
         silent_reads: bool,
+        /// Each read answered after this long.
+        slow_reads: Option<Duration>,
+        /// Each read refused as a 429 asking for this wait.
+        limited_reads: Option<u64>,
         silent_posts: bool,
         /// Posts answered 503 before one lands.
         failing: usize,
@@ -776,14 +812,22 @@ mod tests {
             }
         }
 
-        async fn read(&mut self) -> Result<Current, String> {
+        async fn read(&mut self) -> Result<Current, Refusal> {
             if self.silent_reads {
                 std::future::pending::<()>().await;
+            }
+            if let Some(after) = self.slow_reads {
+                tokio::time::sleep(after).await;
+            }
+            if let Some(retry_after) = self.limited_reads {
+                return Err(unread(CoreError::RateLimited {
+                    retry_after: Some(retry_after),
+                }));
             }
             self.reads += 1;
             if self.unread > 0 || self.fail_read == Some(self.reads) {
                 self.unread = self.unread.saturating_sub(1);
-                return Err("connection reset".into());
+                return Err(Refusal::because("connection reset".into()));
             }
             if self.rollback_at == Some(self.reads) {
                 self.held.pop();
@@ -863,43 +907,46 @@ mod tests {
     /// A kept floor, raised by another reset in the same process just as
     /// this one chooses its target, when `bump` is set.
     struct Mem {
-        floor: u64,
-        bump: Option<u64>,
+        floor: std::cell::Cell<u64>,
+        bump: std::cell::Cell<Option<u64>>,
     }
 
     impl Mem {
         fn at(floor: u64) -> Mem {
-            Mem { floor, bump: None }
+            Mem {
+                floor: floor.into(),
+                bump: None.into(),
+            }
         }
     }
 
     impl Kept for Mem {
-        fn raise(&mut self, epoch: u64) {
-            self.floor = self.floor.max(epoch);
+        fn raise(&self, epoch: u64) {
+            self.floor.set(self.floor.get().max(epoch));
         }
 
-        fn next(&mut self, known: u64) -> Result<u64, CoreError> {
+        fn next(&self, known: u64) -> Result<u64, CoreError> {
             if let Some(b) = self.bump.take() {
-                self.floor = self.floor.max(b);
+                self.raise(b);
             }
-            self.floor = self.floor.max(known) + 1;
-            Ok(self.floor)
+            self.floor.set(self.floor.get().max(known) + 1);
+            Ok(self.floor.get())
         }
     }
 
     async fn reset(floor: u64, sims: &mut [&mut Sim]) -> (Result<Report, CoreError>, u64) {
-        reset_with(&mut Mem::at(floor), sims).await
+        reset_with(&Mem::at(floor), sims).await
     }
 
-    async fn reset_with(kept: &mut Mem, sims: &mut [&mut Sim]) -> (Result<Report, CoreError>, u64) {
-        let floor = kept.floor;
+    async fn reset_with(kept: &Mem, sims: &mut [&mut Sim]) -> (Result<Report, CoreError>, u64) {
+        let floor = kept.floor.get();
         let desks = sims
             .iter_mut()
             .enumerate()
             .map(|(i, s)| (format!("r{i}"), &mut **s))
             .collect();
         let report = reset_all(&alice(), floor, desks, kept).await;
-        (report, kept.floor)
+        (report, kept.floor.get())
     }
 
     fn signed(epoch: u64, time: u64) -> Vec<u8> {
@@ -977,12 +1024,12 @@ mod tests {
 
     #[tokio::test]
     async fn the_target_is_past_a_floor_another_reset_here_kept_meanwhile() {
-        let mut kept = Mem {
-            floor: 0,
-            bump: Some(5),
+        let kept = Mem {
+            bump: Some(5).into(),
+            ..Mem::at(0)
         };
         let mut sim = Sim::default();
-        let (report, floor) = reset_with(&mut kept, &mut [&mut sim]).await;
+        let (report, floor) = reset_with(&kept, &mut [&mut sim]).await;
         assert_eq!(report.unwrap(), all_done(6, 1));
         assert_eq!((sim.epochs(), floor), (vec![6], 6));
     }
@@ -996,7 +1043,7 @@ mod tests {
         };
         sim.held.push((4, 0, [9; 32]));
         let desks = vec![("r0".to_string(), &mut sim)];
-        let report = reset_all(&id, 2, desks, &mut Floors(id.public()))
+        let report = reset_all(&id, 2, desks, &Floors(id.public()))
             .await
             .unwrap();
         assert_eq!(report.target, 5);
@@ -1050,18 +1097,25 @@ mod tests {
     #[tokio::test]
     async fn the_read_only_round_keeps_the_floor_it_reads_and_reserves_no_target() {
         // Another holder resets `b` to each target just ahead of this one,
-        // the last time in the round before the reads alone.
-        let mut a = Sim::default();
+        // the last time in the round before the reads alone; `a` is read
+        // in that round, or only once it is given up on, and is not done at
+        // a target found stale either way.
         let last = ROUNDS as u64 - 1;
-        let mut b = Sim {
-            races: (1..=last).map(|e| signed(e, now() + 5 + e)).collect(),
-            ..Sim::default()
-        };
-        let (report, kept) = reset(0, &mut [&mut a, &mut b]).await;
-        let report = report.unwrap();
-        assert_eq!((report.target, report.published, kept), (last, last, last));
-        assert_eq!(report.done, Vec::<String>::new());
-        assert_eq!(b.epochs(), (1..=last).collect::<Vec<_>>());
+        for fail_read in [None, Some(ROUNDS)] {
+            let mut a = Sim {
+                fail_read,
+                ..Sim::default()
+            };
+            let mut b = Sim {
+                races: (1..=last).map(|e| signed(e, now() + 5 + e)).collect(),
+                ..Sim::default()
+            };
+            let (report, kept) = reset(0, &mut [&mut a, &mut b]).await;
+            let report = report.unwrap();
+            assert_eq!((report.target, report.published, kept), (last, last, last));
+            assert_eq!(report.done, Vec::<String>::new(), "{fail_read:?}");
+            assert_eq!(b.epochs(), (1..=last).collect::<Vec<_>>());
+        }
     }
 
     #[tokio::test]
@@ -1155,6 +1209,83 @@ mod tests {
             )]
         );
         assert_eq!(ahead.posts, 0);
+
+        // As far ahead as the skew allows is signed after.
+        let mut at_skew = Sim::default();
+        at_skew.land(&signed(2, now() + SKEW)).unwrap();
+        let (report, _) = reset(0, &mut [&mut at_skew]).await;
+        assert_eq!(report.unwrap(), all_done(3, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_floor_read_is_kept_as_it_lands_while_others_are_read() {
+        let id = IdentityKey::generate();
+        let mut quick = Sim::default();
+        quick.held.push((7, 0, [9; 32]));
+        let mut slow = Sim {
+            slow_reads: Some(Duration::from_secs(10)),
+            ..Sim::default()
+        };
+        let desks = vec![
+            ("r0".to_string(), &mut quick),
+            ("r1".to_string(), &mut slow),
+        ];
+        let kept = Floors(id.public());
+        let looked = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            at_floor(&id.public(), 0, |f| f)
+        };
+        let (report, mid_read) = tokio::join!(reset_all(&id, 0, desks, &kept), looked);
+        assert_eq!(mid_read, 7);
+        assert_eq!(report.unwrap().target, 8);
+    }
+
+    #[tokio::test]
+    async fn a_list_read_refused_for_now_says_when_to_try_again_held_to_a_day() {
+        let mut limited = Sim {
+            limited_reads: Some(u64::MAX),
+            ..Sim::default()
+        };
+        let mut other = Sim::default();
+        let report = reset(0, &mut [&mut limited, &mut other]).await.0.unwrap();
+        assert_eq!(report.done, vec!["r1".to_string()]);
+        assert_eq!(
+            report.not_done,
+            vec![NotYetReset {
+                retry_after: Some(RETRY_MOST),
+                ..not_done(
+                    "r0",
+                    "its list could not be read: it asked to be left a while",
+                    Some("rate_limited")
+                )
+            }]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_no_registrar_heard_raises_no_floor() {
+        let id = IdentityKey::generate();
+        let device = DeviceKey::generate();
+        let card = Card::new(&id, "Alice", 10).sign(&id, Vec::new()).unwrap();
+        let cert = certify(&id, &device, "Pixel", 0).unwrap();
+        let gone = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let got = reset_devices(
+            id.seed().to_vec(),
+            card.clone(),
+            vec![gone],
+            5,
+            device.seed().to_vec(),
+            cert,
+        )
+        .await;
+        match got {
+            Err(CoreError::Refused { code, .. }) => assert_eq!(code, "no_registrar_reached"),
+            other => panic!("{:?}", other.map(|r| r.epoch)),
+        }
+        assert_eq!(crate::epoch::held_floor(card), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1261,7 +1392,7 @@ mod tests {
     fn a_floor_at_the_last_epoch_has_no_reset_past_it() {
         let id = IdentityKey::generate().public();
         let max = hl_identity::cert::EPOCH_MAX;
-        let mut kept = Floors(id);
+        let kept = Floors(id);
         assert_eq!(kept.next(max - 1).unwrap(), max);
         match kept.next(0) {
             Err(CoreError::Refused { code, .. }) => assert_eq!(code, "no_epoch_left"),

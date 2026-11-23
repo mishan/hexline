@@ -54,11 +54,16 @@ pub(crate) fn next_floor(identity: &PublicKey, known: u64) -> Option<u64> {
 /// the app to keep whatever a request it was read for came to.
 #[uniffi::export]
 pub fn held_floor(card: Vec<u8>) -> u64 {
-    let Ok(card) = hl_identity::Card::parse(&card) else {
-        return 0;
-    };
+    match hl_identity::Card::parse(&card) {
+        Ok(card) => floor_of(&card.identity),
+        Err(_) => 0,
+    }
+}
+
+/// The highest device epoch this process has learned for `identity`.
+pub(crate) fn floor_of(identity: &PublicKey) -> u64 {
     let floors = FLOORS.lock().unwrap_or_else(|e| e.into_inner());
-    floors.get(&card.identity).copied().unwrap_or(0)
+    floors.get(identity).copied().unwrap_or(0)
 }
 
 /// What an identity's registrars publish of its devices.
@@ -137,25 +142,21 @@ pub(crate) async fn published_at(
 
 /// The registrars an identity's floor is read from: `kept`, where this
 /// phone set it up or restored it, and each its card's attestations
-/// name that none of `kept` is, as a host reached over https.
+/// name, as a host reached over https, each origin once.
 pub(crate) fn registrars_of(kept: &[String], card: &hl_identity::Card) -> Vec<String> {
-    let kept_hosts: Vec<String> = kept
-        .iter()
-        .filter_map(|k| registrar_base(k).ok()?.host_str().map(str::to_owned))
-        .collect();
+    let origin = |r: &str| registrar_base(r).ok().map(|b| b.origin());
     let mut out: Vec<String> = Vec::new();
-    for k in kept {
-        if !out.contains(k) {
-            out.push(k.clone());
-        }
-    }
-    for a in card
+    let attested = card
         .attestations
         .iter()
         .filter(|a| a.identity == card.identity)
-    {
-        if !kept_hosts.contains(&a.registrar) && !out.contains(&a.registrar) {
-            out.push(a.registrar.clone());
+        .map(|a| &a.registrar);
+    for r in kept.iter().chain(attested) {
+        let seen = out
+            .iter()
+            .any(|o| o == r || origin(o).is_some_and(|o| Some(o) == origin(r)));
+        if !seen {
+            out.push(r.clone());
         }
     }
     out
@@ -482,7 +483,7 @@ pub(crate) mod tests {
             (vec![], vec!["reg.example", "other.example"]),
             (
                 vec!["https://reg.example:8443"],
-                vec!["https://reg.example:8443", "other.example"],
+                vec!["https://reg.example:8443", "reg.example", "other.example"],
             ),
             (
                 vec!["third.example"],
