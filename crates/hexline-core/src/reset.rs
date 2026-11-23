@@ -9,7 +9,9 @@
 //! list shows or this process has learned, and is done at a registrar
 //! once a read of its list shows that epoch in a record this call
 //! posted. A call cut short is not finished by the next: the next resets
-//! once more, an epoch further.
+//! once more, an epoch further. What it could not finish at a registrar
+//! that may yet take it, it hands back signed, for [`retry_reset`] to post
+//! later without the identity key.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,6 +64,22 @@ const RETRY_MOST: u64 = 24 * 3600;
 /// A record post's reply, read at most.
 const REPLY_MAX: usize = 64 * 1024;
 
+/// Records kept for one registrar at most: as many as a reset would post
+/// it.
+const CHAIN_MAX: usize = POSTS_MAX;
+
+/// How long a retry is left where no registrar said, and the least it is
+/// left where one did.
+const RETRY_EVERY: u64 = 15 * 60;
+const RETRY_LEAST: u64 = 60;
+
+/// A retry's bytes, read at most, the registrars it is kept for, and the
+/// hashes of the reset's own records it remembers: a retry opens a
+/// connection to each registrar at once.
+const RETRY_MAX: usize = 1024 * 1024;
+const CHAINS_MAX: usize = 32;
+const POSTED_MAX: usize = 256;
+
 /// The identities a reset is under way for in this process: a second at
 /// once would take the first's records for another holder's and reset
 /// past them, spending the registrars' daily resets on nothing.
@@ -108,6 +126,25 @@ pub struct DevicesReset {
     pub cert: Vec<u8>,
     /// The epoch `cert` was minted at.
     pub cert_epoch: u64,
+    /// What [`retry_reset`] posts to the registrars in `not_done` that may
+    /// yet take the reset, opaque: None where none may.
+    pub retry: Option<Vec<u8>>,
+    /// Seconds before `retry` is worth posting: None with no `retry`.
+    pub retry_in: Option<u64>,
+}
+
+/// What a [`retry_reset`] came to, as [`DevicesReset`] says it.
+#[derive(Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ResetRetried {
+    /// The epoch reset to, which the retry was for.
+    pub epoch: u64,
+    pub published: u64,
+    pub done: Vec<String>,
+    pub not_done: Vec<NotYetReset>,
+    pub not_registrars: Vec<String>,
+    /// To keep in place of the one posted.
+    pub retry: Option<Vec<u8>>,
+    pub retry_in: Option<u64>,
 }
 
 /// A registrar the reset is not at yet, and why.
@@ -139,10 +176,13 @@ pub enum NotYet {
     Malformed,
     /// More posts than a reset makes did not bring it to the target.
     TooFarBehind,
-    /// Another holder reset past this reset's epoch meanwhile.
+    /// Another holder reset to this reset's epoch or past it meanwhile.
     Overtaken,
     /// Its last reset is dated ahead of this phone's clock.
     DatedAhead,
+    /// Its last reset is dated after the records a retry holds for it,
+    /// which it would refuse: only a new reset reaches it.
+    DatedBefore,
 }
 
 /// Signs out every device the identity whose seed is `identity_seed`
@@ -208,6 +248,14 @@ async fn resetting(
     // raises nothing.
     let floor = floor_of(&id.public()).max(epoch).max(info.epoch);
     let report = reset_all(&id, floor, desks, &Floors(id.public())).await?;
+    let at = now();
+    let retry = lagging(
+        &id,
+        &report,
+        |t| remotes.iter().any(|r| r.target == t && r.kept),
+        at,
+    )?;
+    let retry_in = retry_in(&retry.chains, at);
     let name = info.name.as_deref().unwrap_or("Hexline");
     // The floor is past the target by now, which is past `info.epoch`.
     let (cert, cert_epoch) = at_floor(&id.public(), report.published, |floor| {
@@ -221,6 +269,8 @@ async fn resetting(
         not_registrars: report.not_registrars,
         cert,
         cert_epoch,
+        retry: encode(&retry),
+        retry_in,
     })
 }
 
@@ -468,7 +518,7 @@ async fn drive<D: Desk>(
     target: u64,
     mut cur: Current,
     id: &IdentityKey,
-    posted: &Mutex<Vec<[u8; 32]>>,
+    posted: &Mutex<Vec<(u64, [u8; 32])>>,
     stop: &AtomicBool,
     desk: &mut D,
 ) -> Result<Step, CoreError> {
@@ -482,18 +532,12 @@ async fn drive<D: Desk>(
         }
         let epoch = target.min(cur.epoch.saturating_add(STEP_MAX));
         let time = now().max(cur.time);
-        let bytes = DeviceEpoch {
-            identity: id.public(),
-            epoch,
-            time,
-        }
-        .sign(id)
-        .map_err(|e| protocol(&format!("the device epoch does not sign: {e}")))?;
+        let bytes = sign_epoch(id, epoch, time)?;
         let hash: [u8; 32] = Sha256::digest(&bytes).into();
         {
             let mut mine = posted.lock().unwrap_or_else(|e| e.into_inner());
-            if !mine.contains(&hash) {
-                mine.push(hash);
+            if !mine.contains(&(epoch, hash)) {
+                mine.push((epoch, hash));
             }
         }
         match answer(desk.post(&bytes).await) {
@@ -530,12 +574,23 @@ async fn drive<D: Desk>(
     Ok(Step::NotDone(Refusal::because(NotYet::TooFarBehind)))
 }
 
+fn sign_epoch(id: &IdentityKey, epoch: u64, time: u64) -> Result<Vec<u8>, CoreError> {
+    DeviceEpoch {
+        identity: id.public(),
+        epoch,
+        time,
+    }
+    .sign(id)
+    .map_err(|e| protocol(&format!("the device epoch does not sign: {e}")))
+}
+
 /// Whether this reset posted the record whose hash is `hash`.
-fn mine(posted: &Mutex<Vec<[u8; 32]>>, hash: &[u8; 32]) -> bool {
+fn mine(posted: &Mutex<Vec<(u64, [u8; 32])>>, hash: &[u8; 32]) -> bool {
     posted
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains(hash)
+        .iter()
+        .any(|(_, h)| h == hash)
 }
 
 // --- A reset at every registrar ---------------------------------------------
@@ -592,6 +647,11 @@ pub(crate) struct Report {
     pub(crate) done: Vec<String>,
     pub(crate) not_done: Vec<NotYetReset>,
     pub(crate) not_registrars: Vec<String>,
+    /// The registrars in `not_done` that may yet take the target, each
+    /// with the last of its list read.
+    pub(crate) behind: Vec<(String, Current)>,
+    /// The hashes of the records this reset posted at `target`.
+    pub(crate) posted: Vec<[u8; 32]>,
 }
 
 /// Reset at every one of `desks`, from `floor`. `kept` keeps a floor
@@ -630,8 +690,9 @@ pub(crate) async fn reset_all<D: Desk>(
         });
     }
     let posted = Mutex::new(Vec::new());
-    let ours =
-        |c: &Current, posted: &Mutex<Vec<[u8; 32]>>| c.hash.is_some_and(|h| mine(posted, &h));
+    let ours = |c: &Current, posted: &Mutex<Vec<(u64, [u8; 32])>>| {
+        c.hash.is_some_and(|h| mine(posted, &h))
+    };
     let mut known = floor;
     let mut target = 0;
     // The target last posted, which a re-target in the last round passed.
@@ -774,6 +835,8 @@ pub(crate) async fn reset_all<D: Desk>(
         .any(|c| posted_at.is_some_and(|t| c.epoch > t || (c.epoch == t && !ours(c, &posted))));
     for (s, c) in slots.iter_mut().zip(lists) {
         if let Some(c) = c {
+            // What a retry signs after is the newest record seen there.
+            s.cur = c;
             published = published.max(c.epoch);
             if posted_at == Some(c.epoch) && ours(&c, &posted) {
                 s.state = State::Done;
@@ -784,12 +847,20 @@ pub(crate) async fn reset_all<D: Desk>(
         }
     }
     kept.raise(published);
+    let target = posted_at.unwrap_or(target);
+    let posted = posted.into_inner().unwrap_or_else(|e| e.into_inner());
     let mut report = Report {
-        target: posted_at.unwrap_or(target),
+        target,
         published,
         done: Vec::new(),
         not_done: Vec::new(),
         not_registrars: Vec::new(),
+        behind: Vec::new(),
+        posted: posted
+            .into_iter()
+            .filter_map(|(e, h)| (e == target).then_some(h))
+            .take(POSTED_MAX)
+            .collect(),
     };
     for s in slots {
         let r = match s.state {
@@ -805,6 +876,10 @@ pub(crate) async fn reset_all<D: Desk>(
             State::Lost => Refusal::because(NotYet::Unreachable),
             State::Open | State::Answered => Refusal::because(NotYet::Overtaken),
         };
+        // Past a target another holder passed, there is nothing to finish.
+        if !passed && waits(&r) {
+            report.behind.push((s.target.clone(), s.cur));
+        }
         report.not_done.push(NotYetReset {
             registrar: s.target,
             why: r.why,
@@ -823,6 +898,455 @@ async fn read_in_time<D: Desk>(desk: &mut D, kept: &impl Kept) -> Result<Current
         .unwrap_or(Err(Refusal::because(NotYet::Unreachable)))?;
     kept.raise(read.epoch);
     Ok(read)
+}
+
+// --- A reset finished later -------------------------------------------------
+
+/// Whether a registrar not done may take the reset later: one that could
+/// not be reached or read, did not bear out what it answered, or asked to
+/// be left a while, said for how long or not.
+fn waits(r: &Refusal) -> bool {
+    match r.why {
+        NotYet::Unreachable
+        | NotYet::ConnectionRefused
+        | NotYet::Unconfirmed
+        | NotYet::Malformed => true,
+        NotYet::Refused => r.retry_after.is_some() || r.code.as_deref() == Some("rate_limited"),
+        _ => false,
+    }
+}
+
+/// A device epoch record as signed, kept to be posted later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Signed {
+    epoch: u64,
+    time: u64,
+    bytes: Vec<u8>,
+}
+
+/// A registrar a reset is not done at, and the records that bring it to
+/// the reset's epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Chain {
+    registrar: String,
+    /// As [`Remote::kept`].
+    kept: bool,
+    /// Ascending, each at most a step past the one before, the last at the
+    /// reset's epoch.
+    records: Vec<Signed>,
+    /// When it is next asked, in seconds.
+    due: u64,
+}
+
+/// What a reset keeps for the registrars it was not done at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Retry {
+    /// The reset's epoch, where every chain ends.
+    epoch: u64,
+    /// The hashes of the records the reset posted at `epoch`, which a list
+    /// may show where the reply was lost.
+    posted: Vec<[u8; 32]>,
+    /// No two for one origin.
+    chains: Vec<Chain>,
+}
+
+impl Retry {
+    /// Whether `cur` puts a registrar whose chain is `chain` at or past the
+    /// reset: past it, or at it with this reset's record. At it with
+    /// another's, that holder's devices minted there are not signed out,
+    /// as [`reset_all`] decides too.
+    fn done(&self, chain: &Chain, cur: &Current) -> bool {
+        let ours = |h: &[u8; 32]| {
+            self.posted.contains(h)
+                || chain
+                    .records
+                    .last()
+                    .is_some_and(|r| <[u8; 32]>::from(Sha256::digest(&r.bytes)) == *h)
+        };
+        cur.epoch > self.epoch || (cur.epoch == self.epoch && cur.hash.as_ref().is_some_and(ours))
+    }
+}
+
+/// The records from a registrar whose list showed `cur` up to `target`,
+/// counted down from `target` a step at a time so that the first past
+/// whatever it shows later is a step past it, as many as a reset would
+/// post it, and the record at `target` always, so a registrar already
+/// there that is still to confirm it keeps a chain. Dated as a reset's
+/// own posts are, so it does not refuse them as dated before its last.
+fn chain_to(id: &IdentityKey, target: u64, cur: &Current) -> Result<Vec<Signed>, CoreError> {
+    let time = now().max(cur.time);
+    let mut records = (0..CHAIN_MAX as u64)
+        .map_while(|k| {
+            target
+                .checked_sub(k * STEP_MAX)
+                .filter(|e| k == 0 || *e > cur.epoch)
+        })
+        .map(|epoch| {
+            let bytes = sign_epoch(id, epoch, time)?;
+            Ok(Signed { epoch, time, bytes })
+        })
+        .collect::<Result<Vec<_>, CoreError>>()?;
+    records.reverse();
+    Ok(records)
+}
+
+/// What `report` leaves at `at` for a retry, `kept` saying which
+/// registrars the app keeps, each due once any wait it asked for is up.
+/// Left to a new reset: a registrar whose last record is dated past the
+/// skew, which a chain would be dated as, one further behind than a chain
+/// reaches, and any past [`CHAINS_MAX`].
+fn lagging(
+    id: &IdentityKey,
+    report: &Report,
+    kept: impl Fn(&str) -> bool,
+    at: u64,
+) -> Result<Retry, CoreError> {
+    let reaches = |cur: &Current| {
+        cur.time <= now().saturating_add(SKEW)
+            && report.target.saturating_sub(cur.epoch) <= CHAIN_MAX as u64 * STEP_MAX
+    };
+    let wait = |registrar: &str| {
+        let n = report.not_done.iter().find(|n| n.registrar == registrar);
+        wait_of(n.and_then(|n| n.retry_after))
+    };
+    let chains = report
+        .behind
+        .iter()
+        .filter(|(_, cur)| reaches(cur))
+        .take(CHAINS_MAX)
+        .map(|(registrar, cur)| {
+            Ok(Chain {
+                registrar: registrar.clone(),
+                kept: kept(registrar),
+                records: chain_to(id, report.target, cur)?,
+                due: at.saturating_add(wait(registrar)),
+            })
+        })
+        .collect::<Result<_, CoreError>>()?;
+    Ok(Retry {
+        epoch: report.target,
+        posted: report.posted.clone(),
+        chains,
+    })
+}
+
+/// The bytes the app keeps of `retry`: None with no chain.
+fn encode(retry: &Retry) -> Option<Vec<u8>> {
+    if retry.chains.is_empty() {
+        return None;
+    }
+    let at: Vec<Value> = retry
+        .chains
+        .iter()
+        .map(|c| {
+            let records: Vec<String> = c.records.iter().map(|r| b64(&r.bytes)).collect();
+            json!({ "registrar": c.registrar, "kept": c.kept, "records": records, "due": c.due })
+        })
+        .collect();
+    let posted: Vec<String> = retry.posted.iter().map(|h| b64(h)).collect();
+    Some(
+        json!({ "v": 1, "posted": posted, "at": at })
+            .to_string()
+            .into_bytes(),
+    )
+}
+
+/// What `bytes` hold, every record `identity`'s own: refused `bad_retry`
+/// where they do not read as [`encode`] writes them, and `wrong_identity`
+/// where a record is another's.
+fn decode(bytes: &[u8], identity: &PublicKey) -> Result<Retry, CoreError> {
+    let bad = || refused("bad_retry");
+    if bytes.len() > RETRY_MAX {
+        return Err(bad());
+    }
+    let v: Value = serde_json::from_slice(bytes).map_err(|_| bad())?;
+    if v["v"] != 1 {
+        return Err(bad());
+    }
+    let posted = v["posted"]
+        .as_array()
+        .filter(|p| p.len() <= POSTED_MAX)
+        .ok_or_else(bad)?
+        .iter()
+        .map(|h| h.as_str().and_then(unb64)?.try_into().ok())
+        .collect::<Option<Vec<[u8; 32]>>>()
+        .ok_or_else(bad)?;
+    let at = v["at"]
+        .as_array()
+        .filter(|a| (1..=CHAINS_MAX).contains(&a.len()))
+        .ok_or_else(bad)?;
+    let chains = at
+        .iter()
+        .map(|c| {
+            let raw = c["records"]
+                .as_array()
+                .filter(|r| (1..=CHAIN_MAX).contains(&r.len()))
+                .ok_or_else(bad)?;
+            let mut records: Vec<Signed> = Vec::new();
+            for r in raw {
+                let bytes = r.as_str().and_then(unb64).ok_or_else(bad)?;
+                let e = DeviceEpoch::parse(&bytes).map_err(|_| bad())?;
+                if e.identity != *identity {
+                    return Err(refused("wrong_identity"));
+                }
+                let follows = records
+                    .last()
+                    .is_none_or(|p| e.epoch > p.epoch && e.epoch - p.epoch <= STEP_MAX);
+                if !follows {
+                    return Err(bad());
+                }
+                records.push(Signed {
+                    epoch: e.epoch,
+                    time: e.time,
+                    bytes,
+                });
+            }
+            Ok(Chain {
+                registrar: c["registrar"].as_str().ok_or_else(bad)?.to_owned(),
+                kept: c["kept"].as_bool().ok_or_else(bad)?,
+                records,
+                due: c["due"].as_u64().ok_or_else(bad)?,
+            })
+        })
+        .collect::<Result<Vec<Chain>, CoreError>>()?;
+    let epoch = chains[0].records.last().map_or(0, |r| r.epoch);
+    let origin = |r: &str| {
+        registrar_base(r).map_or_else(|_| r.to_owned(), |b| b.origin().ascii_serialization())
+    };
+    let origins: BTreeSet<String> = chains.iter().map(|c| origin(&c.registrar)).collect();
+    let one_epoch = chains
+        .iter()
+        .all(|c| c.records.last().is_some_and(|r| r.epoch == epoch));
+    if !one_epoch || origins.len() != chains.len() {
+        return Err(bad());
+    }
+    Ok(Retry {
+        epoch,
+        posted,
+        chains,
+    })
+}
+
+/// How long a registrar must be left before it is asked again: what it
+/// asked for, and nothing where it did not say.
+fn wait_of(retry_after: Option<u64>) -> u64 {
+    retry_after.map_or(0, |s| s.max(RETRY_LEAST))
+}
+
+/// Seconds from `at` until the next retry is worth making: when the first
+/// of `chains` is due, a while for one due already.
+fn retry_in(chains: &[Chain], at: u64) -> Option<u64> {
+    chains
+        .iter()
+        .map(|c| match c.due > at {
+            true => c.due - at,
+            false => RETRY_EVERY,
+        })
+        .min()
+}
+
+/// Whether `chain` is to be asked at `at`: its time has come, or the
+/// clock has been set back past any wait it was given.
+fn is_due(chain: &Chain, at: u64) -> bool {
+    chain.due <= at || chain.due > at.saturating_add(RETRY_MOST)
+}
+
+/// Posts what a reset of the identity whose card is `card` kept in
+/// `retry` for the registrars it was not done at, without the identity
+/// key: done at one whose list shows the reset's epoch with a record it
+/// signed, or past it, and posted nothing a list shows already. Only the
+/// registrars due are asked, and reported; the rest are handed back as
+/// they were. A registrar that refuses for good is left out of the
+/// `retry` handed back, and is reached by a new reset alone. Refused
+/// `bad_retry` for bytes a reset did not hand back, `wrong_identity` for
+/// another identity's, and `busy` while a reset of
+/// the identity is under way.
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn retry_reset(retry: Vec<u8>, card: Vec<u8>) -> Result<ResetRetried, CoreError> {
+    crate::connection::RUNTIME
+        .spawn(retrying(retry, card))
+        .await
+        .unwrap_or_else(|_| Err(protocol("the retry stopped")))
+}
+
+async fn retrying(retry: Vec<u8>, card: Vec<u8>) -> Result<ResetRetried, CoreError> {
+    let identity = Card::parse(&card)
+        .map_err(|_| refused("wrong_identity"))?
+        .identity;
+    let mut retry = decode(&retry, &identity)?;
+    let _resetting = Resetting::take(&identity)?;
+    let chains = std::mem::take(&mut retry.chains);
+    let mut remotes: Vec<Remote> = chains
+        .iter()
+        .map(|c| Remote {
+            target: c.registrar.clone(),
+            identity,
+            kept: c.kept,
+            reg: None,
+        })
+        .collect();
+    let desks = chains.into_iter().zip(remotes.iter_mut()).collect();
+    Ok(retry_all(retry, desks, &Floors(identity), now).await)
+}
+
+/// What a retry came to at one registrar.
+enum Caught {
+    Done,
+    NotARegistrar,
+    NotDone(Refusal),
+}
+
+/// Bring every one of `desks` due by `clock` to `retry`'s epoch, side by
+/// side: `retry` with its chains taken out, each beside its desk. A wait
+/// is counted from when the asking is done, which can be long after it
+/// began.
+async fn retry_all<D: Desk>(
+    retry: Retry,
+    desks: Vec<(Chain, &mut D)>,
+    kept: &impl Kept,
+    clock: impl Fn() -> u64,
+) -> ResetRetried {
+    let at = clock();
+    let (desks, waiting): (Vec<_>, Vec<_>) = desks.into_iter().partition(|(c, _)| is_due(c, at));
+    let mut left: Vec<Chain> = waiting.into_iter().map(|(c, _)| c).collect();
+    let caught = join_all(desks.into_iter().map(|(chain, desk)| {
+        let retry = &retry;
+        async move {
+            let got = catch_up(retry, &chain, desk, kept).await;
+            (chain, got)
+        }
+    }))
+    .await;
+    let at = clock();
+    let mut out = ResetRetried {
+        epoch: retry.epoch,
+        published: 0,
+        done: Vec::new(),
+        not_done: Vec::new(),
+        not_registrars: Vec::new(),
+        retry: None,
+        retry_in: None,
+    };
+    for (mut chain, (listed, caught)) in caught {
+        out.published = out.published.max(listed);
+        match caught {
+            Caught::Done => out.done.push(chain.registrar),
+            Caught::NotARegistrar => out.not_registrars.push(chain.registrar),
+            Caught::NotDone(r) => {
+                out.not_done.push(NotYetReset {
+                    registrar: chain.registrar.clone(),
+                    why: r.why,
+                    code: r.code.clone(),
+                    retry_after: r.retry_after,
+                });
+                if waits(&r) {
+                    chain.due = at.saturating_add(wait_of(r.retry_after));
+                    left.push(chain);
+                }
+            }
+        }
+    }
+    out.retry_in = retry_in(&left, at);
+    out.retry = encode(&Retry {
+        chains: left,
+        ..retry
+    });
+    out
+}
+
+/// One registrar brought to `retry`'s epoch by `chain`: the highest epoch
+/// its list showed, and how it came out, done as [`Retry::done`] says.
+async fn catch_up<D: Desk>(
+    retry: &Retry,
+    chain: &Chain,
+    desk: &mut D,
+    kept: &impl Kept,
+) -> (u64, Caught) {
+    let found = tokio::time::timeout(WAIT, desk.discover())
+        .await
+        .unwrap_or_else(|_| Err(Unfound::Not(Refusal::because(NotYet::Unreachable))));
+    match found {
+        Ok(()) => {}
+        Err(Unfound::NotARegistrar) => return (0, Caught::NotARegistrar),
+        Err(Unfound::Not(r)) => return (0, Caught::NotDone(r)),
+    }
+    let cur = match read_in_time(desk, kept).await {
+        Ok(cur) => cur,
+        Err(r) => return (0, Caught::NotDone(r)),
+    };
+    if let Some(caught) = settled(retry, chain, &cur) {
+        return (cur.epoch, caught);
+    }
+    let why = tokio::time::timeout(WAIT, post_past(&chain.records, cur, desk))
+        .await
+        .unwrap_or(Refusal::because(NotYet::Unreachable));
+    // Replies are not signed, and one lost may have landed: its list says.
+    match read_in_time(desk, kept).await {
+        Ok(c) => match settled(retry, chain, &c) {
+            Some(caught) => (c.epoch, caught),
+            None => (c.epoch.max(cur.epoch), Caught::NotDone(why)),
+        },
+        // What the posts came to stands where it is final; otherwise the
+        // one of the two asking to be left longer.
+        Err(r) => match waits(&why) && r.retry_after > why.retry_after {
+            true => (cur.epoch, Caught::NotDone(r)),
+            false => (cur.epoch, Caught::NotDone(why)),
+        },
+    }
+}
+
+/// How a list showing `cur` leaves a registrar, where nothing posted could
+/// change it: done, or at the epoch with another holder's record.
+fn settled(retry: &Retry, chain: &Chain, cur: &Current) -> Option<Caught> {
+    if retry.done(chain, cur) {
+        Some(Caught::Done)
+    } else if cur.epoch >= retry.epoch {
+        Some(Caught::NotDone(Refusal::because(NotYet::Overtaken)))
+    } else {
+        None
+    }
+}
+
+/// Post `desk` the records past `cur`, its list as read, in order, until
+/// one is answered at the last or one is not taken: why it stopped, for
+/// where its list does not show the last.
+async fn post_past<D: Desk>(records: &[Signed], cur: Current, desk: &mut D) -> Refusal {
+    let target = records.last().map_or(0, |r| r.epoch);
+    let mut at = cur.epoch;
+    for r in records {
+        // Below what its list shows, it is not posted at all.
+        if r.epoch <= at {
+            continue;
+        }
+        if r.epoch - at > STEP_MAX {
+            return Refusal::because(NotYet::TooFarBehind);
+        }
+        if r.time < cur.time {
+            return Refusal::because(NotYet::DatedBefore);
+        }
+        let mut lost = 0;
+        loop {
+            match answer(desk.post(&r.bytes).await) {
+                Answer::At { epoch, .. } if epoch >= target => {
+                    return Refusal::because(NotYet::Unconfirmed)
+                }
+                Answer::At { epoch, .. } if epoch >= r.epoch => {
+                    at = epoch;
+                    break;
+                }
+                Answer::At { .. } => return Refusal::because(NotYet::Unconfirmed),
+                Answer::Lost => {
+                    lost += 1;
+                    if lost >= TRIES {
+                        return Refusal::because(NotYet::Unreachable);
+                    }
+                    desk.pause().await;
+                }
+                Answer::Refused(refusal) => return refusal,
+            }
+        }
+    }
+    Refusal::because(NotYet::Unconfirmed)
 }
 
 fn protocol(detail: &str) -> CoreError {
@@ -868,6 +1392,9 @@ mod tests {
         races: Vec<Vec<u8>>,
         /// Drops its latest record at this read, as a restore would.
         rollback_at: Option<usize>,
+        /// Holds this record from this read on, as another holder's
+        /// landing meanwhile would.
+        held_at: Option<(usize, Vec<u8>)>,
         /// The identity whose floor a mint reads as each post arrives,
         /// and what it read.
         minting: Option<PublicKey>,
@@ -876,8 +1403,10 @@ mod tests {
         silent_reads: bool,
         /// Each read answered after this long.
         slow_reads: Option<Duration>,
-        /// Each read refused as a 429 asking for this wait.
+        /// Each read refused as a 429 asking for this wait, after the
+        /// first `limited_after`.
         limited_reads: Option<u64>,
+        limited_after: usize,
         silent_posts: bool,
         /// Posts answered 503 before one lands.
         failing: usize,
@@ -934,7 +1463,10 @@ mod tests {
             if let Some(after) = self.slow_reads {
                 tokio::time::sleep(after).await;
             }
-            if let Some(retry_after) = self.limited_reads {
+            if let Some(retry_after) = self
+                .limited_reads
+                .filter(|_| self.reads >= self.limited_after)
+            {
                 return Err(unread(CoreError::RateLimited {
                     retry_after: Some(retry_after),
                 }));
@@ -946,6 +1478,11 @@ mod tests {
             }
             if self.rollback_at == Some(self.reads) {
                 self.held.pop();
+            }
+            if let Some((_, bytes)) = self.held_at.take_if(|(n, _)| *n == self.reads) {
+                let r = DeviceEpoch::parse(&bytes).unwrap();
+                self.held
+                    .push((r.epoch, r.time, Sha256::digest(&bytes).into()));
             }
             Ok(self
                 .held
@@ -1060,7 +1597,14 @@ mod tests {
             .enumerate()
             .map(|(i, s)| (format!("r{i}"), &mut **s))
             .collect();
-        let report = reset_all(&alice(), floor, desks, kept).await;
+        // What this reset posted is new bytes each run; the tests that need
+        // it call [`reset_all`] themselves.
+        let report = reset_all(&alice(), floor, desks, kept)
+            .await
+            .map(|r| Report {
+                posted: vec![],
+                ..r
+            });
         (report, kept.floor.get())
     }
 
@@ -1081,6 +1625,8 @@ mod tests {
             done: (0..n).map(|i| format!("r{i}")).collect(),
             not_done: vec![],
             not_registrars: vec![],
+            behind: vec![],
+            posted: vec![],
         }
     }
 
@@ -1217,7 +1763,8 @@ mod tests {
         // Another holder resets `b` to each target just ahead of this one,
         // the last time in the round before the reads alone; `a` is read
         // in that round, or only once it is given up on, and is not done at
-        // a target found stale either way.
+        // a target found stale either way, and nothing is kept for `c`,
+        // down throughout, to be brought to it.
         let last = ROUNDS as u64 - 1;
         for fail_read in [None, Some(ROUNDS)] {
             let mut a = Sim {
@@ -1228,10 +1775,15 @@ mod tests {
                 races: (1..=last).map(|e| signed(e, now() + 5 + e)).collect(),
                 ..Sim::default()
             };
-            let (report, kept) = reset(0, &mut [&mut a, &mut b]).await;
+            let mut c = Sim {
+                unreachable: true,
+                ..Sim::default()
+            };
+            let (report, kept) = reset(0, &mut [&mut a, &mut b, &mut c]).await;
             let report = report.unwrap();
             assert_eq!((report.target, report.published, kept), (last, last, last));
             assert_eq!(report.done, Vec::<String>::new(), "{fail_read:?}");
+            assert_eq!(report.behind, vec![], "{fail_read:?}");
             assert_eq!(b.epochs(), (1..=last).collect::<Vec<_>>());
         }
     }
@@ -1279,6 +1831,8 @@ mod tests {
                 done: vec!["r1".into()],
                 not_done: vec![not_done("r0", NotYet::Unconfirmed, None)],
                 not_registrars: vec![],
+                behind: vec![("r0".into(), Current::default())],
+                posted: vec![],
             }
         );
         assert_eq!((honest.epochs(), honest.posts), (vec![1], 1));
@@ -1327,6 +1881,7 @@ mod tests {
             report.not_done,
             vec![not_done("r0", NotYet::DatedAhead, None)]
         );
+        assert_eq!(report.behind, vec![], "left to a new reset");
         assert_eq!(ahead.posts, 0);
 
         // As far ahead as the skew allows is signed after.
@@ -1595,6 +2150,12 @@ mod tests {
                     not_done("r2", NotYet::Refused, Some("not_registered")),
                 ],
                 not_registrars: vec![],
+                // Refused for good, `r2` is left to a new reset.
+                behind: vec![
+                    ("r0".into(), Current::default()),
+                    ("r1".into(), Current::default()),
+                ],
+                posted: vec![],
             }
         );
         assert_eq!((pretender.posts, below.posts), (1, 1));
@@ -1724,6 +2285,7 @@ mod tests {
             report.not_done,
             vec![not_done("r0", NotYet::TooFarBehind, None)]
         );
+        assert_eq!(report.behind, vec![], "left to a new reset");
         assert_eq!(far.posts, POSTS_MAX);
     }
 
@@ -1733,5 +2295,560 @@ mod tests {
             answer(Ok((200, json!({ "seq": 1, "published": true })))),
             Answer::Refused(Refusal::because(NotYet::Unsupported))
         );
+    }
+
+    /// Past every wait a reset or a retry gives.
+    fn later() -> u64 {
+        now() + RETRY_MOST
+    }
+
+    /// What `retry` comes to posted to `sims` once every chain is due.
+    async fn retry(retry: &Retry, sims: &mut [&mut Sim]) -> ResetRetried {
+        retry_at(retry, sims, later()).await
+    }
+
+    async fn retry_at(retry: &Retry, sims: &mut [&mut Sim], at: u64) -> ResetRetried {
+        retry_by(retry, sims, || at).await
+    }
+
+    /// What `retry` comes to posted to `sims` by `clock`, each at the
+    /// `r{i}` its chain names.
+    async fn retry_by(
+        retry: &Retry,
+        sims: &mut [&mut Sim],
+        clock: impl Fn() -> u64,
+    ) -> ResetRetried {
+        let desks = sims
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                let chain = retry
+                    .chains
+                    .iter()
+                    .find(|c| c.registrar == format!("r{i}"))?;
+                Some((chain.clone(), &mut **s))
+            })
+            .collect();
+        let header = Retry {
+            chains: vec![],
+            ..retry.clone()
+        };
+        retry_all(header, desks, &Mem::at(0), clock).await
+    }
+
+    /// What a reset or a retry handed back.
+    fn kept_of(retry: &Option<Vec<u8>>) -> Retry {
+        decode(retry.as_ref().unwrap(), &alice().public()).unwrap()
+    }
+
+    /// A retry to `epoch` for `r0`, whose list read `cur`, with `posted`.
+    fn for_r0(epoch: u64, cur: Current, posted: Vec<[u8; 32]>) -> Retry {
+        Retry {
+            epoch,
+            posted,
+            chains: vec![Chain {
+                registrar: "r0".into(),
+                kept: true,
+                records: chain_to(&alice(), epoch, &cur).unwrap(),
+                due: 0,
+            }],
+        }
+    }
+
+    fn retried(
+        epoch: u64,
+        published: u64,
+        done: &[&str],
+        not_done: Vec<NotYetReset>,
+    ) -> ResetRetried {
+        ResetRetried {
+            epoch,
+            published,
+            done: done.iter().map(|d| d.to_string()).collect(),
+            not_done,
+            not_registrars: vec![],
+            retry: None,
+            retry_in: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registrar_down_at_a_reset_is_caught_up_by_what_it_kept_at_the_same_epoch() {
+        let mut good = Sim::default();
+        let mut down = Sim {
+            unreachable: true,
+            ..Sim::default()
+        };
+        let desks = vec![("r0".to_string(), &mut good), ("r1".to_string(), &mut down)];
+        let report = reset_all(&alice(), 0, desks, &Mem::at(0)).await.unwrap();
+        assert_eq!((report.target, &report.done), (1, &vec!["r0".to_string()]));
+        assert_eq!(report.posted, vec![good.cur().2]);
+        let at = now();
+        let kept = lagging(&alice(), &report, |_| true, at).unwrap();
+        assert_eq!(retry_in(&kept.chains, at), Some(RETRY_EVERY));
+
+        // Still down, it is kept as it was.
+        let got = retry(&kept_of(&encode(&kept)), &mut [&mut good, &mut down]).await;
+        assert_eq!(
+            got.not_done,
+            vec![not_done("r1", NotYet::Unreachable, None)]
+        );
+        assert_eq!(
+            kept_of(&got.retry).chains[0].records,
+            kept.chains[0].records
+        );
+        assert_eq!(got.retry_in, Some(RETRY_EVERY));
+
+        down.unreachable = false;
+        let got = retry(&kept, &mut [&mut good, &mut down]).await;
+        assert_eq!(got, retried(1, 1, &["r1"], vec![]));
+        assert_eq!((good.epochs(), good.posts), (vec![1], 1));
+        assert_eq!(down.epochs(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn a_registrar_far_behind_is_caught_up_a_step_at_a_time_across_retries() {
+        let mut ahead = Sim::default();
+        ahead.held.push((39, 0, [9; 32]));
+        // Its last reset dated ahead of this clock, as the kept records
+        // must be too.
+        let mut behind = Sim::default();
+        behind.land(&signed(3, now() + 100)).unwrap();
+        behind.allowance = Some(1);
+        let report = reset(0, &mut [&mut ahead, &mut behind]).await.0.unwrap();
+        assert_eq!((report.target, behind.epochs()), (40, vec![3, 19]));
+        let kept = lagging(&alice(), &report, |_| true, now()).unwrap();
+
+        behind.allowance = Some(1);
+        let at = later();
+        let got = retry_at(&kept, &mut [&mut ahead, &mut behind], at).await;
+        assert_eq!(behind.epochs(), vec![3, 19, 24]);
+        assert_eq!(got.retry_in, Some(3600), "as long as it asked");
+        assert_eq!(
+            kept_of(&got.retry).chains[0].records,
+            kept.chains[0].records
+        );
+
+        behind.allowance = None;
+        let posts = behind.posts;
+        let got = retry_at(
+            &kept_of(&got.retry),
+            &mut [&mut ahead, &mut behind],
+            at + 3600,
+        )
+        .await;
+        assert_eq!(got, retried(40, 40, &["r1"], vec![]));
+        assert_eq!(behind.epochs(), vec![3, 19, 24, 40]);
+        assert_eq!(behind.posts - posts, 1, "nothing below its list posted");
+        assert_eq!(ahead.epochs(), vec![39, 40]);
+    }
+
+    #[tokio::test]
+    async fn a_registrar_at_the_epoch_with_another_holders_record_is_overtaken_and_past_it_done() {
+        let theirs = signed(1, now() + 5);
+        let mine: [u8; 32] = Sha256::digest(&theirs).into();
+        for (what, record, posted, outcome) in [
+            (
+                "another holder's at it",
+                theirs.clone(),
+                vec![],
+                Err(NotYet::Overtaken),
+            ),
+            (
+                "this reset's own, its reply lost",
+                theirs,
+                vec![mine],
+                Ok(()),
+            ),
+            (
+                "another holder's past it",
+                signed(5, now() + 5),
+                vec![],
+                Ok(()),
+            ),
+        ] {
+            // Its list read once, so the first read decides.
+            let mut sim = Sim {
+                fail_read: Some(2),
+                ..Sim::default()
+            };
+            sim.land(&record).unwrap();
+            let got = retry(&for_r0(1, Current::default(), posted), &mut [&mut sim]).await;
+            let published = sim.cur().0;
+            let want = match outcome {
+                Ok(()) => retried(1, published, &["r0"], vec![]),
+                Err(why) => retried(1, published, &[], vec![not_done("r0", why, None)]),
+            };
+            assert_eq!(got, want, "{what}");
+            assert_eq!(sim.posts, 0, "{what}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registrar_a_retry_cannot_bring_to_the_epoch_is_left_to_a_new_reset() {
+        let later = now() + 50;
+        // Kept from its list at 30: a record at 40 alone.
+        let at_30 = Current {
+            epoch: 30,
+            ..Current::default()
+        };
+        let cases: [(&str, Sim, Current, NotYetReset, usize); 3] = [
+            (
+                "not registered",
+                Sim {
+                    unregistered: true,
+                    ..Sim::default()
+                },
+                Current::default(),
+                not_done("r0", NotYet::Refused, Some("not_registered")),
+                1,
+            ),
+            (
+                "reset since, dated later",
+                {
+                    let mut s = Sim::default();
+                    s.land(&signed(2, later)).unwrap();
+                    s
+                },
+                Current::default(),
+                not_done("r0", NotYet::DatedBefore, None),
+                0,
+            ),
+            (
+                "further behind than it read",
+                Sim::default(),
+                at_30,
+                not_done("r0", NotYet::TooFarBehind, None),
+                0,
+            ),
+        ];
+        for (what, mut sim, cur, why, posts) in cases {
+            let got = retry(&for_r0(40, cur, vec![]), &mut [&mut sim]).await;
+            assert_eq!(got, retried(40, sim.cur().0, &[], vec![why]), "{what}");
+            assert_eq!(sim.posts, posts, "{what}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registrar_asking_for_less_than_a_minute_is_left_a_minute() {
+        let mut sim = Sim {
+            limited_reads: Some(5),
+            ..Sim::default()
+        };
+        let got = retry(&for_r0(1, Current::default(), vec![]), &mut [&mut sim]).await;
+        assert_eq!(got.retry_in, Some(RETRY_LEAST));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retry_while_a_reset_of_its_identity_is_under_way_is_refused() {
+        let id = IdentityKey::generate();
+        let card = Card::new(&id, "Alice", 10).sign(&id, Vec::new()).unwrap();
+        let gone = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let kept = Retry {
+            epoch: 1,
+            posted: vec![],
+            chains: vec![Chain {
+                registrar: gone,
+                kept: true,
+                records: chain_to(&id, 1, &Current::default()).unwrap(),
+                due: 0,
+            }],
+        };
+        let _resetting = Resetting::take(&id.public()).unwrap();
+        match retrying(encode(&kept).unwrap(), card).await {
+            Err(CoreError::Refused { code, .. }) => assert_eq!(code, "busy"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_retry_reads_as_the_identitys_own_records_in_steps_or_not_at_all() {
+        let chain = |registrar: &str, id: &IdentityKey, epochs: &[u64]| Chain {
+            registrar: registrar.into(),
+            kept: false,
+            records: epochs
+                .iter()
+                .map(|&epoch| Signed {
+                    epoch,
+                    time: 7,
+                    bytes: sign_epoch(id, epoch, 7).unwrap(),
+                })
+                .collect(),
+            due: 9,
+        };
+        let blob = |chains: Vec<Chain>| {
+            encode(&Retry {
+                epoch: 0,
+                posted: vec![],
+                chains,
+            })
+            .unwrap()
+        };
+        let good = Retry {
+            epoch: 40,
+            posted: vec![[3; 32]],
+            chains: vec![
+                chain("r0", &alice(), &[8, 24, 40]),
+                chain("r1", &alice(), &[40]),
+            ],
+        };
+        let kept = encode(&good).unwrap();
+        assert_eq!(decode(&kept, &alice().public()).unwrap(), good);
+
+        let mut flipped = chain("r0", &alice(), &[8, 24, 40]);
+        let last = flipped.records[2].bytes.len() - 1;
+        flipped.records[2].bytes[last] ^= 1;
+        let too_many: Vec<u64> = (1..=CHAIN_MAX as u64 + 1).collect();
+        let too_wide: Vec<Chain> = (0..=CHAINS_MAX)
+            .map(|i| chain(&format!("r{i}"), &alice(), &[1]))
+            .collect();
+        let other = IdentityKey::from_seed(&[2; 32]);
+        let one = |c| blob(vec![c]);
+        for (what, bytes, code) in [
+            ("not json", b"<html>".to_vec(), "bad_retry"),
+            (
+                "another version",
+                br#"{"v": 2, "posted": [], "at": []}"#.to_vec(),
+                "bad_retry",
+            ),
+            (
+                "no chain",
+                br#"{"v": 1, "posted": [], "at": []}"#.to_vec(),
+                "bad_retry",
+            ),
+            (
+                "another identity's",
+                one(chain("r0", &other, &[1])),
+                "wrong_identity",
+            ),
+            (
+                "out of order",
+                one(chain("r0", &alice(), &[24, 8])),
+                "bad_retry",
+            ),
+            (
+                "past a step",
+                one(chain("r0", &alice(), &[8, 25])),
+                "bad_retry",
+            ),
+            ("none", one(chain("r0", &alice(), &[])), "bad_retry"),
+            (
+                "too many",
+                one(chain("r0", &alice(), &too_many)),
+                "bad_retry",
+            ),
+            ("a signature broken", one(flipped), "bad_retry"),
+            ("too many registrars", blob(too_wide), "bad_retry"),
+            (
+                "one origin twice",
+                blob(vec![
+                    chain("hl.example", &alice(), &[1]),
+                    chain("https://HL.example:443", &alice(), &[1]),
+                ]),
+                "bad_retry",
+            ),
+            (
+                "two epochs",
+                blob(vec![
+                    chain("r0", &alice(), &[1]),
+                    chain("r1", &alice(), &[2]),
+                ]),
+                "bad_retry",
+            ),
+            (
+                "a hash cut short",
+                String::from_utf8(kept.clone())
+                    .unwrap()
+                    .replace(&b64(&[3; 32]), &b64(&[3; 31]))
+                    .into_bytes(),
+                "bad_retry",
+            ),
+            (
+                "too long",
+                [kept.clone(), vec![b' '; RETRY_MAX]].concat(),
+                "bad_retry",
+            ),
+        ] {
+            match decode(&bytes, &alice().public()) {
+                Err(CoreError::Refused { code: c, .. }) => assert_eq!(c, code, "{what}"),
+                other => panic!("{what}: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_kept_records_are_dated_after_one_its_last_read_showed() {
+        let mut ahead = Sim::default();
+        ahead.held.push((39, 0, [9; 32]));
+        // Refuses the reset for now, and holds another holder's record,
+        // dated later, by the time its list is read again.
+        let mut limited = Sim {
+            allowance: Some(0),
+            held_at: Some((2, signed(3, now() + 100))),
+            ..Sim::default()
+        };
+        let report = reset(0, &mut [&mut ahead, &mut limited]).await.0.unwrap();
+        assert_eq!((report.target, limited.epochs()), (40, vec![3]));
+        let kept = lagging(&alice(), &report, |_| true, now()).unwrap();
+
+        limited.allowance = None;
+        let got = retry(&kept, &mut [&mut ahead, &mut limited]).await;
+        assert_eq!(got, retried(40, 40, &["r1"], vec![]));
+        assert_eq!(limited.epochs(), vec![3, 8, 24, 40]);
+    }
+
+    #[test]
+    fn a_registrar_asking_to_be_left_waits_whether_it_says_how_long_or_not() {
+        let refusal = |code: &str, retry_after| Refusal {
+            code: Some(code.into()),
+            retry_after,
+            ..Refusal::because(NotYet::Refused)
+        };
+        for (r, waiting) in [
+            (refusal("rate_limited", None), true),
+            (refusal("rate_limited", Some(60)), true),
+            (refusal("not_registered", None), false),
+        ] {
+            assert_eq!(waits(&r), waiting, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn a_registrar_a_chain_cannot_bring_to_the_epoch_gets_none_and_one_at_it_keeps_one() {
+        let list = |epoch, time| Current {
+            epoch,
+            time,
+            hash: None,
+        };
+        let reach = CHAIN_MAX as u64 * STEP_MAX;
+        for (what, target, cur, first) in [
+            ("dated past the skew", 40, list(2, now() + 10 * SKEW), None),
+            ("dated within it", 40, list(2, now() + SKEW), Some(8)),
+            (
+                "further behind than a chain reaches",
+                reach + 1,
+                list(0, 0),
+                None,
+            ),
+            ("as far as one reaches", reach, list(0, 0), Some(16)),
+            ("at the epoch, to confirm", 40, list(40, 0), Some(40)),
+        ] {
+            let report = Report {
+                behind: vec![("r0".into(), cur)],
+                ..all_done(target, 0)
+            };
+            let kept = lagging(&alice(), &report, |_| true, 0).unwrap();
+            assert_eq!(
+                kept.chains.first().map(|c| c.records[0].epoch),
+                first,
+                "{what}"
+            );
+            if first.is_some() {
+                let blob = encode(&kept).unwrap();
+                assert_eq!(decode(&blob, &alice().public()).unwrap(), kept, "{what}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registrar_is_asked_again_only_once_its_wait_is_up() {
+        let mut good = Sim::default();
+        let mut limited = Sim {
+            allowance: Some(0),
+            ..Sim::default()
+        };
+        let mut down = Sim {
+            unreachable: true,
+            ..Sim::default()
+        };
+        let report = reset(0, &mut [&mut good, &mut limited, &mut down])
+            .await
+            .0
+            .unwrap();
+        let at = now();
+        let kept = lagging(&alice(), &report, |_| true, at).unwrap();
+        assert_eq!(retry_in(&kept.chains, at), Some(RETRY_EVERY));
+
+        (limited.allowance, down.unreachable) = (None, false);
+        let asked = (limited.posts, limited.reads);
+        let sims = &mut [&mut good, &mut limited, &mut down];
+        // One that asked for no wait is asked at once.
+        let got = retry_at(&kept, sims, at).await;
+        assert_eq!((got.done, got.not_done), (vec!["r2".to_string()], vec![]));
+        assert_eq!(got.retry_in, Some(3600));
+        assert_eq!((limited.posts, limited.reads), asked, "not asked yet");
+
+        // Asked once the clock is set back past any wait.
+        let sims = &mut [&mut good, &mut limited, &mut down];
+        let got = retry_at(&kept_of(&got.retry), sims, at - RETRY_MOST - 1).await;
+        assert_eq!(got, retried(1, 1, &["r1"], vec![]));
+    }
+
+    #[tokio::test]
+    async fn a_wait_is_counted_from_when_the_retry_is_done_asking() {
+        // Asked at `at` and done asking 90 s later: `r0` asks for a
+        // minute, and `r1` is not due.
+        let at = now();
+        let mut limited = Sim {
+            limited_reads: Some(60),
+            ..Sim::default()
+        };
+        let mut untouched = Sim::default();
+        let mut kept = for_r0(1, Current::default(), vec![]);
+        let mut r1 = kept.chains[0].clone();
+        (r1.registrar, r1.due) = ("r1".into(), at + 3600);
+        kept.chains.push(r1);
+        let ticks = std::cell::Cell::new(0);
+        let clock = || {
+            ticks.set(ticks.get() + 1);
+            at + 90 * (ticks.get() - 1)
+        };
+        let got = retry_by(&kept, &mut [&mut limited, &mut untouched], clock).await;
+        let dues: Vec<u64> = kept_of(&got.retry).chains.iter().map(|c| c.due).collect();
+        assert_eq!(dues, vec![at + 3600, at + 90 + 60]);
+        assert_eq!(got.retry_in, Some(60));
+        assert_eq!(untouched.reads, 0);
+    }
+
+    #[tokio::test]
+    async fn a_wait_the_confirming_read_asks_for_is_kept() {
+        // Takes the post, then refuses the read that would confirm it.
+        let mut sim = Sim {
+            limited_reads: Some(3600),
+            limited_after: 1,
+            ..Sim::default()
+        };
+        let got = retry(&for_r0(1, Current::default(), vec![]), &mut [&mut sim]).await;
+        assert_eq!(sim.epochs(), vec![1]);
+        assert_eq!(
+            got.not_done,
+            vec![NotYetReset {
+                retry_after: Some(3600),
+                ..not_done("r0", NotYet::Refused, Some("rate_limited"))
+            }],
+            "not done until a list shows it"
+        );
+        assert_eq!(got.retry_in, Some(3600));
+    }
+
+    #[tokio::test]
+    async fn a_registrar_a_chain_can_never_reach_is_dropped_whatever_the_confirming_read_asks() {
+        // Reset since by another holder, dated after the kept records, then
+        // refusing the read after it.
+        let mut sim = Sim {
+            limited_reads: Some(3600),
+            limited_after: 1,
+            ..Sim::default()
+        };
+        sim.land(&signed(2, now() + 50)).unwrap();
+        let got = retry(&for_r0(40, Current::default(), vec![]), &mut [&mut sim]).await;
+        assert_eq!(
+            got,
+            retried(40, 2, &[], vec![not_done("r0", NotYet::DatedBefore, None)])
+        );
+        assert_eq!(sim.posts, 0);
     }
 }

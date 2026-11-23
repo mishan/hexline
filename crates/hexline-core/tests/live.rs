@@ -3536,6 +3536,43 @@ async fn a_registrar_down_at_a_reset_is_caught_up_by_the_next() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_registrar_down_at_a_reset_is_caught_up_by_its_retry_at_the_same_epoch() {
+    use std::sync::atomic::Ordering;
+    let (home, other) = (
+        Server::with_registrar(&[]).await,
+        Server::with_registrar(&[]).await,
+    );
+    let (seed, minted, card) = held(&home, "yan").await;
+    let id = hl_identity::IdentityKey::from_seed(&seed.clone().try_into().unwrap());
+    registered(&other, &id, "yan", None).await.unwrap();
+    let front = Front::to(&other).await;
+    front.down.store(true, Ordering::SeqCst);
+    let reset = hexline_core::reset_devices(
+        seed,
+        card.clone(),
+        vec![home.http.clone(), front.url.clone()],
+        0,
+        minted.device_seed,
+        minted.cert,
+    )
+    .await
+    .unwrap();
+    assert_eq!((reset.epoch, &reset.done), (1, &vec![home.http.clone()]));
+    assert!(reset.retry_in.is_some());
+
+    front.down.store(false, Ordering::SeqCst);
+    let retried = hexline_core::retry_reset(reset.retry.unwrap(), card)
+        .await
+        .unwrap();
+    assert_eq!(
+        (retried.published, &retried.done),
+        (1, &vec![front.url.clone()])
+    );
+    assert_eq!(epochs_at(&other, &id).await, vec![1]);
+    assert_eq!(epochs_at(&home, &id).await, vec![1]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_reset_elsewhere_while_a_code_is_shown_is_the_epoch_it_certifies_at() {
     use hexline_core::Enrollee;
     use hxng_client::testing::Holder;
