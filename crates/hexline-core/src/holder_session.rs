@@ -441,7 +441,7 @@ impl HolderSession {
         kept: HolderKept,
     ) -> Result<Arc<HolderSession>, CoreError> {
         let parsed = hl_identity::Card::parse(&card).map_err(|_| refused("bad_card"))?;
-        let registrars = registrars_of(kept.registrar.as_deref(), &parsed);
+        let registrars = registrars_of(kept.registrar.as_slice(), &parsed);
         let listed = pairs(&kept.devices);
         let base = mailbox_base(mailbox)?;
         let http = auth::http_client(base.as_str(), None)?;

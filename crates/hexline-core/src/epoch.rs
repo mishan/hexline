@@ -35,16 +35,35 @@ pub(crate) fn at_floor<T>(identity: &PublicKey, known: u64, mint: impl FnOnce(u6
     mint(*floor)
 }
 
+/// One past the higher of `identity`'s floor and `known`, made its floor
+/// in the same hold of the lock: a reset's target, which no mint begun
+/// after it signs below. None where no epoch is left past it.
+pub(crate) fn next_floor(identity: &PublicKey, known: u64) -> Option<u64> {
+    let mut floors = FLOORS.lock().unwrap_or_else(|e| e.into_inner());
+    let floor = floors.entry(*identity).or_default();
+    let next = (*floor)
+        .max(known)
+        .checked_add(1)
+        .filter(|n| *n <= hl_identity::cert::EPOCH_MAX)?;
+    *floor = next;
+    Some(next)
+}
+
 /// The highest device epoch this process has learned for the identity
 /// whose card is `card`, 0 for none or for a card that does not read: for
 /// the app to keep whatever a request it was read for came to.
 #[uniffi::export]
 pub fn held_floor(card: Vec<u8>) -> u64 {
-    let Ok(card) = hl_identity::Card::parse(&card) else {
-        return 0;
-    };
+    match hl_identity::Card::parse(&card) {
+        Ok(card) => floor_of(&card.identity),
+        Err(_) => 0,
+    }
+}
+
+/// The highest device epoch this process has learned for `identity`.
+pub(crate) fn floor_of(identity: &PublicKey) -> u64 {
     let floors = FLOORS.lock().unwrap_or_else(|e| e.into_inner());
-    floors.get(&card.identity).copied().unwrap_or(0)
+    floors.get(identity).copied().unwrap_or(0)
 }
 
 /// What an identity's registrars publish of its devices.
@@ -52,12 +71,17 @@ pub fn held_floor(card: Vec<u8>) -> u64 {
 pub(crate) struct Published {
     /// The highest device epoch any of them publishes, 0 for none.
     pub(crate) epoch: u64,
+    /// The `time` of the record publishing it, and its hash.
+    pub(crate) time: u64,
+    pub(crate) hash: Option<[u8; 32]>,
     pub(crate) revocations: Vec<DeviceRevocation>,
 }
 
 impl Published {
     fn merge(&mut self, other: Published) {
-        self.epoch = self.epoch.max(other.epoch);
+        if other.epoch > self.epoch {
+            (self.epoch, self.time, self.hash) = (other.epoch, other.time, other.hash);
+        }
         self.revocations.extend(other.revocations);
     }
 }
@@ -118,27 +142,29 @@ pub(crate) async fn published_at(
 
 /// The registrars an identity's floor is read from: `kept`, where this
 /// phone set it up or restored it, and each its card's attestations
-/// name that `kept` is not, as a host reached over https.
-pub(crate) fn registrars_of(kept: Option<&str>, card: &hl_identity::Card) -> Vec<String> {
-    let kept_host = kept
-        .and_then(|k| registrar_base(k).ok())
-        .and_then(|b| b.host_str().map(str::to_owned));
-    let mut out: Vec<String> = kept.map(str::to_owned).into_iter().collect();
-    for a in card
+/// name, as a host reached over https, each origin once.
+pub(crate) fn registrars_of(kept: &[String], card: &hl_identity::Card) -> Vec<String> {
+    let origin = |r: &str| registrar_base(r).ok().map(|b| b.origin());
+    let mut out: Vec<String> = Vec::new();
+    let attested = card
         .attestations
         .iter()
         .filter(|a| a.identity == card.identity)
-    {
-        if kept_host.as_deref() != Some(a.registrar.as_str()) && !out.contains(&a.registrar) {
-            out.push(a.registrar.clone());
+        .map(|a| &a.registrar);
+    for r in kept.iter().chain(attested) {
+        let seen = out
+            .iter()
+            .any(|o| o == r || origin(o).is_some_and(|o| Some(o) == origin(r)));
+        if !seen {
+            out.push(r.clone());
         }
     }
     out
 }
 
 /// What `reg`'s per-identity records list says of `identity`, page after
-/// page, each entry verified: its highest device epoch and the device
-/// revocations.
+/// page, each entry verified and read past any cache: its highest device
+/// epoch and the device revocations.
 pub(crate) async fn published(
     http: &hxng_client::reqwest::Client,
     base: &Url,
@@ -160,7 +186,7 @@ pub(crate) async fn published(
             None => format!("{records}/{fingerprint}"),
             Some(s) => format!("{records}/{fingerprint}?since={s}"),
         };
-        let (status, body) = auth::get(http, &url).await?;
+        let (status, body) = auth::get_uncached(http, &url).await?;
         if status == 429 || status == 503 {
             return Err(CoreError::RateLimited {
                 retry_after: crate::restore::retry_after(&body),
@@ -175,8 +201,10 @@ pub(crate) async fn published(
             })?;
         for (_, bytes) in &list.entries {
             match Record::parse(bytes, Some(keys)) {
-                Ok(Record::DeviceEpoch(r)) if r.identity == *identity => {
-                    out.epoch = out.epoch.max(r.epoch)
+                Ok(Record::DeviceEpoch(r)) if r.identity == *identity && r.epoch >= out.epoch => {
+                    use sha2::Digest;
+                    (out.epoch, out.time) = (r.epoch, r.time);
+                    out.hash = Some(sha2::Sha256::digest(bytes).into());
                 }
                 Ok(Record::RevokeDevice(r)) if r.identity == *identity => out.revocations.push(r),
                 _ => {}
@@ -359,8 +387,8 @@ pub(crate) mod tests {
         };
         let by_identity = DeviceRevocation::parse(&revocation(&id, d)).unwrap();
         let published = |revocations| Published {
-            epoch: 0,
             revocations,
+            ..Published::default()
         };
         let (old, now) = (cert_at(&device, 1), cert_at(&device, 2));
         let none = Published::default();
@@ -452,17 +480,26 @@ pub(crate) mod tests {
             .unwrap();
         let card = hl_identity::Card::parse(&card).unwrap();
         for (kept, want) in [
-            (None, vec!["reg.example", "other.example"]),
+            (vec![], vec!["reg.example", "other.example"]),
             (
-                Some("https://reg.example:8443"),
-                vec!["https://reg.example:8443", "other.example"],
+                vec!["https://reg.example:8443"],
+                vec!["https://reg.example:8443", "reg.example", "other.example"],
             ),
             (
-                Some("third.example"),
+                vec!["third.example"],
                 vec!["third.example", "reg.example", "other.example"],
             ),
+            (
+                vec![
+                    "http://127.0.0.1:1",
+                    "https://other.example",
+                    "http://127.0.0.1:1",
+                ],
+                vec!["http://127.0.0.1:1", "https://other.example", "reg.example"],
+            ),
         ] {
-            assert_eq!(registrars_of(kept, &card), want, "{kept:?}");
+            let kept: Vec<String> = kept.into_iter().map(String::from).collect();
+            assert_eq!(registrars_of(&kept, &card), want, "{kept:?}");
         }
     }
 }

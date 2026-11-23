@@ -69,7 +69,7 @@ fun enrollProblem(e: CoreException): EnrollProblem =
                 "cert_unusable" -> EnrollProblem.Unusable
                 "cert_vouches" -> EnrollProblem.Vouches
                 "cert_expired", "cert_not_yet_valid" -> EnrollProblem.Clock
-                "short_renewal" -> EnrollProblem.RefusedHere
+                "short_renewal", "behind_reset" -> EnrollProblem.RefusedHere
                 "rate_limited" -> EnrollProblem.RateLimited
                 else -> EnrollProblem.Other
             }
