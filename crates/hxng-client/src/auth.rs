@@ -193,6 +193,18 @@ pub async fn get(http: &reqwest::Client, url: &str) -> Result<(u16, Vec<u8>), Er
     Ok((status, bounded(resp).await?))
 }
 
+/// As [`get`], past any cache between here and the server.
+pub async fn get_uncached(http: &reqwest::Client, url: &str) -> Result<(u16, Vec<u8>), Error> {
+    let resp = http
+        .get(url)
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .send()
+        .await
+        .map_err(|e| Error::Connect(e.to_string()))?;
+    let status = resp.status().as_u16();
+    Ok((status, bounded(resp).await?))
+}
+
 /// GET `url` as a long poll: its status and its body, waiting up to `wait`
 /// for them where an ordinary call gives up sooner.
 pub async fn get_waiting(

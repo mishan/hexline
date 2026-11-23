@@ -4,7 +4,7 @@
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -693,8 +693,11 @@ pub async fn back_up(
 pub struct Holder {
     http: reqwest::Client,
     mailbox: String,
+    records: String,
     pub id: hl_identity::IdentityKey,
     pub card: Vec<u8>,
+    /// The device epoch it certifies in: the last it reset to.
+    epoch: AtomicU64,
 }
 
 /// One session the holder opened, with the code it shows.
@@ -713,12 +716,45 @@ impl Holder {
     /// A holder of a new identity called `name`.
     pub fn new(server: &Server, name: &str) -> Holder {
         let (id, d) = device(name);
+        Holder::of(server, id, d.card)
+    }
+
+    /// A holder of `id`, whose card is `card`, as another machine holding
+    /// the same key would be: certifying at epoch 0 until it resets.
+    pub fn of(server: &Server, id: hl_identity::IdentityKey, card: Vec<u8>) -> Holder {
         Holder {
             http: crate::auth::http_client(&server.http, None).unwrap(),
             mailbox: format!("{}/identity/enroll", server.http),
+            records: format!("{}/registrar/records", server.http),
             id,
-            card: d.card,
+            card,
+            epoch: AtomicU64::new(0),
         }
+    }
+
+    /// Posts a device epoch of `epoch` to the server's registrar, as `hlid
+    /// devices reset` does one step of it, and certifies at it from then
+    /// on: the registrar's answer.
+    pub async fn reset(&self, epoch: u64) -> serde_json::Value {
+        let record = hl_identity::DeviceEpoch {
+            identity: self.id.public(),
+            epoch,
+            time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        }
+        .sign(&self.id)
+        .unwrap();
+        let answer = crate::auth::post(
+            &self.http,
+            &self.records,
+            Some(serde_json::json!({ "record": b64(&record) })),
+        )
+        .await
+        .unwrap();
+        self.epoch.fetch_max(epoch, Ordering::SeqCst);
+        answer
     }
 
     /// A session, and its code.
@@ -801,6 +837,7 @@ impl Holder {
             DeviceCert::for_keys(&self.id, device, device_enc, now, days * 86_400).unwrap();
         cert.caps = Some(asked.request.caps.unwrap_or(u64::MAX) & (caps::LOGIN | caps::MESSAGE));
         cert.name = asked.request.name.clone();
+        cert.epoch = self.epoch.load(Ordering::SeqCst);
         let bundle = Bundle {
             cert: cert.sign(&self.id),
             card: self.card.clone(),

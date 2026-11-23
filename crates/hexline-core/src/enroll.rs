@@ -249,7 +249,11 @@ impl Enrollee {
             http: auth::http_client(base.as_str(), None)?,
             base,
         };
-        self.ask(&http, code.as_deref(), prev.as_ref(), name).await
+        let enrolled = self
+            .ask(&http, code.as_deref(), prev.as_ref(), name)
+            .await?;
+        behind_reset(&enrolled.cert, &enrolled.card, &http.base).await?;
+        Ok(enrolled)
     }
 
     /// The request posted to `mailbox` and its answer waited for: every
@@ -450,6 +454,30 @@ impl Enrollee {
             short: fingerprint.short(),
             name: card.name,
         })
+    }
+}
+
+/// Refused `behind_reset` for a certificate below the floor its card's
+/// registrars publish, each read for up to `FLOOR_WAIT`, and the mailbox
+/// that sent it where it is one of them by host: the holder that answered
+/// had not learned of a reset, and servers that have refuse the
+/// certificate. One not read in time is passed over.
+async fn behind_reset(cert: &[u8], card: &[u8], mailbox: &Url) -> Result<(), CoreError> {
+    const FLOOR_WAIT: Duration = Duration::from_secs(10);
+    let cert = DeviceCert::parse(cert).map_err(|e| protocol(&e.to_string()))?;
+    let card = Card::parse(card).map_err(|e| protocol(&e.to_string()))?;
+    let mut registrars = crate::epoch::registrars_of(&[], &card);
+    let host = mailbox.host_str().unwrap_or_default();
+    let at_mailbox = mailbox.origin().ascii_serialization();
+    if registrars.iter().any(|r| r == host)
+        && crate::restore::registrar_base(host).ok().as_ref() != Some(mailbox)
+    {
+        registrars.push(at_mailbox);
+    }
+    let published = crate::epoch::published_at(&registrars, &card.identity, FLOOR_WAIT).await;
+    match cert.check_floor(published.epoch) {
+        Ok(()) => Ok(()),
+        Err(_) => Err(refused("behind_reset")),
     }
 }
 
@@ -698,6 +726,50 @@ fn protocol(detail: &str) -> CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_certificate_below_the_floor_its_cards_registrar_publishes_is_refused() {
+        use crate::epoch::tests::{registrar_publishing, reset};
+        use hl_identity::{Attestation, IdentityKey, ServerKey};
+        let id = IdentityKey::generate();
+        let mailbox = registrar_publishing(vec![reset(&id, 2)], 8).await;
+        let key = ServerKey::from_seed(&[5; 32]);
+        let card = |registrar: &str| {
+            let att = Attestation {
+                identity: id.public(),
+                registrar: registrar.into(),
+                registrar_key: key.public(),
+                handle: "alice".into(),
+                registered: 1,
+                issued: 1,
+                expires: u64::MAX / 2,
+                level: None,
+            }
+            .sign(&key);
+            let att = hl_identity::cbor::decode_canonical(&att).unwrap();
+            Card::new(&id, "Alice", 10).sign(&id, vec![att]).unwrap()
+        };
+        let cert = |epoch| {
+            let device = DeviceKey::generate();
+            let mut c = DeviceCert::for_device(&id, &device, now(), 86_400).unwrap();
+            c.epoch = epoch;
+            c.sign(&id)
+        };
+        for (epoch, attested, refused_as) in [
+            (1, "127.0.0.1", Some("behind_reset")),
+            (2, "127.0.0.1", None),
+            (3, "127.0.0.1", None),
+            // A floor the card names no registrar for is not learned.
+            (1, "elsewhere.invalid", None),
+        ] {
+            let got = behind_reset(&cert(epoch), &card(attested), &mailbox).await;
+            let got = got.err().map(|e| match e {
+                CoreError::Refused { code, .. } => code,
+                e => panic!("{e:?}"),
+            });
+            assert_eq!(got.as_deref(), refused_as, "epoch {epoch} at {attested}");
+        }
+    }
 
     #[test]
     fn a_code_is_read_as_the_mailbox_reads_it_and_shown_as_the_holder_shows_it() {

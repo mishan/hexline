@@ -3224,3 +3224,361 @@ async fn an_identity_rotated_first_to_another_key_is_rotated_away() {
         }
     );
 }
+
+/// A registrar's HTTP front: each request passed on whole, closing its
+/// connection after; while `down`, every connection closed unanswered;
+/// and the replies to the next `lose` posts dropped once the registrar
+/// has them.
+struct Front {
+    url: String,
+    down: Arc<std::sync::atomic::AtomicBool>,
+    lose: Arc<std::sync::atomic::AtomicUsize>,
+    posts: Arc<std::sync::atomic::AtomicUsize>,
+    accept: tokio::task::JoinHandle<()>,
+}
+
+impl Front {
+    async fn to(server: &Server) -> Front {
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (down, lose, posts) = (Arc::default(), Arc::default(), Arc::default());
+        let target = server.addr;
+        let accept = tokio::spawn({
+            let (down, lose, posts): (
+                Arc<std::sync::atomic::AtomicBool>,
+                Arc<std::sync::atomic::AtomicUsize>,
+                Arc<std::sync::atomic::AtomicUsize>,
+            ) = (Arc::clone(&down), Arc::clone(&lose), Arc::clone(&posts));
+            async move {
+                while let Ok((mut client, _)) = listener.accept().await {
+                    if down.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    let (lose, posts) = (lose.clone(), posts.clone());
+                    tokio::spawn(async move {
+                        let Some(request) = message(&mut client).await else {
+                            return;
+                        };
+                        let post = request.starts_with(b"POST ");
+                        let at = request.windows(2).position(|w| w == b"\r\n").unwrap();
+                        let request =
+                            [&request[..at], b"\r\nconnection: close", &request[at..]].concat();
+                        let mut server = tokio::net::TcpStream::connect(target).await.unwrap();
+                        server.write_all(&request).await.unwrap();
+                        let Some(reply) = message(&mut server).await else {
+                            return;
+                        };
+                        if post {
+                            posts.fetch_add(1, Ordering::SeqCst);
+                            let lost = lose
+                                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                                    n.checked_sub(1)
+                                })
+                                .is_ok();
+                            if lost {
+                                return;
+                            }
+                        }
+                        let _ = client.write_all(&reply).await;
+                    });
+                }
+            }
+        });
+        Front {
+            url,
+            down,
+            lose,
+            posts,
+            accept,
+        }
+    }
+}
+
+impl Drop for Front {
+    fn drop(&mut self) {
+        self.accept.abort();
+    }
+}
+
+/// One HTTP message read whole from `s`: its head, and as much body as
+/// its `content-length` says.
+async fn message(s: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut got = Vec::new();
+    let mut buf = [0; 8192];
+    loop {
+        if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&got[..end]).to_lowercase();
+            let len = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .map_or(0, |n| n.trim().parse::<usize>().unwrap());
+            if got.len() >= end + 4 + len {
+                return Some(got);
+            }
+        }
+        let n = s.read(&mut buf).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        got.extend_from_slice(&buf[..n]);
+    }
+}
+
+/// The device epochs `server`'s registrar lists for `identity`, oldest
+/// first, its list verified against the key its discovery names.
+async fn epochs_at(server: &Server, identity: &hl_identity::IdentityKey) -> Vec<u64> {
+    use base64::Engine;
+    use hl_identity::{Fingerprint, ListKind, Record, RegistrarKeys, SignedList};
+    let http = hxng_client::auth::http_client(&server.http, None).unwrap();
+    let (_, doc) = hxng_client::auth::get(&http, &format!("{}/.well-known/hotline", server.http))
+        .await
+        .unwrap();
+    let doc: Value = serde_json::from_slice(&doc).unwrap();
+    let key: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(doc["registrar"]["key"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let keys = RegistrarKeys {
+        host: "127.0.0.1",
+        keys: &[key],
+    };
+    let url = format!(
+        "{}/registrar/records/{}",
+        server.http,
+        Fingerprint::of(&identity.public())
+    );
+    let (status, body) = hxng_client::auth::get(&http, &url).await.unwrap();
+    assert_eq!(status, 200);
+    let list = SignedList::parse(&body, ListKind::Records, keys).unwrap();
+    assert!(!list.more);
+    list.entries
+        .iter()
+        .filter_map(|(_, bytes)| match Record::parse(bytes, Some(keys)) {
+            Ok(Record::DeviceEpoch(r)) => Some(r.epoch),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether `seed`'s device, certified by `cert`, logs in at `server`.
+async fn logs_in(server: &Server, seed: &[u8], cert: &[u8], card: &[u8]) -> Result<(), CoreError> {
+    let conn = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
+    let device = DeviceIdentity {
+        device_seed: seed.to_vec(),
+        cert: cert.to_vec(),
+        card: card.to_vec(),
+        rotation: None,
+    };
+    conn.login_identity(device, true, None, None)
+        .await
+        .map(drop)
+}
+
+/// The epoch a certificate was minted at.
+fn epoch_of(cert: &[u8]) -> u64 {
+    hl_identity::DeviceCert::parse(cert).unwrap().epoch
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_signs_out_the_devices_certified_before_it_and_not_this_phone() {
+    use hexline_core::{reset_devices, Enrollee};
+    let server = Server::with_registrar_fresh_records().await;
+    let (seed, minted, card) = held(&server, "tess").await;
+    let phone = Enrollee::new();
+    let (session, asked, asking) = asked_by(&server, &card, &phone).await;
+    approved(&session, &seed, false, asked.device)
+        .await
+        .unwrap();
+    let before = asking.await.unwrap().unwrap();
+    logs_in(&server, &phone.seed(), &before.cert, &card)
+        .await
+        .unwrap();
+
+    let reset = reset_devices(
+        seed.clone(),
+        card.clone(),
+        vec![server.http.clone()],
+        0,
+        minted.device_seed.clone(),
+        minted.cert.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (reset.epoch, reset.published, &reset.done),
+        (1, 1, &vec![server.http.clone()])
+    );
+    assert!(reset.not_done.is_empty(), "{:?}", reset.not_done);
+    let own = reset.cert;
+    assert_eq!(epoch_of(&own), 1);
+
+    // Past the records the server holds, which it fetched at that login.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    for (what, seed, cert) in [
+        ("the device certified before", phone.seed(), &before.cert),
+        (
+            "this phone's old certificate",
+            minted.device_seed.clone(),
+            &minted.cert,
+        ),
+    ] {
+        let e = logs_in(&server, &seed, cert, &card).await.unwrap_err();
+        assert_eq!(refused_as(&e), "revoked", "{what}");
+    }
+    logs_in(&server, &minted.device_seed, &own, &card)
+        .await
+        .unwrap();
+
+    // Enrolled again with a new key, at the new epoch.
+    let again = Enrollee::new();
+    let (session, asked, asking) = asked_by(&server, &card, &again).await;
+    let certified = approved(&session, &seed, false, asked.device)
+        .await
+        .unwrap();
+    assert_eq!(certified.epoch, 1);
+    let after = asking.await.unwrap().unwrap();
+    logs_in(&server, &again.seed(), &after.cert, &card)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_whose_reply_is_lost_is_posted_again_and_published_once() {
+    use std::sync::atomic::Ordering;
+    let server = Server::with_registrar(&[]).await;
+    let (seed, minted, card) = held(&server, "una").await;
+    let front = Front::to(&server).await;
+    front.lose.store(1, Ordering::SeqCst);
+    let reset = hexline_core::reset_devices(
+        seed.clone(),
+        card,
+        vec![front.url.clone()],
+        0,
+        minted.device_seed,
+        minted.cert,
+    )
+    .await
+    .unwrap();
+    assert_eq!((reset.epoch, &reset.done), (1, &vec![front.url.clone()]));
+    assert!(reset.not_done.is_empty(), "{:?}", reset.not_done);
+    assert_eq!(front.posts.load(Ordering::SeqCst), 2);
+    let id = hl_identity::IdentityKey::from_seed(&seed.try_into().unwrap());
+    assert_eq!(epochs_at(&server, &id).await, vec![1]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registrar_down_at_a_reset_is_caught_up_by_the_next() {
+    use std::sync::atomic::Ordering;
+    let (home, other) = (
+        Server::with_registrar(&[]).await,
+        Server::with_registrar(&[]).await,
+    );
+    let (seed, minted, card) = held(&home, "vic").await;
+    let id = hl_identity::IdentityKey::from_seed(&seed.clone().try_into().unwrap());
+    registered(&other, &id, "vic", None).await.unwrap();
+    let front = Front::to(&other).await;
+    let reset = |cert: Vec<u8>| {
+        hexline_core::reset_devices(
+            seed.clone(),
+            card.clone(),
+            vec![home.http.clone(), front.url.clone()],
+            0,
+            minted.device_seed.clone(),
+            cert,
+        )
+    };
+
+    front.down.store(true, Ordering::SeqCst);
+    let first = reset(minted.cert.clone()).await.unwrap();
+    assert_eq!((first.epoch, &first.done), (1, &vec![home.http.clone()]));
+    assert_eq!(
+        first
+            .not_done
+            .iter()
+            .map(|n| n.registrar.as_str())
+            .collect::<Vec<_>>(),
+        vec![front.url.as_str()]
+    );
+
+    front.down.store(false, Ordering::SeqCst);
+    let second = reset(first.cert).await.unwrap();
+    assert_eq!(
+        (second.epoch, &second.done),
+        (2, &vec![home.http.clone(), front.url.clone()])
+    );
+    assert_eq!(epoch_of(&second.cert), 2);
+    assert_eq!(epochs_at(&home, &id).await, vec![1, 2]);
+    assert_eq!(
+        epochs_at(&other, &id).await,
+        vec![2],
+        "caught up in one post"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_elsewhere_while_a_code_is_shown_is_the_epoch_it_certifies_at() {
+    use hexline_core::Enrollee;
+    use hxng_client::testing::Holder;
+    let server = Server::with_registrar(&[]).await;
+    let (seed, _, card) = held(&server, "wren").await;
+    let session =
+        hexline_core::open_holder_session(server.http.clone(), card.clone(), kept(&server.http))
+            .await
+            .unwrap();
+    let id = hl_identity::IdentityKey::from_seed(&seed.clone().try_into().unwrap());
+    let elsewhere = Holder::of(&server, id, card.clone());
+    assert_eq!(elsewhere.reset(3).await["epoch"], 3);
+
+    let phone = Enrollee::new();
+    let asking = tokio::spawn(phone.clone().enroll(
+        server.url.clone(),
+        Some(session.code()),
+        "Tablet".into(),
+    ));
+    let asked = within(session.clone().next_request()).await.unwrap();
+    let certified = approved(&session, &seed, false, asked.device)
+        .await
+        .unwrap();
+    assert_eq!(certified.epoch, 3);
+    let enrolled = asking.await.unwrap().unwrap();
+    assert_eq!(epoch_of(&enrolled.cert), 3);
+    logs_in(&server, &phone.seed(), &enrolled.cert, &card)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_certificate_from_a_holder_behind_a_reset_is_refused_by_the_device() {
+    use hexline_core::Enrollee;
+    use hxng_client::testing::Holder;
+    let server = Server::with_registrar(&[]).await;
+    let (seed, minted, card) = held(&server, "xia").await;
+    hexline_core::reset_devices(
+        seed.clone(),
+        card.clone(),
+        vec![server.http.clone()],
+        0,
+        minted.device_seed,
+        minted.cert,
+    )
+    .await
+    .unwrap();
+
+    let id = hl_identity::IdentityKey::from_seed(&seed.try_into().unwrap());
+    let stale = Holder::of(&server, id, card);
+    let s = stale.open().await;
+    let phone = Enrollee::new();
+    let asking = tokio::spawn(phone.clone().enroll(
+        server.url.clone(),
+        Some(s.code.clone()),
+        "Tablet".into(),
+    ));
+    let asked = stale.asked(&s).await;
+    stale.approve(&s, &asked, 30).await;
+    let e = asking.await.unwrap().unwrap_err();
+    assert_eq!(refused_as(&e), "behind_reset");
+}
