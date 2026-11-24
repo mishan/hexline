@@ -165,6 +165,8 @@ class FakeSetups : HolderSetups {
     }
 
     class Revocation(
+        /** The card of the identity it is published for. */
+        val card: ByteArray?,
         val seed: ByteArray,
         val registrar: String,
         val device: ByteArray,
@@ -183,6 +185,17 @@ class FakeSetups : HolderSetups {
     /** Called as each revocation reaches the registrar. */
     var onRevoke: () -> Unit = {}
 
+    /** Each revocation asked of the registrar, taken or not. */
+    var revokeCalls = 0
+
+    /** [device] revoked at the registrar by another holder of the identity whose card is [card]. */
+    fun revokedElsewhere(
+        card: ByteArray,
+        device: ByteArray,
+    ) {
+        revocations += Revocation(card, ByteArray(32), "reg.example", device, RevokeReason.LOST, 0)
+    }
+
     override suspend fun revoke(
         identitySeed: ByteArray,
         registrar: String,
@@ -192,13 +205,15 @@ class FakeSetups : HolderSetups {
         thisDevice: ByteArray,
     ) {
         yield()
+        revokeCalls++
         if (device.contentEquals(thisDevice)) throw CoreException.Refused("own_device", "", null)
         onRevoke()
         revokeFails?.let {
             revokeFails = null
             throw it
         }
-        revocations += Revocation(identitySeed, registrar, device, reason, until)
+        val card = made.find { it.holds(identitySeed) }?.card()
+        revocations += Revocation(card, identitySeed, registrar, device, reason, until)
         revokeAnswerLost?.let {
             revokeAnswerLost = null
             throw it
@@ -224,6 +239,7 @@ class FakeSetups : HolderSetups {
         standingWaits?.await()
         standingFails?.let { throw it }
         val floor = maxOf(epoch, floor)
+        val revocations = revocations.filter { it.card.contentEquals(card) }
         return DeviceStandings(
             devices.map { d ->
                 when {
@@ -232,6 +248,7 @@ class FakeSetups : HolderSetups {
                     else -> DeviceStanding.IN_FORCE
                 }
             },
+            if (listsRead) revocations.map { it.device } else emptyList(),
             listsRead,
         )
     }
@@ -395,6 +412,8 @@ class FakeSetups : HolderSetups {
         var onCommit: () -> Unit = {}
 
         override fun card() = identity.card
+
+        fun holds(seed: ByteArray) = identity.seed.contentEquals(seed)
 
         override suspend fun commit(
             registrar: String,

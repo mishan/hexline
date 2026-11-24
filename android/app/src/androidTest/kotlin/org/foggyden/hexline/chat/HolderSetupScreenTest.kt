@@ -436,7 +436,7 @@ class HolderSetupScreenTest {
             registrars: List<String>,
             epoch: Long,
             devices: List<ListedDevice>,
-        ) = DeviceStandings(devices.map { DeviceStanding.IN_FORCE }, complete = false)
+        ) = DeviceStandings(devices.map { DeviceStanding.IN_FORCE }, emptyList(), complete = false)
 
         override fun deviceFingerprint(device: ByteArray) = deviceFingerprintOf(device)
 

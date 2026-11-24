@@ -738,6 +738,7 @@ dependencies = [
  "hl-identity",
  "hxng-client",
  "jni",
+ "libc",
  "proptest",
  "qrcode",
  "rustls-platform-verifier",

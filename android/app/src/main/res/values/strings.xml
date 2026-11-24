@@ -214,6 +214,8 @@
     <string name="device_this_phone">This phone.</string>
     <string name="device_revoked">Revoked.</string>
     <string name="device_signed_out">Signed out by a reset.</string>
+    <string name="device_unconfirmed">Not confirmed by the registrar yet.</string>
+    <string name="revoke_again">Revoke again</string>
     <string name="device_can_manage">Can manage the account.</string>
     <string name="certify_intro">Add another device to this identity: it asks by a code this phone shows, at a server that keeps a mailbox for it.</string>
     <string name="certify_mailbox">Server</string>
@@ -243,10 +245,10 @@
     <string name="certify_never_vouch">It will never be able to certify other devices.</string>
     <string name="certify_revoked">This device was revoked. It cannot be certified again.</string>
     <string name="certify_revoked_unopened">This phone\'s list of devices it certified would not open, so it cannot tell whether this device was revoked. Try again below to approve it.</string>
-    <string name="certify_revoked_unchecked">This phone couldn\'t reach this identity\'s registrars, so it cannot tell whether this device was revoked. Try again below to approve it.</string>
     <string name="certify_revoked_unknown">This phone\'s list of devices it certified could not be read, so it cannot tell whether this device was revoked. Discard the unreadable list below to approve it.</string>
     <string name="devices_loading">Reading the list&#8230;</string>
     <string name="devices_unreadable">This phone\'s list of devices it certified could not be read. It was kept aside, and devices certified before it may not be listed here. Until it is discarded, no device can be approved.</string>
+    <string name="devices_discard_loses">Part of it can\'t be read at all, so a device revoked there would not be known here as revoked once it is discarded.</string>
     <string name="devices_discard_unreadable">Discard unreadable list</string>
     <string name="devices_unopened">This phone\'s list of devices it certified would not open just now. No device can be approved until it does.</string>
     <string name="devices_unchecked">Couldn\'t reach this identity\'s registrars, so a device revoked or signed out elsewhere may not show it here.</string>
@@ -256,6 +258,7 @@
     </plurals>
     <string name="certify_no_login">A device asked for a certificate that signs in nowhere, and was told no. Show a new code to try again.</string>
     <string name="certify_signed_out">A device asked with a key that was signed out, and was told to make a new one. Show a new code once it has.</string>
+    <string name="certify_unchecked">A device this identity may have revoked asked while its registrars couldn\'t be read, and was told to try again later. Show a new code once they can be reached.</string>
     <string name="certify_approve">Approve</string>
     <string name="certify_deny">Deny</string>
     <string name="certify_approved">%1$s can now use this identity.</string>

@@ -7,6 +7,7 @@ import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.DeviceStanding
 import org.foggyden.hexline.core.HolderRequest
 import org.foggyden.hexline.core.RevokeReason
+import org.foggyden.hexline.core.WholeRead
 import org.foggyden.hexline.core.certTimeChanges
 import org.foggyden.hexline.core.deviceFingerprintOf
 import org.foggyden.hexline.core.shortHash
@@ -92,6 +93,21 @@ class CertifyFlowTest : ViewModelHarness() {
     private fun devices(vm: ChatViewModel) = checkNotNull(vm.devices.value).devices
 
     private fun own(vm: ChatViewModel) = devices(vm).single { it.own }
+
+    private fun cardOf(fingerprint: String) = outside { identities.list().single { it.fingerprint == fingerprint }.card }
+
+    /** Whether [session] was opened with [device] marked revoked, for the core to refuse. */
+    private fun handedRevoked(
+        session: FakeSetups.FakeSession,
+        device: MintedDevice,
+    ) = handed(session, device.device)
+
+    private fun handed(
+        session: FakeSetups.FakeSession,
+        key: ByteArray,
+    ) = session.kept.devices
+        .single { it.device.contentEquals(key) }
+        .revoked
 
     private fun standing(
         vm: ChatViewModel,
@@ -387,7 +403,8 @@ class CertifyFlowTest : ViewModelHarness() {
         vm.revokeDevice(fingerprint, tablet, RevokeReason.STOLEN, stores.keys.authorizer { false })
         settle()
         assertEquals(Revoking.Idle, vm.revoking.value)
-        assertEquals(emptyList<Any>(), setups.revocations)
+        assertEquals("the registrar not asked", 0, setups.revokeCalls)
+        assertEquals("nor marked here", listOf(tablet), onDisk(fingerprint))
         vm.revokeDevice(fingerprint, tablet, RevokeReason.STOLEN, stores.keys.authorizer())
         settle()
         assertEquals(Revoking.Done(fingerprint, tablet), vm.revoking.value)
@@ -523,6 +540,170 @@ class CertifyFlowTest : ViewModelHarness() {
     }
 
     @Test
+    fun aListDiscardedCarriesEachRevokedKeyItCanStillReadAndWarnsOnlyWhereItCannotReadAll() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val list = minted(fingerprint)
+        val key = { b: Byte -> android.util.Base64.encodeToString(ByteArray(32) { b }, android.util.Base64.NO_WRAP) }
+        // Set aside for want of an expiry, every key read; then another with a key that does not.
+        for ((text, loses) in listOf(
+            """[{"device":"${key(7)}","revoked":true},{"device":"${key(8)}"}]""" to false,
+            """[{"device":"${key(5)}","revoked":true},{"device":12}]""" to true,
+        )) {
+            list.writeText(text)
+            vm.openDevices(fingerprint)
+            settle()
+            val shown = checkNotNull(vm.devices.value)
+            assertTrue(shown.setAside)
+            assertEquals(text, loses, shown.setAsideLoses)
+        }
+        vm.discardUnreadable(fingerprint)
+        settle()
+        assertEquals(
+            "only the revoked, carried",
+            listOf(true, true),
+            listOf(7, 5).map { b -> onDisk(fingerprint).single { it.device.contentEquals(ByteArray(32) { b.toByte() }) }.revoked },
+        )
+        assertEquals(2, onDisk(fingerprint).size)
+        val session = shown(vm, fingerprint)
+        asked(vm, fingerprint, session, Revoked.Yes)
+    }
+
+    @Test
+    fun aKeyMarkedRevokedStaysSoWhateverIsWrittenForItLater() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val ends = now + DAY
+        outside {
+            identities.minted(fingerprint, entry(7, ends, revoked = true), now)
+            identities.minted(fingerprint, entry(7, ends + DAY), now)
+        }
+        assertEquals(listOf(entry(7, ends + DAY, revoked = true)), onDisk(fingerprint))
+    }
+
+    @Test
+    fun aWholeReadOfTheRecordsIsKeptWithTheListAndHandedToTheSession() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        outside { identities.minted(fingerprint, entry(9, now + DAY), now) }
+        val first = shown(vm, fingerprint)
+        assertNull("never read", first.kept.read)
+        vm.cancelCertifying()
+        setups.revokedElsewhere(cardOf(fingerprint), ByteArray(32) { 3 })
+        vm.openDevices(fingerprint)
+        settle()
+        val read = WholeRead(now.toULong(), uptime.toULong(), boot, listOf("reg.example"))
+        setups.listsRead = false
+        now += 60
+        uptime += 60
+        vm.openDevices(fingerprint)
+        settle()
+        val again = model2()
+        val session = shown(again, fingerprint)
+        assertEquals("the last whole read, not the later one", read, session.kept.read)
+        assertEquals(uptime.toULong(), session.kept.uptime)
+        assertEquals(boot, session.kept.boot)
+        assertTrue(handed(session, ByteArray(32) { 3 }))
+    }
+
+    @Test
+    fun aKeyTheRecordsShowedRevokedIsRefusedListedHereOrNotAndAfterARestartWithNoRead() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        vm.openDevices(fingerprint)
+        settle()
+        // Revoked by another holder that certified it: never listed here.
+        setups.revokedElsewhere(cardOf(fingerprint), tablet.device)
+        vm.openDevices(fingerprint)
+        settle()
+        assertEquals("not listed", emptyList<MintedDevice>(), onDisk(fingerprint))
+        setups.listsRead = false
+        val again = model2()
+        again.openDevices(fingerprint)
+        settle()
+        val session = shown(again, fingerprint)
+        asked(again, fingerprint, session, Revoked.Yes)
+        assertTrue("handed to the core marked", handed(session, tablet.device))
+    }
+
+    @Test
+    fun aKeyARecordsReadShowsRevokedWhileItAsksIsNotApproved() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val session = shown(vm, fingerprint)
+        asked(vm, fingerprint, session)
+        setups.revokedElsewhere(cardOf(fingerprint), tablet.device)
+        vm.openDevices(fingerprint)
+        settle()
+        assertEquals(Certifying.Asked(fingerprint, tablet, Revoked.Yes), vm.certify.value)
+        vm.approveDevice(fingerprint, manage = false, stores.keys.authorizer())
+        settle()
+        assertEquals(emptyList<Any>(), session.approvals)
+    }
+
+    @Test
+    fun aWholeReadKeptMalformedIsNoneAndTheListAndItsKeysSeenRevokedStand() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val key = { b: Byte -> android.util.Base64.encodeToString(ByteArray(32) { b }, android.util.Base64.NO_WRAP) }
+        minted(fingerprint).writeText(
+            """{"devices":[{"device":"${key(9)}","expires":${now + DAY}}],"revoked":["${key(7)}"],"read":{"at":1}}""",
+        )
+        // No read of the records lands to write another.
+        setups.standingWaits = CompletableDeferred()
+        vm.openDevices(fingerprint)
+        settle()
+        assertFalse("not set aside", checkNotNull(vm.devices.value).setAside)
+        assertEquals(listOf(entry(9, now + DAY)), onDisk(fingerprint))
+        val session = shown(vm, fingerprint)
+        assertNull("no read to stand in", session.kept.read)
+        asked(vm, fingerprint, session, Revoked.Yes)
+    }
+
+    @Test
+    fun aKeySeenRevokedStandsPastAKeyBesideItThatDoesNotRead() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val key = { b: Byte -> android.util.Base64.encodeToString(ByteArray(32) { b }, android.util.Base64.NO_WRAP) }
+        minted(fingerprint).writeText("""{"devices":[],"revoked":[12,"${key(7)}"]}""")
+        setups.standingWaits = CompletableDeferred()
+        vm.openDevices(fingerprint)
+        settle()
+        assertFalse("not set aside", checkNotNull(vm.devices.value).setAside)
+        val session = shown(vm, fingerprint)
+        asked(vm, fingerprint, session, Revoked.Yes)
+        assertTrue(handed(session, tablet.device))
+    }
+
+    @Test
+    fun aListSetAsideCarriesItsKeysSeenRevokedWhenDiscardedAndWarnsOfWhatItCannotRead() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val key = { b: Byte -> android.util.Base64.encodeToString(ByteArray(32) { b }, android.util.Base64.NO_WRAP) }
+        // Set aside for a device that does not read; its key seen revoked reads.
+        minted(fingerprint).writeText("""{"devices":[{"device":12}],"revoked":["${key(7)}"]}""")
+        setups.standingWaits = CompletableDeferred()
+        vm.openDevices(fingerprint)
+        settle()
+        val shown = checkNotNull(vm.devices.value)
+        assertTrue(shown.setAside)
+        assertTrue("warned", shown.setAsideLoses)
+        vm.discardUnreadable(fingerprint)
+        settle()
+        val session = shown(vm, fingerprint)
+        asked(vm, fingerprint, session, Revoked.Yes)
+        assertTrue(handed(session, tablet.device))
+    }
+
+    @Test
     fun aListOfDevicesTheDiskWillNotOpenIsToldAsUnreadAndThrowsAtNothing() {
         val vm = model()
         settle()
@@ -583,28 +764,20 @@ class CertifyFlowTest : ViewModelHarness() {
     }
 
     @Test
-    fun aRevocationTheDiskWillNotMarkIsMarkedFromMemoryAndWrittenLater() {
+    fun aRevocationTheDiskWillNotMarkIsNotAskedOfTheRegistrar() {
         val vm = model()
         settle()
         val fingerprint = heldHere(vm)
         vm.openDevices(fingerprint)
         certified(vm, fingerprint)
         val device = devices(vm).single { !it.own }
-        val dir = stores.identityDir
-        // The registrar asked, the disk refuses the mark that it has it.
-        setups.onRevoke = { dir.setWritable(false) }
-        try {
+        unwritable {
             vm.revokeDevice(fingerprint, device, RevokeReason.LOST, stores.keys.authorizer())
             settle()
-        } finally {
-            dir.setWritable(true)
         }
-        assertEquals(Revoking.Done(fingerprint, device), vm.revoking.value)
-        assertEquals(listOf(own(vm), revoked(device)), devices(vm))
-        vm.openDevices(fingerprint)
-        settle()
-        assertEquals(listOf(revoked(device)), onDisk(fingerprint))
-        assertEquals("the registrar asked once", 1, setups.revocations.size)
+        assertEquals(Revoking.Failed(fingerprint, SetupProblem.NotKept), vm.revoking.value)
+        assertEquals("the registrar not asked", 0, setups.revokeCalls)
+        assertEquals(listOf(device), onDisk(fingerprint))
     }
 
     @Test
@@ -695,47 +868,54 @@ class CertifyFlowTest : ViewModelHarness() {
     }
 
     @Test
-    fun aDeviceTheRecordsRevokeStaysListedPastItsCertificateAndIsNotApproved() {
+    fun aDeviceRevokedElsewhereIsMarkedFromTheRecordsAndKeptPastItsCertificateAndAListWritten() {
         val vm = model()
         settle()
         val fingerprint = heldHere(vm)
         vm.openDevices(fingerprint)
         certified(vm, fingerprint)
         val device = devices(vm).single { !it.own }
-        setups.revokeAnswerLost = CoreException.Connect("its answer lost")
-        vm.revokeDevice(fingerprint, device, RevokeReason.LOST, stores.keys.authorizer())
-        settle()
-        now = lapsed(device.expires)
+        setups.revokedElsewhere(cardOf(fingerprint), device.device)
         vm.openDevices(fingerprint)
         settle()
-        assertTrue(devices(vm).any { it.device.contentEquals(device.device) })
-        val session = shown(vm, fingerprint)
-        asked(vm, fingerprint, session, Revoked.Yes)
-    }
-
-    @Test
-    fun aDeviceTheRecordsRevokeIsMarkedSoAListWrittenPastItsCertificateKeepsIt() {
-        val vm = model()
-        settle()
-        val fingerprint = heldHere(vm)
-        vm.openDevices(fingerprint)
-        certified(vm, fingerprint)
-        val device = devices(vm).single { !it.own }
-        setups.revokeAnswerLost = CoreException.Connect("its answer lost")
-        vm.revokeDevice(fingerprint, device, RevokeReason.LOST, stores.keys.authorizer())
-        settle()
+        assertEquals("marked from the records", listOf(revoked(device)), onDisk(fingerprint))
+        // Past its certificate, another entry written, and no list read after a restart.
         now = lapsed(device.expires)
         outside { identities.minted(fingerprint, entry(9, now + DAY), now) }
         setups.listsRead = false
         val again = model2()
         again.openDevices(fingerprint)
         settle()
+        assertTrue(revoked(device) in onDisk(fingerprint))
         val session = shown(again, fingerprint)
         asked(again, fingerprint, session, Revoked.Yes)
+        assertTrue("handed to the core marked", handedRevoked(session, device))
     }
 
     @Test
-    fun aDeviceListedSinceTheLastRecordsReadIsUncheckedAndARequestFromItUnknown() {
+    fun aRevocationWhoseAnswerIsLostStaysMarkedPastItsCertificateAndAListWrittenWithNoListReading() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        vm.openDevices(fingerprint)
+        certified(vm, fingerprint)
+        val device = devices(vm).single { !it.own }
+        setups.listsRead = false
+        setups.revokeFails = CoreException.Connect("its answer lost")
+        vm.revokeDevice(fingerprint, device, RevokeReason.LOST, stores.keys.authorizer())
+        settle()
+        now = lapsed(device.expires)
+        outside { identities.minted(fingerprint, entry(9, now + DAY), now) }
+        val again = model2()
+        again.openDevices(fingerprint)
+        settle()
+        val session = shown(again, fingerprint)
+        asked(again, fingerprint, session, Revoked.Yes)
+        assertTrue(handedRevoked(session, device))
+    }
+
+    @Test
+    fun aDeviceListedSinceTheLastRecordsReadIsShownUnchecked() {
         val vm = model()
         settle()
         val fingerprint = heldHere(vm)
@@ -745,41 +925,13 @@ class CertifyFlowTest : ViewModelHarness() {
         assertFalse(checkNotNull(vm.devices.value).unchecked)
         outside { identities.minted(fingerprint, entry(7, now + DAY), now) }
         setups.standingWaits = CompletableDeferred()
-        val session = shown(vm, fingerprint)
-        asked(vm, fingerprint, session, Revoked.Unknown)
+        vm.openDevices(fingerprint)
+        settle()
         assertTrue(checkNotNull(vm.devices.value).unchecked)
     }
 
     @Test
-    fun aRecordsReadBegunBeforeAnUnconfirmedRevocationDoesNotLandAfterIt() {
-        val vm = model()
-        settle()
-        val fingerprint = heldHere(vm)
-        vm.openDevices(fingerprint)
-        certified(vm, fingerprint)
-        val device = devices(vm).single { !it.own }
-        val earlier = CompletableDeferred<Unit>()
-        setups.standingWaits = earlier
-        vm.openDevices(fingerprint)
-        settle()
-        setups.standingWaits = CompletableDeferred()
-        var sent = false
-        setups.onRevoke = { sent = true }
-        setups.revokeFails = CoreException.Refused("server_error", "", null)
-        vm.revokeDevice(fingerprint, device, RevokeReason.LOST, stores.keys.authorizer())
-        while (!sent) {
-            onMain()
-            if (!sent) onDisk()
-        }
-        // The earlier read answers with the failure's invalidation queued and not yet run.
-        earlier.complete(Unit)
-        settle()
-        val session = shown(vm, fingerprint)
-        asked(vm, fingerprint, session, Revoked.Unknown)
-    }
-
-    @Test
-    fun aRevocationUnconfirmedLeavesARequestFromItUnknownUntilTheRecordsAreRead() {
+    fun aRevocationUnconfirmedLeavesARequestFromItRevokedWhateverTheRecordsSay() {
         val vm = model()
         settle()
         val fingerprint = heldHere(vm)
@@ -792,11 +944,12 @@ class CertifyFlowTest : ViewModelHarness() {
         vm.revokeDevice(fingerprint, device, RevokeReason.LOST, stores.keys.authorizer())
         settle()
         val session = shown(vm, fingerprint)
-        asked(vm, fingerprint, session, Revoked.Unknown)
+        asked(vm, fingerprint, session, Revoked.Yes)
         setups.standingWaits = null
         read.complete(Unit)
         settle()
-        assertEquals("the records decide", Certifying.Asked(fingerprint, tablet), vm.certify.value)
+        assertEquals("the records, in force, take back nothing", Certifying.Asked(fingerprint, tablet, Revoked.Yes), vm.certify.value)
+        assertEquals("shown as not confirmed", DeviceStanding.IN_FORCE, standing(vm, device))
     }
 
     @Test
@@ -842,7 +995,7 @@ class CertifyFlowTest : ViewModelHarness() {
         vm.revokeDevice(fingerprint, device, RevokeReason.LOST, stores.keys.authorizer())
         settle()
         assertEquals(Revoking.Failed(fingerprint, SetupProblem.RevocationUnconfirmed), vm.revoking.value)
-        assertEquals(listOf(device), onDisk(fingerprint))
+        assertEquals(listOf(revoked(device)), onDisk(fingerprint))
     }
 
     @Test
@@ -860,6 +1013,7 @@ class CertifyFlowTest : ViewModelHarness() {
         assertEquals(Revoking.Failed(fingerprint, SetupProblem.NotKept), vm.revoking.value)
         assertEquals(emptyList<Any>(), setups.revocations)
         assertEquals(listOf(device), onDisk(fingerprint))
+        assertEquals("the registrar not asked", 0, setups.revokeCalls)
     }
 
     @Test
@@ -876,6 +1030,7 @@ class CertifyFlowTest : ViewModelHarness() {
         stores.keys.trouble = null
         assertEquals(Revoking.Failed(fingerprint, SetupProblem.Other), vm.revoking.value)
         assertEquals(listOf(device), onDisk(fingerprint))
+        assertEquals("the registrar not asked", 0, setups.revokeCalls)
     }
 
     @Test
@@ -1016,7 +1171,7 @@ class CertifyFlowTest : ViewModelHarness() {
     }
 
     @Test
-    fun aRevocationWhoseAnswerIsLostLeavesTheDeviceInForceAndIsRevokedAgain() {
+    fun aRevocationWhoseAnswerIsLostIsMarkedHereShownUnconfirmedAndRevokedAgain() {
         val vm = model()
         settle()
         val fingerprint = heldHere(vm)
@@ -1027,21 +1182,22 @@ class CertifyFlowTest : ViewModelHarness() {
         vm.revokeDevice(fingerprint, device, RevokeReason.LOST, stores.keys.authorizer())
         settle()
         assertEquals(Revoking.Failed(fingerprint, SetupProblem.Unreachable), vm.revoking.value)
-        assertEquals(listOf(device), onDisk(fingerprint))
-        assertEquals("as the records say", DeviceStanding.IN_FORCE, standing(vm, device))
+        assertEquals(listOf(revoked(device)), onDisk(fingerprint))
+        assertEquals("not confirmed by the records", DeviceStanding.IN_FORCE, standing(vm, device))
         val session = shown(vm, fingerprint)
-        asked(vm, fingerprint, session)
+        asked(vm, fingerprint, session, Revoked.Yes)
         vm.cancelCertifying()
         vm.revokingSeen()
-        vm.revokeDevice(fingerprint, device, RevokeReason.LOST, stores.keys.authorizer())
+        vm.revokeDevice(fingerprint, revoked(device), RevokeReason.LOST, stores.keys.authorizer())
         settle()
-        assertEquals(Revoking.Done(fingerprint, device), vm.revoking.value)
+        assertEquals(Revoking.Done(fingerprint, revoked(device)), vm.revoking.value)
         assertEquals(listOf(revoked(device)), onDisk(fingerprint))
-        assertEquals(1, setups.revocations.size)
+        assertEquals(DeviceStanding.REVOKED, standing(vm, device))
+        assertEquals(listOf(1, 2), listOf(setups.revocations.size, setups.revokeCalls))
     }
 
     @Test
-    fun aRevocationWhoseAnswerIsLostWithNoListReadingLeavesARequestFromItUnknown() {
+    fun aRevocationWhoseAnswerIsLostWithNoListReadingLeavesARequestFromItRevoked() {
         val vm = model()
         settle()
         val fingerprint = heldHere(vm)
@@ -1054,7 +1210,7 @@ class CertifyFlowTest : ViewModelHarness() {
         settle()
         assertTrue(checkNotNull(vm.devices.value).unchecked)
         val session = shown(vm, fingerprint)
-        asked(vm, fingerprint, session, Revoked.Unknown)
+        asked(vm, fingerprint, session, Revoked.Yes)
         vm.approveDevice(fingerprint, manage = false, stores.keys.authorizer())
         settle()
         assertEquals(emptyList<Any>(), session.approvals)
@@ -1092,7 +1248,7 @@ class CertifyFlowTest : ViewModelHarness() {
     }
 
     @Test
-    fun aRevocationTheRegistrarRefusesLeavesTheDeviceAsItWas() {
+    fun aRevocationTheRegistrarRefusesStaysMarkedHere() {
         val vm = model()
         settle()
         val fingerprint = heldHere(vm)
@@ -1103,8 +1259,7 @@ class CertifyFlowTest : ViewModelHarness() {
         vm.revokeDevice(fingerprint, device, RevokeReason.LOST, stores.keys.authorizer())
         settle()
         assertTrue(vm.revoking.value is Revoking.Failed)
-        assertEquals(listOf(device), onDisk(fingerprint))
-        assertEquals(listOf(own(vm), device), devices(vm))
+        assertEquals(listOf(revoked(device)), onDisk(fingerprint))
     }
 
     @Test

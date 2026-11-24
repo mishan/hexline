@@ -173,6 +173,101 @@ pub(crate) fn registrars_of(kept: &[String], card: &hl_identity::Card) -> Vec<St
     out
 }
 
+/// How long a complete read of an identity's records stands in for one
+/// that is not.
+pub(crate) const READ_STANDS: u64 = 24 * 3600;
+
+/// How far the wall clock and the clock since boot may drift apart over a
+/// read's [`READ_STANDS`] before the read is not trusted to be as recent as
+/// the wall clock says.
+pub(crate) const CLOCKS_DRIFT: u64 = 600;
+
+/// The last complete read of an identity's records this phone keeps: when,
+/// in seconds by the wall clock and by the phone's clock since boot, the
+/// boot that clock counts from (opaque, the platform's), and the
+/// registrars it reached, every one kept for the identity then.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct WholeRead {
+    pub at: u64,
+    pub uptime: u64,
+    pub boot: String,
+    pub registrars: Vec<String>,
+}
+
+/// Seconds since boot, time asleep counted, where the platform says.
+pub(crate) fn boot_secs() -> Option<u64> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid timespec for the call to write.
+        let ok = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } == 0;
+        ok.then_some(ts.tv_sec as u64)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    None
+}
+
+/// Whether `published` was read from every registrar in `kept`, where this
+/// phone posts its revocations, or with none kept, from any of
+/// `registrars`; vacuously where there are none to read.
+pub(crate) fn read_whole(kept: &[String], registrars: &[String], published: &Published) -> bool {
+    match kept.is_empty() {
+        true => registrars.is_empty() || !published.read.is_empty(),
+        false => kept
+            .iter()
+            .all(|k| published.read.iter().any(|r| same_registrar(r, k))),
+    }
+}
+
+/// The keys a revocation that stands at `floor` names.
+pub(crate) fn revoked_keys(floor: u64, published: &Published) -> Vec<PublicKey> {
+    let mut keys: Vec<PublicKey> = Vec::new();
+    for r in &published.revocations {
+        if r.check_signer_floor(floor).is_ok() && !keys.contains(&r.device) {
+            keys.push(r.device);
+        }
+    }
+    keys
+}
+
+/// Whether `device`'s revocation is unknown on what was read: a key this
+/// identity may have revoked, one `listed` here or asking with a `prev` it
+/// signed, where the read is not `whole` and `last` does not stand in for
+/// it. A key known to neither could only have been revoked elsewhere,
+/// which the records alone say.
+pub(crate) fn standing_unknown(
+    device: &PublicKey,
+    prev: bool,
+    listed: &[(PublicKey, u64)],
+    whole: bool,
+    last: Option<&WholeRead>,
+    kept: &[String],
+    (now, uptime, boot): (u64, u64, &str),
+) -> bool {
+    let known = prev || listed.iter().any(|(d, _)| d == device);
+    known && !whole && !last.is_some_and(|l| l.boot == boot && stands(l, kept, now, uptime))
+}
+
+/// Whether `last` stands in for a read that is not whole: within
+/// [`READ_STANDS`] by the wall clock and by the clock since boot alike,
+/// so a wall clock moved since makes it count for nothing, and of every
+/// registrar `kept` now. The caller holds it to the same boot.
+fn stands(last: &WholeRead, kept: &[String], now: u64, uptime: u64) -> bool {
+    let (Some(wall), Some(booted)) = (now.checked_sub(last.at), uptime.checked_sub(last.uptime))
+    else {
+        return false;
+    };
+    wall <= READ_STANDS
+        && booted <= READ_STANDS
+        && wall.abs_diff(booted) <= CLOCKS_DRIFT
+        && kept
+            .iter()
+            .all(|k| last.registrars.iter().any(|r| same_registrar(r, k)))
+}
+
 /// Whether `a` and `b` name one registrar: the same text, or one origin.
 pub(crate) fn same_registrar(a: &str, b: &str) -> bool {
     let origin = |r: &str| registrar_base(r).ok().map(|b| b.origin());

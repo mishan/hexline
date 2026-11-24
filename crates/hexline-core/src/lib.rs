@@ -26,7 +26,7 @@ pub use connection::{
     ClassicLogin, CoreError, CoreUpdate, DeviceIdentity, LoginInfo, ServerConnection, UpdateSink,
 };
 pub use enroll::{card_name, enrollment_code, newer_card, renewal_due, Enrolled, Enrollee};
-pub use epoch::held_floor;
+pub use epoch::{held_floor, WholeRead};
 pub use holder::{
     check_device_name, check_holder_registrar, held_renewal, holder_mint, holder_renew,
     new_identity, HeldRenewal, HolderCommitted, HolderMinted, HolderSetup, NewIdentity,

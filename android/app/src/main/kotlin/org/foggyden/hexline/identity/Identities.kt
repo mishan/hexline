@@ -10,6 +10,7 @@ import android.util.Log
 import org.foggyden.hexline.core.CertInfo
 import org.foggyden.hexline.core.KeptRotation
 import org.foggyden.hexline.core.RotationState
+import org.foggyden.hexline.core.WholeRead
 import org.foggyden.hexline.core.certForDevice
 import org.foggyden.hexline.core.certInfo
 import org.foggyden.hexline.core.decodeRotation
@@ -465,45 +466,163 @@ class Identities(
      * sense of it, rather than written over, and [mintedUnreadable] says so
      * from then on. Throws an [java.io.IOException] the disk gives.
      */
-    fun minted(fingerprint: String): List<MintedDevice> =
-        synchronized(LOCK) {
-            val file = mintedFile(fingerprint)
-            val bytes =
-                try {
-                    AtomicFile(file).readFully()
-                } catch (e: FileNotFoundException) {
-                    // One that is there and will not open is the disk's trouble, not an empty list.
-                    if (file.exists()) throw e
-                    return emptyList()
-                }
+    fun minted(fingerprint: String): List<MintedDevice> = synchronized(LOCK) { kept(fingerprint).devices }
+
+    /** [fingerprint]'s last whole read of its records, kept with its list; null if never, or it does not read. */
+    fun lastRead(fingerprint: String): WholeRead? = synchronized(LOCK) { kept(fingerprint).read }
+
+    /** Every key a read of [fingerprint]'s records ever showed revoked, listed here or not. */
+    fun seenRevoked(fingerprint: String): List<ByteArray> = synchronized(LOCK) { kept(fingerprint).seen }
+
+    /** What [fingerprint]'s list file holds: its devices, the keys seen revoked, and the last whole read. */
+    private class Kept(
+        val devices: List<MintedDevice>,
+        val seen: List<ByteArray> = emptyList(),
+        val read: WholeRead? = null,
+    )
+
+    /** [fingerprint]'s list file, as [minted] reads it. */
+    private fun kept(fingerprint: String): Kept {
+        val file = mintedFile(fingerprint)
+        val bytes =
             try {
-                val list = JSONArray(String(bytes))
-                (0 until list.length()).map { i ->
-                    val json = list.getJSONObject(i)
-                    val device = unb64(json.getString("device"))
-                    MintedDevice(
-                        device,
-                        deviceFingerprintOf(device),
-                        json.optString("name").ifEmpty { null },
-                        json.getLong("expires"),
-                        json.optBoolean("manage"),
-                        json.optBoolean("revoked"),
-                        epoch = json.optLong("epoch"),
-                    )
-                }
-            } catch (e: Exception) {
-                // What was read did not parse: the disk's own trouble is the caller's.
-                if (e is java.io.IOException) throw e
-                aside(file, bytes)
-                emptyList()
+                AtomicFile(file).readFully()
+            } catch (e: FileNotFoundException) {
+                // One that is there and will not open is the disk's trouble, not an empty list.
+                if (file.exists()) throw e
+                return Kept(emptyList())
             }
+        return try {
+            val text = String(bytes)
+            // The list alone, as it was first written, or with what reads of the records found beside it.
+            if (text.trimStart().startsWith("[")) {
+                Kept(JSONArray(text).let { list -> (0 until list.length()).map { device(list.getJSONObject(it)) } })
+            } else {
+                val json = JSONObject(text)
+                val list = json.getJSONArray("devices")
+                // A key that does not read is passed over, not taken for the whole file not reading.
+                val seen = keys(json.optJSONArray("revoked")).first
+                val devices = (0 until list.length()).map { device(list.getJSONObject(it)) }
+                Kept(devices, seen, wholeRead(json.optJSONObject("read")))
+            }
+        } catch (e: Exception) {
+            // What was read did not parse: the disk's own trouble is the caller's.
+            if (e is java.io.IOException) throw e
+            aside(file, bytes)
+            Kept(emptyList())
+        }
+    }
+
+    /** The keys in [array] that read, and whether all of them did. */
+    private fun keys(array: JSONArray?): Pair<List<ByteArray>, Boolean> {
+        if (array == null) return emptyList<ByteArray>() to true
+        val keys =
+            (0 until array.length()).mapNotNull { i ->
+                try {
+                    unb64(array.getString(i)).takeIf { it.size == 32 }
+                } catch (_: Exception) {
+                    null
+                }
+            }
+        return keys to (keys.size == array.length())
+    }
+
+    /** A whole read as kept; one that does not read is none, which stands in for nothing. */
+    private fun wholeRead(json: JSONObject?): WholeRead? =
+        try {
+            json?.let { r ->
+                val registrars = r.getJSONArray("registrars")
+                WholeRead(
+                    r.getLong("at").toULong(),
+                    r.getLong("uptime").toULong(),
+                    r.getString("boot"),
+                    (0 until registrars.length()).map { registrars.getString(it) },
+                )
+            }
+        } catch (_: org.json.JSONException) {
+            null
         }
 
-    /** [fingerprint]'s lists of devices kept aside as unread, let go of. */
-    fun discardUnread(fingerprint: String): Unit = synchronized(LOCK) { unread(fingerprint).forEach { it.delete() } }
+    private fun device(json: JSONObject): MintedDevice {
+        val device = unb64(json.getString("device"))
+        return MintedDevice(
+            device,
+            deviceFingerprintOf(device),
+            json.optString("name").ifEmpty { null },
+            json.getLong("expires"),
+            json.optBoolean("manage"),
+            json.optBoolean("revoked"),
+            epoch = json.optLong("epoch"),
+        )
+    }
+
+    /**
+     * [fingerprint]'s lists of devices kept aside as unread, let go of, each
+     * device revoked in them that can still be read carried into the list
+     * first, in one write.
+     */
+    fun discardUnread(fingerprint: String): Unit =
+        synchronized(LOCK) {
+            val salvaged = unread(fingerprint).map { salvaged(it) }
+            val carried = salvaged.flatMap { it.revoked }
+            val seen = salvaged.flatMap { it.seen }
+            if (carried.isNotEmpty() || seen.isNotEmpty()) {
+                val kept = kept(fingerprint)
+                val all = kept.devices
+                val more = carried.filter { c -> all.none { it.device.contentEquals(c.device) } }.distinctBy { it.fingerprint }
+                val marked = all.map { d -> if (carried.any { it.device.contentEquals(d.device) }) d.with(revoked = true) else d }
+                val joined = (kept.seen + seen).distinctBy { it.toList() }
+                writeMinted(fingerprint, Kept(marked + more, joined, kept.read))
+            }
+            unread(fingerprint).forEach { it.delete() }
+        }
 
     /** Whether a list of [fingerprint]'s devices did not read and was kept aside: what it said is not known here. */
     fun mintedUnreadable(fingerprint: String): Boolean = synchronized(LOCK) { unread(fingerprint).isNotEmpty() }
+
+    /** Whether part of a list of [fingerprint]'s devices kept aside cannot be read at all: a device revoked there would be let go of. */
+    fun unreadLoses(fingerprint: String): Boolean = synchronized(LOCK) { unread(fingerprint).any { !salvaged(it).whole } }
+
+    /** What a list set aside still says that can be read: the devices revoked in it, the keys seen revoked, and whether all of those could. */
+    private class Salvaged(
+        val revoked: List<MintedDevice>,
+        val seen: List<ByteArray>,
+        val whole: Boolean,
+    )
+
+    /** What [copy], a list set aside, still says that can be read. */
+    private fun salvaged(copy: File): Salvaged {
+        var seen: Pair<List<ByteArray>, Boolean> = emptyList<ByteArray>() to true
+        val list =
+            try {
+                val text = String(AtomicFile(copy).readFully())
+                if (text.trimStart().startsWith("[")) {
+                    JSONArray(text)
+                } else {
+                    val json = JSONObject(text)
+                    seen = keys(json.optJSONArray("revoked"))
+                    json.getJSONArray("devices")
+                }
+            } catch (_: Exception) {
+                return Salvaged(emptyList(), seen.first, false)
+            }
+        var whole = seen.second
+        val revoked =
+            (0 until list.length()).mapNotNull { i ->
+                try {
+                    val json = list.getJSONObject(i)
+                    val device = unb64(json.getString("device"))
+                    if (device.size != 32) error("not a key")
+                    // Only the key and that it was revoked matter: it is never certified again.
+                    MintedDevice(device, deviceFingerprintOf(device), null, json.optLong("expires"), false, revoked = true)
+                        .takeIf { json.optBoolean("revoked") }
+                } catch (_: Exception) {
+                    whole = false
+                    null
+                }
+            }
+        return Salvaged(revoked, seen.first, whole)
+    }
 
     /** [bytes], [file]'s, under a name of their own beside any kept before, and then [file] gone. */
     private fun aside(
@@ -524,7 +643,8 @@ class Identities(
 
     /**
      * [device] certified by [fingerprint]'s key, in place of any it certified
-     * before for the same key. Read back once written: one the list does not
+     * before for the same key; revoked if either is, as a key revoked is
+     * never certified again. Read back once written: one the list does not
      * hold, whatever the write said (a rename that did not land), is an
      * [java.io.IOException]. That says nothing of the data reaching the disk.
      */
@@ -534,10 +654,12 @@ class Identities(
         now: Long,
     ): Unit =
         synchronized(LOCK) {
-            val all = minted(fingerprint)
+            val kept = kept(fingerprint)
+            val all = kept.devices
+            val before = all.find { it.device.contentEquals(given.device) }
             // A key is never certified again in a lower epoch than its listed one: a lower one
             // given is an entry read before the latest, and the floor that one lists is kept.
-            val epoch = maxOf(given.epoch, all.find { it.device.contentEquals(given.device) }?.epoch ?: 0)
+            val epoch = maxOf(given.epoch, before?.epoch ?: 0)
             // An empty name kept as none, as it reads back.
             val device =
                 MintedDevice(
@@ -546,7 +668,7 @@ class Identities(
                     given.name?.ifEmpty { null },
                     given.expires,
                     given.canManage,
-                    given.revoked,
+                    given.revoked || before?.revoked == true,
                     given.own,
                     epoch,
                 )
@@ -565,31 +687,36 @@ class Identities(
             // A certificate past [now] is let go of as the list is written, a revoked one kept, and
             // one holding a floor kept nowhere else.
             val live = all.filter { it.listed(now) || (!raised && it.epoch == floor) }
-            writeMinted(fingerprint, live.filter { !it.device.contentEquals(device.device) } + device)
+            writeMinted(fingerprint, Kept(live.filter { !it.device.contentEquals(device.device) } + device, kept.seen, kept.read))
             if (minted(fingerprint).none { it == device }) throw java.io.IOException("not kept")
         }
 
     /**
-     * [devices], of those [fingerprint]'s key certified here, marked
-     * revoked in one write. Throws an [java.io.IOException] the disk gives.
+     * What a read of [fingerprint]'s records found, in one write: each key of
+     * [revoked] kept as seen revoked for good, listed here or not, each
+     * listed device of them marked revoked, and [whole], where the read was
+     * whole, kept as its last. Throws an [java.io.IOException] the disk gives.
      */
-    fun revoked(
+    fun recordsRead(
         fingerprint: String,
-        devices: List<ByteArray>,
+        whole: WholeRead?,
+        revoked: List<ByteArray>,
     ): Unit =
         synchronized(LOCK) {
-            val all = minted(fingerprint)
-            val marking = all.filter { d -> !d.revoked && devices.any { it.contentEquals(d.device) } }
-            if (marking.isEmpty()) return
-            writeMinted(fingerprint, all.map { d -> if (d in marking) d.with(revoked = true) else d })
+            val kept = kept(fingerprint)
+            val all = kept.devices
+            val marked = all.map { d -> if (!d.revoked && revoked.any { it.contentEquals(d.device) }) d.with(revoked = true) else d }
+            val seen = kept.seen + revoked.filter { r -> kept.seen.none { it.contentEquals(r) } }.distinctBy { it.toList() }
+            if (marked == all && seen.size == kept.seen.size && whole == null) return
+            writeMinted(fingerprint, Kept(marked, seen, whole ?: kept.read))
         }
 
     private fun writeMinted(
         fingerprint: String,
-        devices: List<MintedDevice>,
+        kept: Kept,
     ) {
         val list = JSONArray()
-        for (d in devices) {
+        for (d in kept.devices) {
             list.put(
                 JSONObject()
                     .put("device", b64(d.device))
@@ -602,7 +729,19 @@ class Identities(
                     },
             )
         }
-        commit(mintedFile(fingerprint), list.toString().toByteArray())
+        val json = JSONObject().put("devices", list)
+        if (kept.seen.isNotEmpty()) json.put("revoked", JSONArray(kept.seen.map(::b64)))
+        kept.read?.let { r ->
+            json.put(
+                "read",
+                JSONObject()
+                    .put("at", r.at.toLong())
+                    .put("uptime", r.uptime.toLong())
+                    .put("boot", r.boot)
+                    .put("registrars", JSONArray(r.registrars)),
+            )
+        }
+        commit(mintedFile(fingerprint), json.toString().toByteArray())
     }
 
     /** Lists of devices, and copies set aside, kept for an identity no longer here: let go of. */

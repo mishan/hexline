@@ -115,7 +115,8 @@ sealed interface Revoking {
 /**
  * The devices [identity]'s key certified here, this phone's own first;
  * [unreadable] when the list would not open just now, and [setAside] when
- * one that did not read is kept aside. [standing] is what the identity's
+ * one that did not read is kept aside, [setAsideLoses] when part of that
+ * cannot be read at all. [standing] is what the identity's
  * registrars last said of each, by its fingerprint, and [unchecked] that
  * none of their lists read.
  */
@@ -124,6 +125,7 @@ data class DeviceList(
     val devices: List<MintedDevice>,
     val unreadable: Boolean = false,
     val setAside: Boolean = false,
+    val setAsideLoses: Boolean = false,
     val standing: Map<String, DeviceStanding> = emptyMap(),
     val unchecked: Boolean = false,
 ) {
