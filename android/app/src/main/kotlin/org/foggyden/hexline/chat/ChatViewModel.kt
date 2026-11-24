@@ -1888,6 +1888,10 @@ class ChatViewModel internal constructor(
     fun deleteIdentity(fingerprint: String) {
         // A code shown for it answers nothing more: a certificate made and not yet sent is not.
         if (sessionFor == fingerprint) session?.cancel()
+        // A read of its records under way says nothing of where its devices stand from now on, nor
+        // stands in as a whole read for one held again: it is overtaken. With the identity gone, the
+        // store has nothing to write what it found into.
+        standingReads[fingerprint] = (standingReads[fingerprint] ?: 0) + 1
         val signedIn = SignIn.Identity(fingerprint)
         // A connect asked for after this reads the device after it, and finds none.
         letGo { it.signIn == signedIn }
@@ -1905,6 +1909,7 @@ class ChatViewModel internal constructor(
             held.dismiss(fingerprint)
             identities.delete(fingerprint)
             unkept.remove(fingerprint)
+            atRegistrars.remove(fingerprint)
             heldLost.value = held.notices()
             publishIdentities()
             for (s in servers.all().filter { it.signIn == signedIn }) servers.forgetSession(s, since)

@@ -884,6 +884,27 @@ class CertifyFlowTest : ViewModelHarness() {
     }
 
     @Test
+    fun aReadOfTheRecordsLandingOnceItsIdentityIsDeletedWritesNothingBack() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        vm.openDevices(fingerprint)
+        certified(vm, fingerprint)
+        setups.revokedElsewhere(cardOf(fingerprint), tablet.device)
+        val held = CompletableDeferred<Unit>()
+        setups.standingWaits = held
+        vm.openDevices(fingerprint)
+        settle()
+        vm.deleteIdentity(fingerprint)
+        settle()
+        assertFalse(minted(fingerprint).exists())
+        setups.standingWaits = null
+        held.complete(Unit)
+        settle()
+        assertFalse("no list written back", minted(fingerprint).exists())
+    }
+
+    @Test
     fun aWholeReadIsNotKeptToStandInWhereNoBootIsKnown() {
         boot = ""
         val vm = model()
