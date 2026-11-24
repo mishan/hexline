@@ -122,6 +122,10 @@ fun setupActions(
     override fun revokingSeen() = chat.revokingSeen()
 
     override fun discardUnreadable(fingerprint: String) = chat.discardUnreadable(fingerprint)
+
+    override fun resetDevices(fingerprint: String) = chat.resetDevices(fingerprint, authorizer)
+
+    override fun resettingSeen() = chat.resettingSeen()
 }
 
 @Composable
@@ -143,6 +147,7 @@ fun Hexline(
     val devices by chat.devices.collectAsStateWithLifecycle()
     val identitiesRead by chat.identitiesRead.collectAsStateWithLifecycle()
     val revoking by chat.revoking.collectAsStateWithLifecycle()
+    val resetting by chat.resetting.collectAsStateWithLifecycle()
     val rotations by chat.rotations.collectAsStateWithLifecycle()
     when (val link = state.link) {
         Link.Live, is Link.Reconnecting -> ChatScreen(state, chat::send, chat::loadEarlier, chat::disconnect)
@@ -177,6 +182,7 @@ fun Hexline(
                 devices = devices,
                 identitiesRead = identitiesRead,
                 revoking = revoking,
+                resetting = resetting,
                 setup = setupActions(chat, authorizer),
                 rotations = rotations,
             )

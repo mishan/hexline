@@ -94,6 +94,9 @@ abstract class ViewModelHarness {
     protected val enrollments = mutableListOf<FakeEnrollment>()
     protected var setups = FakeSetups()
 
+    /** Each reset's retry the models ask for, as WorkManager would be asked. */
+    protected val retries = FakeRetries()
+
     /** What the store held of the identity's last try when the holder was asked. */
     protected var triedWhenAsked: Long? = null
     protected var now = ISSUED + DAY
@@ -207,7 +210,7 @@ abstract class ViewModelHarness {
                         connection(url, sink).also { opened += it }
                     }, { renewing, expecting ->
                         enrollment(renewing, expecting).also { enrollments += it }
-                    }, setups, { now }, process.lifecycle, { wait(it) }, { uptime }, { boot }) as T
+                    }, setups, { now }, process.lifecycle, { wait(it) }, { uptime }, { boot }, retries) as T
             }
         armed = true
         return ViewModelProvider.create(owner, factory)[ChatViewModel::class.java]

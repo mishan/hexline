@@ -67,6 +67,7 @@ import org.foggyden.hexline.identity.EnrollProblem
 import org.foggyden.hexline.identity.Enrolling
 import org.foggyden.hexline.identity.HolderRefusal
 import org.foggyden.hexline.identity.Renewing
+import org.foggyden.hexline.identity.Resetting
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
 import org.foggyden.hexline.identity.Revoking
@@ -119,6 +120,7 @@ fun ConnectFlow(
     /** Whether [identities] has been read yet: a selection is not judged against the list before it has. */
     identitiesRead: Boolean = false,
     revoking: Revoking = Revoking.Idle,
+    resetting: Resetting = Resetting.Idle,
     /** Each rotation sent, by the identity it moves away from. */
     rotations: Map<String, KeptRotation> = emptyMap(),
 ) {
@@ -158,6 +160,7 @@ fun ConnectFlow(
             certifying,
             revoking,
             setup,
+            resetting,
         ) { devicesFor = null }
     } else if (enrolling.open) {
         val renewing = enrolling.renewing?.let { fp -> identities.find { it.fingerprint == fp } }

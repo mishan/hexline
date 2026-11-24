@@ -6,6 +6,7 @@ import org.foggyden.hexline.core.Certified
 import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.DeviceStanding
 import org.foggyden.hexline.core.DeviceStandings
+import org.foggyden.hexline.core.DevicesReset
 import org.foggyden.hexline.core.Evidence
 import org.foggyden.hexline.core.HeldRestore
 import org.foggyden.hexline.core.HolderCommitted
@@ -13,7 +14,9 @@ import org.foggyden.hexline.core.HolderKept
 import org.foggyden.hexline.core.HolderRequest
 import org.foggyden.hexline.core.ListedDevice
 import org.foggyden.hexline.core.NewIdentity
+import org.foggyden.hexline.core.NotYetReset
 import org.foggyden.hexline.core.PostOutcome
+import org.foggyden.hexline.core.ResetRetried
 import org.foggyden.hexline.core.Restored
 import org.foggyden.hexline.core.RevokeReason
 import org.foggyden.hexline.core.SecretKind
@@ -273,6 +276,84 @@ class FakeSetups : HolderSetups {
     var floor = 0L
 
     override fun floor(card: ByteArray) = floor
+
+    /** What the next reset leaves undone, and of that what a retry is kept for, with the retry and when it is due. */
+    var resetNotDone: List<NotYetReset> = emptyList()
+    var resetLater: List<String> = emptyList()
+    var resetRetry: ByteArray? = null
+    var resetRetryIn: Long? = null
+    var resetDone: List<String> = listOf("reg.example")
+
+    /** What the next reset throws before it posts anything. */
+    var resetFails: CoreException? = null
+
+    /** What the next reset throws once it has posted, the floor raised. */
+    var resetFailsAfterPosting: CoreException? = null
+
+    /** Held until completed, where set: a reset under way while the test acts. */
+    var resetWaits: CompletableDeferred<Unit>? = null
+
+    /** Called as a reset posts, with the identity seed, card, device seed and certificate it was handed. */
+    var onReset: (ByteArray, ByteArray, ByteArray, ByteArray) -> Unit = { _, _, _, _ -> }
+
+    /** The device epoch each reset was asked to reset from. */
+    val resets = mutableListOf<Long>()
+
+    override suspend fun resetDevices(
+        identitySeed: ByteArray,
+        card: ByteArray,
+        registrars: List<String>,
+        epoch: Long,
+        deviceSeed: ByteArray,
+        cert: ByteArray,
+    ): DevicesReset {
+        yield()
+        resets += epoch
+        resetWaits?.await()
+        resetFails?.let {
+            resetFails = null
+            throw it
+        }
+        // As the core's: the floor it keeps for the process rises as the reset posts.
+        val target = maxOf(epoch, floor) + 1
+        floor = target
+        onReset(identitySeed, card, deviceSeed, cert)
+        resetFailsAfterPosting?.let {
+            resetFailsAfterPosting = null
+            throw it
+        }
+        return DevicesReset(
+            epoch = target.toULong(),
+            published = target.toULong(),
+            done = resetDone,
+            notDone = resetNotDone,
+            notRegistrars = emptyList(),
+            cert = holderRenew(identitySeed, card, deviceSeed, cert, target.toULong()),
+            certEpoch = target.toULong(),
+            retry = resetRetry,
+            retryIn = resetRetryIn?.toULong(),
+            later = resetLater,
+        )
+    }
+
+    /** Each retry posted, as handed. */
+    val retried = mutableListOf<ByteArray>()
+
+    /** What each retry comes to, in turn: a result, or what it throws. */
+    val retryAnswers = ArrayDeque<() -> ResetRetried>()
+
+    /** Held until completed, where set: a retry under way while the test acts. */
+    var retryWaits: CompletableDeferred<Unit>? = null
+
+    override suspend fun retryReset(
+        retry: ByteArray,
+        card: ByteArray,
+    ): ResetRetried {
+        yield()
+        retried += retry
+        retryWaits?.await()
+        return checkNotNull(retryAnswers.removeFirstOrNull()) { "no answer for a retry" }()
+    }
 
     /** A session at a mailbox: what a device asks it, and how it ends, the test's; answered once, as the core's. */
     inner class FakeSession(

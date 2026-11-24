@@ -37,11 +37,13 @@ import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.CoreUpdate
 import org.foggyden.hexline.core.DeviceIdentity
 import org.foggyden.hexline.core.DeviceStanding
+import org.foggyden.hexline.core.DevicesReset
 import org.foggyden.hexline.core.Enrollment
 import org.foggyden.hexline.core.HolderKept
 import org.foggyden.hexline.core.KeptRotation
 import org.foggyden.hexline.core.ListedDevice
 import org.foggyden.hexline.core.LoginInfo
+import org.foggyden.hexline.core.NotYet
 import org.foggyden.hexline.core.Restored
 import org.foggyden.hexline.core.RevokeReason
 import org.foggyden.hexline.core.SecretKind
@@ -55,6 +57,7 @@ import org.foggyden.hexline.core.minPassphrase
 import org.foggyden.hexline.core.newerCard
 import org.foggyden.hexline.core.refusalLasts
 import org.foggyden.hexline.core.restoreIdentity
+import org.foggyden.hexline.identity.Absorbing
 import org.foggyden.hexline.identity.Backed
 import org.foggyden.hexline.identity.BackingUp
 import org.foggyden.hexline.identity.CertifySession
@@ -70,6 +73,11 @@ import org.foggyden.hexline.identity.Identities
 import org.foggyden.hexline.identity.MintedDevice
 import org.foggyden.hexline.identity.NewRecoveryCode
 import org.foggyden.hexline.identity.Renewing
+import org.foggyden.hexline.identity.ResetKept
+import org.foggyden.hexline.identity.ResetRetrier
+import org.foggyden.hexline.identity.ResetRetries
+import org.foggyden.hexline.identity.ResetShown
+import org.foggyden.hexline.identity.Resetting
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
 import org.foggyden.hexline.identity.Revoked
@@ -79,6 +87,7 @@ import org.foggyden.hexline.identity.Setup
 import org.foggyden.hexline.identity.SetupProblem
 import org.foggyden.hexline.identity.Standing
 import org.foggyden.hexline.identity.StoredIdentity
+import org.foggyden.hexline.identity.WorkResetRetries
 import org.foggyden.hexline.identity.certifyEnd
 import org.foggyden.hexline.identity.enrollProblem
 import org.foggyden.hexline.identity.restoreProblem
@@ -150,6 +159,8 @@ class ChatViewModel internal constructor(
     private val uptime: () -> Long = { SystemClock.elapsedRealtime() / 1000 },
     /** Which boot [uptime] counts from: a read made in another stands in for nothing. */
     private val boot: () -> String = { "" },
+    /** Where a reset's retries are asked for, to be made with the app closed. */
+    private val retries: ResetRetries,
 ) : AndroidViewModel(app) {
     /** The one the app makes: its own stores, the process's queue, the core's connections and the clock. */
     constructor(app: Application) : this(
@@ -176,9 +187,13 @@ class ChatViewModel internal constructor(
                 ?.toString()
                 .orEmpty()
         },
+        retries = WorkResetRetries(app),
     )
 
     private val store = queue.dispatcher
+
+    /** The one writer of what reads of the records found, shared with a reset's retries. */
+    private val absorber = Absorbing(identities, setups)
 
     /**
      * [work] on the store queue, kept to however the person leaves. A store
@@ -406,6 +421,11 @@ class ChatViewModel internal constructor(
                         }
                     }
                     publishIdentities()
+                    // A reset's retry kept from before, its work gone with an update or a wipe of the app's jobs.
+                    for (i in identities.list()) {
+                        val reset = i.reset ?: continue
+                        if (reset.retry != null) retries.ensure(i.fingerprint, reset.retryAt - now())
+                    }
                     stored { identities.sweepOrphans() }
                     held.sweep()
                     demoteHeld()
@@ -415,6 +435,16 @@ class ChatViewModel internal constructor(
                 }
             // Apart from the resume, which it is not to hold up: a holder may take minutes.
             launch { quiet.run() }
+            launch {
+                ResetRetrier.changed.collect { fingerprint ->
+                    val list =
+                        withContext(store) {
+                            publishIdentities()
+                            devicesOf(fingerprint)
+                        }
+                    if (devicesFor == fingerprint) mintedDevices.value = list
+                }
+            }
             postRotations()
             // A session left without leaving: take it up again, unless let go of while it was read.
             if (found == null || found.second == null || !ask.live) {
@@ -728,8 +758,13 @@ class ChatViewModel internal constructor(
                             held.use(fingerprint, authorizer) { seed -> setups.renew(seed, kept.card, device, kept.cert, epoch) }
                                 ?: return@keeping Renewing.Idle
                         // Only in place of the certificate it began from: one installed meanwhile stands.
-                        withContext(store) { identities.renewed(fingerprint, cert, replacing = kept.cert)?.also { publishIdentities() } }
-                            ?: return@keeping Renewing.Idle
+                        val list =
+                            withContext(store) {
+                                identities.renewed(fingerprint, cert, replacing = kept.cert)?.also { publishIdentities() }
+                                    ?: return@withContext null
+                                devicesOf(fingerprint)
+                            } ?: return@keeping Renewing.Idle
+                        if (devicesFor == fingerprint) mintedDevices.value = list
                         Renewing.Done(fingerprint)
                     }
                 } finally {
@@ -1043,7 +1078,16 @@ class ChatViewModel internal constructor(
         val kept = identities.list().find { it.fingerprint == fingerprint } ?: return null
         val info = kept.info
         val own =
-            MintedDevice(info.device, setups.deviceFingerprint(info.device), info.name, info.expires.toLong(), info.canManage, own = true)
+            MintedDevice(
+                info.device,
+                setups.deviceFingerprint(info.device),
+                info.name,
+                info.expires.toLong(),
+                info.canManage,
+                own = true,
+                epoch = info.epoch.toLong(),
+            )
+        val floor = identities.epoch(kept)
         val pending =
             unkept[fingerprint]
                 .orEmpty()
@@ -1061,8 +1105,8 @@ class ChatViewModel internal constructor(
         val merged =
             (listed.filter { l -> pending.none { it.device.contentEquals(l.device) } } + pending)
                 .filter { it.listed(now()) }
-        // One listed since the last read was not asked about.
-        val unchecked = merged.any { !read || it.fingerprint !in standing }
+        // One listed since the last read was not asked about; one below the floor is signed out whatever a read says.
+        val unchecked = merged.any { (!read || it.fingerprint !in standing) && it.epoch >= floor }
         val setAside = identities.mintedUnreadable(fingerprint)
         val seen =
             try {
@@ -1084,6 +1128,9 @@ class ChatViewModel internal constructor(
             standing,
             unchecked,
             confirmed,
+            floor,
+            kept.reset,
+            kept.registrar,
         )
     }
 
@@ -1242,39 +1289,11 @@ class ChatViewModel internal constructor(
     /** What the core has verified of [fingerprint]'s records kept, even as the model goes: [absorbing]. */
     private suspend fun absorb(fingerprint: String) = withContext(NonCancellable + store) { absorbing(fingerprint, null) }
 
-    /**
-     * The one writer of what reads of [fingerprint]'s records found, on the
-     * store queue: every key the core has verified revoked, and the floor,
-     * only ever added to, beside [whole] where a read was whole. What the
-     * disk will not take the core still holds for as long as this process
-     * lives, counted as kept and handed to the session, and written by the
-     * next; a whole read kept from before, which predates it, then stands
-     * in no more.
-     */
+    /** The one writer of what reads of [fingerprint]'s records found, on the store queue: [Absorbing]. */
     private fun absorbing(
         fingerprint: String,
         whole: WholeRead?,
-    ) {
-        val card = identities.list().find { it.fingerprint == fingerprint }?.card ?: return
-        val evidence = setups.evidence(card)
-        // The identity's epoch is the floor's home, the whole read's own among it: never the marker alone.
-        val floor = maxOf(evidence.floor, whole?.floor ?: 0uL).toLong()
-        try {
-            identities.learned(fingerprint, floor)
-        } catch (e: IOException) {
-            Log.w("hexline", "device epoch $floor not kept", e)
-        }
-        try {
-            identities.recordsRead(fingerprint, whole, evidence.revoked)
-        } catch (e: IOException) {
-            Log.w("hexline", "a read of the records not kept", e)
-            try {
-                identities.forgetRead(fingerprint)
-            } catch (e: IOException) {
-                Log.w("hexline", "a whole read not let go of", e)
-            }
-        }
-    }
+    ) = absorber.absorb(fingerprint, whole)
 
     /** [fingerprint]'s device epoch raised to [epoch], learned from its registrars, even as the model goes. */
     private suspend fun learn(
@@ -1500,6 +1519,110 @@ class ChatViewModel internal constructor(
 
     fun revokingSeen() {
         if (revocation.value !is Revoking.Working) revocation.value = Revoking.Idle
+    }
+
+    private val reset = MutableStateFlow<Resetting>(Resetting.Idle)
+
+    /** Resetting a held identity's devices. */
+    val resetting: StateFlow<Resetting> = reset
+
+    /**
+     * Signs out every device [fingerprint]'s key certified, at its registrars,
+     * behind [authorizer]'s prompt, this phone's own certified again past
+     * them. Noted as under way before anything is posted, so a process gone
+     * meanwhile leaves one offered again; what it came to kept in one
+     * write, and what it left for later retried.
+     */
+    fun resetDevices(
+        fingerprint: String,
+        authorizer: Authorizer,
+    ) {
+        if (reset.value is Resetting.Working || revocation.value is Revoking.Working || certifying.value is Certifying.Answering) return
+        reset.value = Resetting.Working(fingerprint)
+        viewModelScope.launch {
+            // Kept where a cancellation before the read returns cannot lose it, and wiped however this ends.
+            var deviceSeed: ByteArray? = null
+            reset.value =
+                try {
+                    keeping({ Resetting.Failed(fingerprint, it) }) {
+                        val kept =
+                            withContext(store) { identities.device(fingerprint)?.also { deviceSeed = it.second } }?.first
+                                ?: return@keeping Resetting.Idle
+                        val device = checkNotNull(deviceSeed)
+                        val epoch = withContext(store) { identities.epoch(kept) }
+                        val got =
+                            try {
+                                madeReset(fingerprint, kept, epoch, device, authorizer)
+                            } catch (e: CoreException.Refused) {
+                                val problem =
+                                    when (e.code) {
+                                        "busy" -> SetupProblem.ResetUnderWay
+                                        "no_registrar_reached" -> SetupProblem.NoRegistrarReached
+                                        "no_registrar" -> SetupProblem.NotARegistrar
+                                        else -> throw e
+                                    }
+                                return@keeping Resetting.Failed(fingerprint, problem)
+                            } ?: return@keeping Resetting.Idle
+                        Resetting.Done(fingerprint, ResetShown(got.done, got.notDone, got.notRegistrars, got.later))
+                    }
+                } finally {
+                    deviceSeed?.fill(0)
+                }
+            // Read again however it ended: what it signed out is shown as the registrars now say.
+            if (devicesFor == fingerprint) refreshDevices(fingerprint)
+        }
+    }
+
+    /** [fingerprint]'s reset made and kept: what it came to, or null where the prompt was refused or the identity is gone. */
+    private suspend fun madeReset(
+        fingerprint: String,
+        kept: StoredIdentity,
+        epoch: Long,
+        device: ByteArray,
+        authorizer: Authorizer,
+    ): DevicesReset? {
+        var begun = false
+        // Whether this one noted itself under way, rather than finding an earlier reset noted.
+        var noted = false
+        var got: DevicesReset? = null
+        try {
+            return held.use(fingerprint, authorizer) { seed ->
+                // Before anything is posted, and with no whole read from before it left to waive a check.
+                noted = withContext(store) { identities.resetBegun(fingerprint, now()) } ?: return@use null
+                begun = true
+                setups.resetDevices(seed, kept.card, listOfNotNull(kept.registrar), epoch, device, kept.cert).also { got = it }
+            }
+        } catch (e: CoreException.Refused) {
+            // Refused before anything was posted: this one is not under way, though an earlier one may be.
+            if (noted && e.code in BEFORE_POSTING) withContext(NonCancellable + store) { stored { identities.resetNotBegun(fingerprint) } }
+            throw e
+        } finally {
+            withContext(NonCancellable + store) {
+                got?.let { r ->
+                    val later = r.later.toSet()
+                    val unreset = r.notDone.filter { it.registrar !in later && it.why != NotYet.OVERTAKEN }.map { it.registrar }
+                    val outcome =
+                        ResetKept(
+                            r.epoch.toLong(),
+                            r.retry,
+                            r.retryIn?.let { now() + it.toLong() } ?: 0,
+                            r.later,
+                            unreset,
+                        )
+                    stored { identities.resetDone(fingerprint, r.cert, kept.cert, outcome) }
+                    if (r.retry != null) retries.schedule(fingerprint, r.retryIn?.toLong() ?: 0) else retries.cancel(fingerprint)
+                }
+                // What its reads verified, and the floor it raised, whatever it came to.
+                if (begun) absorbing(fingerprint, null)
+                publishIdentities()
+            }
+            // A read of the records begun before the reset answers for a floor it may not know: it is overtaken.
+            if (begun) standingReads[fingerprint] = (standingReads[fingerprint] ?: 0) + 1
+        }
+    }
+
+    fun resettingSeen() {
+        if (reset.value !is Resetting.Working) reset.value = Resetting.Idle
     }
 
     /** [act] on [fingerprint]'s seed, opened behind [authorizer]'s prompt, at its registrar. */
@@ -1891,6 +2014,8 @@ class ChatViewModel internal constructor(
     fun deleteIdentity(fingerprint: String) {
         // A code shown for it answers nothing more: a certificate made and not yet sent is not.
         if (sessionFor == fingerprint) session?.cancel()
+        // A retry under way finds no reset kept, and writes nothing back.
+        retries.cancel(fingerprint)
         // A read of its records under way says nothing of where its devices stand from now on, nor
         // stands in as a whole read for one held again: it is overtaken. With the identity gone, the
         // store has nothing to write what it found into.
@@ -2282,5 +2407,8 @@ class ChatViewModel internal constructor(
 
         /** What a device said no to is told, on its own screen. */
         const val DENIED = "declined on the holder's phone"
+
+        /** What the core refuses a reset with before it posts anything. */
+        val BEFORE_POSTING = setOf("no_registrar", "no_registrar_reached", "busy", "wrong_identity", "no_epoch_left")
     }
 }

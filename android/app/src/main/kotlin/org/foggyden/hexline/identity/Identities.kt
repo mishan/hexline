@@ -72,12 +72,44 @@ data class StoredIdentity(
      * while it cannot ask its registrars, a cache they correct. Only rises.
      */
     val epoch: Long = 0,
+    /** This phone's last reset of the identity's devices, as far as it knows it. */
+    val reset: ResetKept? = null,
 ) {
     /** As held here, the model's word for it. */
     fun held(): StoredIdentity = copy(held = true)
 
     /** The identity, in the form the core gives it: the only one to pass back. */
     val fingerprint: String get() = info.fingerprint
+}
+
+/**
+ * A reset of an identity's devices made here: its epoch, what is left to
+ * post later and when, and the registrars it has not reached. Kept so a
+ * reset that a registrar has not taken is never shown as one it has.
+ */
+data class ResetKept(
+    /** The epoch reset to (the core's `DevicesReset.epoch`); 0 before one has come back. */
+    val epoch: Long = 0,
+    /** What `retry_reset` posts to [pending], opaque; null with nothing to post. */
+    val retry: ByteArray? = null,
+    /** When [retry] is next worth posting, in seconds. */
+    val retryAt: Long = 0,
+    /** Registrars [retry] is kept for, by the address the core named them by. */
+    val pending: List<String> = emptyList(),
+    /** Registrars the reset is not at and no retry will reach: only a new reset does. */
+    val unreset: List<String> = emptyList(),
+    /** Of the registrars no retry will reach, those retried until they were given up on. */
+    val givenUp: List<String> = emptyList(),
+    /**
+     * When a reset was begun whose outcome is not kept: it may have posted
+     * anything, so the screen offers another. Null when none is.
+     */
+    val underWay: Long? = null,
+    /** Part of what was kept did not read: a reset may not have finished, as with [underWay]. */
+    val unread: Boolean = false,
+) {
+    /** Whether a reset may have gone further than this phone knows. */
+    val uncertain: Boolean get() = underWay != null || unread
 }
 
 /**
@@ -150,6 +182,8 @@ class Identities(
                     rotatingFrom = rotatingFrom ?: before?.rotatingFrom,
                     rotation = rotation ?: before?.rotation,
                     epoch = maxOf(info.epoch.toLong(), before?.epoch ?: 0),
+                    // A reset is the identity's: another device of it here still has one to finish.
+                    reset = before?.reset,
                 )
             write(file, stored)
             before?.let { old ->
@@ -259,7 +293,8 @@ class Identities(
                 } catch (_: java.io.IOException) {
                     0
                 }
-            maxOf(stored.epoch, listed)
+            // And of its own certificate, which a reset mints past the floor before the floor is written.
+            maxOf(stored.epoch, listed, stored.info.epoch.toLong())
         }
 
     /** [fingerprint]'s device epoch raised to [epoch], learned from its registrars; nothing if it is not kept or knew it. */
@@ -271,6 +306,88 @@ class Identities(
             val file = file(fingerprint)
             val stored = load(file)?.takeIf { it.epoch < epoch } ?: return
             write(file, stored.copy(epoch = epoch))
+        }
+
+    /**
+     * A reset of [fingerprint]'s devices begun at [at], before anything is
+     * posted: its last whole read let go of first, so no read from before
+     * the reset waives a check while the reset's outcome is unknown, then
+     * the reset noted as under way, unless an earlier one whose outcome is
+     * unknown is noted already: it may still have posted. Whether this
+     * noted it, or null, with nothing begun, if the identity is not kept;
+     * throws an [java.io.IOException] the disk gives.
+     */
+    fun resetBegun(
+        fingerprint: String,
+        at: Long,
+    ): Boolean? =
+        synchronized(LOCK) {
+            val file = file(fingerprint)
+            val stored = load(file) ?: return null
+            val kept = kept(fingerprint)
+            if (kept.read != null) writeMinted(fingerprint, Kept(kept.devices, kept.seen, kept.certified, null))
+            if (stored.reset?.underWay != null) return false
+            write(file, stored.copy(reset = (stored.reset ?: ResetKept()).copy(underWay = at)))
+            true
+        }
+
+    /** [fingerprint]'s reset, which [resetBegun] noted, noted as under way no longer: it was refused before anything was posted. */
+    fun resetNotBegun(fingerprint: String): Unit =
+        synchronized(LOCK) {
+            val file = file(fingerprint)
+            val stored = load(file) ?: return
+            val reset = stored.reset?.takeIf { it.underWay != null } ?: return
+            write(file, stored.copy(reset = reset.copy(underWay = null).takeIf { it != ResetKept() }))
+        }
+
+    /**
+     * What [fingerprint]'s reset came to, in one write: [reset] in place of
+     * whatever was kept of an earlier one, and [cert], this phone's own
+     * certificate minted again by it, in place of [replacing] or of one
+     * below it, a renewal that raced the reset being minted below the
+     * floor. One installed meanwhile at the reset's epoch or past it
+     * stands. The epoch is left to the floor's own writer. Throws the
+     * core's refusal if [cert] is not this device's; null, writing
+     * nothing, if the identity is not kept.
+     */
+    fun resetDone(
+        fingerprint: String,
+        cert: ByteArray,
+        replacing: ByteArray,
+        reset: ResetKept,
+    ): StoredIdentity? =
+        synchronized(LOCK) {
+            val file = file(fingerprint)
+            val stored = load(file) ?: return null
+            val info = certInfo(cert, stored.card, stored.info.device, stored.info.deviceEnc)
+            val swap = stored.cert.contentEquals(replacing) || stored.info.epoch < info.epoch
+            val cleared = reset.copy(underWay = null, unread = false)
+            val done =
+                if (swap) {
+                    stored.copy(cert = cert, info = info, renewTried = 0, noHolder = false, reset = cleared)
+                } else {
+                    stored.copy(reset = cleared)
+                }
+            done.also { write(file, it) }
+        }
+
+    /**
+     * What a retry of [fingerprint]'s reset to [epoch] came to, as [change]
+     * makes it of what is kept: only while that reset is the one kept, so a
+     * retry outliving a newer reset writes nothing over it, and never for
+     * an identity no longer kept. Throws an [java.io.IOException] the disk
+     * gives.
+     */
+    fun retried(
+        fingerprint: String,
+        epoch: Long,
+        change: (ResetKept) -> ResetKept,
+    ): Unit =
+        synchronized(LOCK) {
+            val file = file(fingerprint)
+            val stored = load(file) ?: return
+            val reset = stored.reset?.takeIf { epoch != 0L && it.epoch == epoch } ?: return
+            write(file, stored.copy(reset = change(reset)))
         }
 
     /** [fingerprint]'s setup, its key gone before it was committed: no longer to be finished. */
@@ -930,11 +1047,65 @@ class Identities(
                 rotatingFrom = json.optString("rotating_from").ifEmpty { null },
                 rotation = json.optString("rotation").ifEmpty { null }?.let(::unb64),
                 epoch = json.optLong("epoch"),
+                reset = json.opt("reset")?.let(::resetOf),
             )
         } catch (_: Exception) {
             null
         }
     }
+
+    /**
+     * A reset as kept, each part read apart: what does not read is told as
+     * [ResetKept.unread] rather than as no reset, so the screen says one may
+     * not have finished.
+     */
+    private fun resetOf(value: Any): ResetKept {
+        val json = value as? JSONObject ?: return ResetKept(unread = true)
+        var unread = false
+
+        fun <T> part(
+            name: String,
+            none: T,
+            read: () -> T,
+        ): T {
+            if (!json.has(name)) return none
+            return try {
+                read()
+            } catch (_: Exception) {
+                unread = true
+                none
+            }
+        }
+
+        fun names(name: String) =
+            part(name, emptyList()) {
+                val list = json.getJSONArray(name)
+                (0 until list.length()).map { list.getString(it) }
+            }
+        val reset =
+            ResetKept(
+                epoch = part("epoch", 0L) { json.getLong("epoch") },
+                retry = part("retry", null) { unb64(json.get("retry") as String) },
+                retryAt = part("retry_at", 0L) { json.getLong("retry_at") },
+                pending = names("pending"),
+                unreset = names("unreset"),
+                givenUp = names("given_up"),
+                underWay = part("under_way", null) { json.getLong("under_way") },
+            )
+        return reset.copy(unread = unread || json.optBoolean("unread"))
+    }
+
+    private fun resetJson(reset: ResetKept) =
+        JSONObject().apply {
+            if (reset.epoch != 0L) put("epoch", reset.epoch)
+            reset.retry?.let { put("retry", b64(it)) }
+            if (reset.retryAt != 0L) put("retry_at", reset.retryAt)
+            if (reset.pending.isNotEmpty()) put("pending", JSONArray(reset.pending))
+            if (reset.unreset.isNotEmpty()) put("unreset", JSONArray(reset.unreset))
+            if (reset.givenUp.isNotEmpty()) put("given_up", JSONArray(reset.givenUp))
+            reset.underWay?.let { put("under_way", it) }
+            if (reset.unread) put("unread", true)
+        }
 
     private fun write(
         file: File,
@@ -957,6 +1128,7 @@ class Identities(
                     stored.rotatingFrom?.let { put("rotating_from", it) }
                     stored.rotation?.let { put("rotation", b64(it)) }
                     if (stored.epoch != 0L) put("epoch", stored.epoch)
+                    stored.reset?.let { put("reset", resetJson(it)) }
                 }
         commit(file, json.toString().toByteArray())
     }

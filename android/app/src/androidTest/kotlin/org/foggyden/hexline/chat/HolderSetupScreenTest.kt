@@ -30,6 +30,7 @@ import org.foggyden.hexline.core.Caps
 import org.foggyden.hexline.core.Certified
 import org.foggyden.hexline.core.DeviceStanding
 import org.foggyden.hexline.core.DeviceStandings
+import org.foggyden.hexline.core.DevicesReset
 import org.foggyden.hexline.core.Evidence
 import org.foggyden.hexline.core.HeldRestore
 import org.foggyden.hexline.core.HolderCommitted
@@ -40,6 +41,7 @@ import org.foggyden.hexline.core.HolderSetupInterface
 import org.foggyden.hexline.core.ListedDevice
 import org.foggyden.hexline.core.PostOutcome
 import org.foggyden.hexline.core.Qr
+import org.foggyden.hexline.core.ResetRetried
 import org.foggyden.hexline.core.RevokeReason
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.certForDevice
@@ -55,6 +57,7 @@ import org.foggyden.hexline.identity.HolderSetups
 import org.foggyden.hexline.identity.Identities
 import org.foggyden.hexline.identity.NewRecoveryCode
 import org.foggyden.hexline.identity.Renewing
+import org.foggyden.hexline.identity.ResetRetries
 import org.foggyden.hexline.identity.SettingUp
 import org.foggyden.hexline.identity.Setup
 import org.foggyden.hexline.secrets.KeystoreHolderKeys
@@ -145,6 +148,7 @@ class HolderSetupScreenTest {
                         OfflineSetups,
                         { System.currentTimeMillis() / 1000 },
                         ProcessLifecycleOwner.get().lifecycle,
+                        retries = NoRetries,
                     ) as T
             }
         var vm: ChatViewModel? = null
@@ -449,6 +453,35 @@ class HolderSetupScreenTest {
             registrar: String,
             record: ByteArray,
         ): PostOutcome = error("no registrar here")
+
+        override suspend fun resetDevices(
+            identitySeed: ByteArray,
+            card: ByteArray,
+            registrars: List<String>,
+            epoch: Long,
+            deviceSeed: ByteArray,
+            cert: ByteArray,
+        ): DevicesReset = error("no registrar here")
+
+        override suspend fun retryReset(
+            retry: ByteArray,
+            card: ByteArray,
+        ): ResetRetried = error("no registrar here")
+    }
+
+    /** No reset is made here, so none is retried. */
+    private object NoRetries : ResetRetries {
+        override fun schedule(
+            fingerprint: String,
+            inSecs: Long,
+        ) = Unit
+
+        override fun ensure(
+            fingerprint: String,
+            inSecs: Long,
+        ) = Unit
+
+        override fun cancel(fingerprint: String) = Unit
     }
 
     /** A mailbox that hands over the request the test makes, and certifies with the seed it is handed. */

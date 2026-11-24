@@ -6,6 +6,7 @@ import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.DeviceStanding
 import org.foggyden.hexline.core.HolderRequest
 import org.foggyden.hexline.core.HolderSessionInterface
+import org.foggyden.hexline.core.NotYetReset
 import org.foggyden.hexline.core.Qr
 import org.foggyden.hexline.core.certTime
 import org.foggyden.hexline.core.certifyEnd
@@ -130,9 +131,53 @@ data class DeviceList(
     val unchecked: Boolean = false,
     /** The devices, by fingerprint, whose revocation a read of the records has shown: confirmed, whatever their standing reads as. */
     val confirmed: Set<String> = emptySet(),
+    /** The identity's device epoch kept here: a device certified below it was signed out by a reset. */
+    val floor: Long = 0,
+    /** The identity's last reset made here, if any. */
+    val reset: ResetKept? = null,
+    /** The registrar the identity is kept at, which a reset is made at with those its card names. */
+    val registrar: String? = null,
 ) {
     /** Whether [device] is revoked, as this phone marked it or as the registrars publish it. */
     fun revoked(device: MintedDevice) = device.revoked || standing[device.fingerprint] == DeviceStanding.REVOKED
+
+    /**
+     * Whether [device] was signed out by a reset: as the registrars say, or,
+     * where they have not been read since, as this phone's own floor does.
+     */
+    fun signedOut(device: MintedDevice) = standing[device.fingerprint] == DeviceStanding.SIGNED_OUT || device.epoch < floor
+}
+
+/** What a reset came to, as the screen tells it. */
+data class ResetShown(
+    val done: List<String>,
+    val notDone: List<NotYetReset>,
+    val notRegistrars: List<String>,
+    /** Of [notDone], those a retry is kept for. */
+    val later: List<String>,
+)
+
+/** Resetting a held identity's devices. */
+sealed interface Resetting {
+    val identity: String?
+
+    data object Idle : Resetting {
+        override val identity: String? = null
+    }
+
+    data class Working(
+        override val identity: String,
+    ) : Resetting
+
+    data class Done(
+        override val identity: String,
+        val reset: ResetShown,
+    ) : Resetting
+
+    data class Failed(
+        override val identity: String,
+        val problem: SetupProblem,
+    ) : Resetting
 }
 
 /** A device certified by a held identity's key on this phone, this phone's own among them. */
