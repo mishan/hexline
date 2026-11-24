@@ -1,6 +1,7 @@
 package org.foggyden.hexline.chat
 
 import androidx.lifecycle.ViewModelStore
+import kotlinx.coroutines.CompletableDeferred
 import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.NewIdentity
 import org.foggyden.hexline.core.SecretKind
@@ -20,6 +21,7 @@ import org.foggyden.hexline.servers.SignIn
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -222,6 +224,41 @@ class HolderSetupFlowTest : ViewModelHarness() {
         assertTrue(stores.held.isHeld(identity.fingerprint))
         assertEquals(identity.fingerprint, keptIdentities().single().fingerprint)
         assertTrue("its seed wiped", setups.handed.single().all { it == 0.toByte() })
+    }
+
+    @Test
+    fun whatARestoreReadOfTheRecordsIsKeptWithTheIdentity() {
+        val identity = newIdentity("Dana")
+        setups.restores = identity
+        val lost = ByteArray(32) { 7 }
+        setups.verified(identity.card, lost)
+        val vm = model()
+        settle()
+        vm.restore("reg.example", "dana", SecretKind.RECOVERY_CODE, "code", "Pixel", stores.keys.authorizer())
+        settle()
+        assertEquals(listOf(lost.toList()), outside { identities.seenRevoked(identity.fingerprint) }.map { it.toList() })
+    }
+
+    @Test
+    fun aReadOfTheRecordsBegunBeforeItsIdentityWasDeletedWritesNothingIntoTheOneHeldAgain() {
+        val identity = newIdentity("Dana")
+        setups.restores = identity
+        val vm = model()
+        settle()
+        vm.restore("reg.example", "dana", SecretKind.RECOVERY_CODE, "code", "Pixel", stores.keys.authorizer())
+        settle()
+        val held = CompletableDeferred<Unit>()
+        setups.standingWaits = held
+        vm.openDevices(identity.fingerprint)
+        settle()
+        vm.deleteIdentity(identity.fingerprint)
+        settle()
+        vm.restore("reg.example", "dana", SecretKind.RECOVERY_CODE, "code", "Pixel", stores.keys.authorizer())
+        settle()
+        setups.standingWaits = null
+        held.complete(Unit)
+        settle()
+        assertNull("no read of this lifetime stands in", outside { identities.lastRead(identity.fingerprint) })
     }
 
     @Test

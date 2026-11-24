@@ -26,14 +26,15 @@ pub use connection::{
     ClassicLogin, CoreError, CoreUpdate, DeviceIdentity, LoginInfo, ServerConnection, UpdateSink,
 };
 pub use enroll::{card_name, enrollment_code, newer_card, renewal_due, Enrolled, Enrollee};
-pub use epoch::held_floor;
+pub use epoch::{held_floor, read_evidence, Evidence, WholeRead};
 pub use holder::{
     check_device_name, check_holder_registrar, held_renewal, holder_mint, holder_renew,
     new_identity, HeldRenewal, HolderCommitted, HolderMinted, HolderSetup, NewIdentity,
 };
 pub use holder_session::{
-    certify_end, device_fingerprint_of, open_holder_session, revoke_device, Certified, CertifyEnd,
-    HolderKept, HolderRequest, HolderSession, ListedDevice, Qr, RevokeReason,
+    certify_end, device_fingerprint_of, device_standing, open_holder_session, revoke_device,
+    Certified, CertifyEnd, DeviceStanding, DeviceStandings, HolderKept, HolderRequest,
+    HolderSession, ListedDevice, Qr, RevokeReason,
 };
 pub use identity::{
     cert_for_device, cert_info, cert_time, new_device, CertInfo, CertTime, NewDevice,

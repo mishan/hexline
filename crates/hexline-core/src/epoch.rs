@@ -60,6 +60,77 @@ pub fn held_floor(card: Vec<u8>) -> u64 {
     }
 }
 
+/// Every device revocation a read of each identity's records verified in
+/// this process, kept page by page as it is read: [`published`] is the one
+/// reader, so a read that fails on a later page, or whose caller refuses
+/// or fails after, loses nothing it verified.
+static SEEN: Mutex<BTreeMap<PublicKey, Vec<DeviceRevocation>>> = Mutex::new(BTreeMap::new());
+
+/// `revocation`, verified, kept as seen for `identity`.
+fn saw(identity: &PublicKey, revocation: &DeviceRevocation) {
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let all = seen.entry(*identity).or_default();
+    if !all.contains(revocation) {
+        all.push(revocation.clone());
+    }
+}
+
+/// What this process has verified of an identity's records, whatever
+/// became of each read: every key a revocation it verified names, and
+/// `floor`, the highest it has learned.
+#[derive(Debug, Clone, Default, PartialEq, uniffi::Record)]
+pub struct Evidence {
+    pub revoked: Vec<Vec<u8>>,
+    pub floor: u64,
+}
+
+/// What this process has verified of the records of the identity whose
+/// card is `card`, for the app to keep: it only ever grows, so one asked
+/// for late still holds all of it. Nothing for a card that does not read.
+#[uniffi::export]
+pub fn read_evidence(card: Vec<u8>) -> Evidence {
+    let Ok(card) = hl_identity::Card::parse(&card) else {
+        return Evidence::default();
+    };
+    evidence_of(&card.identity)
+}
+
+pub(crate) fn evidence_of(identity: &PublicKey) -> Evidence {
+    let floor = floor_of(identity);
+    let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    // Every key seen revoked, whatever floor its signer was at: what this
+    // hands the app never shrinks, so a floor risen since takes back none.
+    let mut revoked: Vec<Vec<u8>> = Vec::new();
+    for r in seen.get(identity).into_iter().flatten() {
+        if !revoked.contains(&r.device.to_vec()) {
+            revoked.push(r.device.to_vec());
+        }
+    }
+    Evidence { revoked, floor }
+}
+
+/// Whether a read of `identity`'s records in this process verified a
+/// revocation of `device`. It takes no lock but the store's own, so it
+/// may be asked with the floor's held, as a mint asks it.
+pub(crate) fn seen_revoked(identity: &PublicKey, device: &PublicKey) -> bool {
+    let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    seen.get(identity)
+        .is_some_and(|all| all.iter().any(|r| r.device == *device))
+}
+
+/// `record`, verified from `identity`'s records, kept as evidence: the
+/// floor an epoch record raises, and a revocation as seen. Each reader of
+/// the records calls it on every record as its page is verified.
+pub(crate) fn kept_record(identity: &PublicKey, record: &Record) {
+    match record {
+        Record::DeviceEpoch(r) if r.identity == *identity => {
+            at_floor(identity, r.epoch, |_| ());
+        }
+        Record::RevokeDevice(r) if r.identity == *identity => saw(identity, r),
+        _ => {}
+    }
+}
+
 /// The highest device epoch this process has learned for `identity`.
 pub(crate) fn floor_of(identity: &PublicKey) -> u64 {
     let floors = FLOORS.lock().unwrap_or_else(|e| e.into_inner());
@@ -75,6 +146,8 @@ pub(crate) struct Published {
     pub(crate) time: u64,
     pub(crate) hash: Option<[u8; 32]>,
     pub(crate) revocations: Vec<DeviceRevocation>,
+    /// The registrars whose lists were read, as they were named.
+    pub(crate) read: Vec<String>,
 }
 
 impl Published {
@@ -83,6 +156,7 @@ impl Published {
             (self.epoch, self.time, self.hash) = (other.epoch, other.time, other.hash);
         }
         self.revocations.extend(other.revocations);
+        self.read.extend(other.read);
     }
 }
 
@@ -102,10 +176,20 @@ pub(crate) fn signed_out(
 ) -> bool {
     prev.is_some_and(|p| p.check_floor(floor).is_err())
         || listed.iter().any(|(d, e)| d == device && *e < floor)
-        || published.revocations.iter().any(|r| {
-            let below = r.check_signer_floor(floor).is_err();
-            (r.device == *device && !below) || (r.signer.as_ref() == Some(device) && below)
-        })
+        || revoked(device, floor, published)
+        || published
+            .revocations
+            .iter()
+            .any(|r| r.signer.as_ref() == Some(device) && r.check_signer_floor(floor).is_err())
+}
+
+/// Whether a revocation that stands at `floor` names `device`: one by the
+/// identity, or by a device certified at or past the floor.
+pub(crate) fn revoked(device: &PublicKey, floor: u64, published: &Published) -> bool {
+    published
+        .revocations
+        .iter()
+        .any(|r| r.device == *device && r.check_signer_floor(floor).is_ok())
 }
 
 /// What `registrars` publish of `identity`, each reached at its base and
@@ -124,7 +208,8 @@ pub(crate) async fn published_at(
             let base = registrar_base(&registrar)?;
             let http = auth::http_client(base.as_str(), None)?;
             let reg = discovered(&http, &base).await?;
-            let p = published(&http, &base, &reg, &identity).await?;
+            let mut p = published(&http, &base, &reg, &identity).await?;
+            p.read.push(registrar);
             // Kept as it is read, so a wait given up on before the others
             // answer still learns it.
             at_floor(&identity, p.epoch, |_| ());
@@ -144,7 +229,6 @@ pub(crate) async fn published_at(
 /// phone set it up or restored it, and each its card's attestations
 /// name, as a host reached over https, each origin once.
 pub(crate) fn registrars_of(kept: &[String], card: &hl_identity::Card) -> Vec<String> {
-    let origin = |r: &str| registrar_base(r).ok().map(|b| b.origin());
     let mut out: Vec<String> = Vec::new();
     let attested = card
         .attestations
@@ -152,14 +236,107 @@ pub(crate) fn registrars_of(kept: &[String], card: &hl_identity::Card) -> Vec<St
         .filter(|a| a.identity == card.identity)
         .map(|a| &a.registrar);
     for r in kept.iter().chain(attested) {
-        let seen = out
-            .iter()
-            .any(|o| o == r || origin(o).is_some_and(|o| Some(o) == origin(r)));
+        let seen = out.iter().any(|o| same_registrar(o, r));
         if !seen {
             out.push(r.clone());
         }
     }
     out
+}
+
+/// How long a complete read of an identity's records stands in for one
+/// that is not.
+pub(crate) const READ_STANDS: u64 = 24 * 3600;
+
+/// How far the wall clock and the clock since boot may drift apart over a
+/// read's [`READ_STANDS`] before the read is not trusted to be as recent as
+/// the wall clock says.
+pub(crate) const CLOCKS_DRIFT: u64 = 600;
+
+/// The last complete read of an identity's records this phone keeps: when,
+/// in seconds by the wall clock and by the phone's clock since boot, the
+/// boot that clock counts from (opaque, the platform's), and the
+/// registrars it reached, every one kept for the identity then.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct WholeRead {
+    pub at: u64,
+    pub uptime: u64,
+    pub boot: String,
+    pub registrars: Vec<String>,
+    /// The floor learned as it was read, which it stands in with: a read
+    /// is never taken without the floor it saw.
+    pub floor: u64,
+}
+
+/// Seconds since boot, time asleep counted, where the platform says.
+pub(crate) fn boot_secs() -> Option<u64> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid timespec for the call to write.
+        let ok = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } == 0;
+        ok.then_some(ts.tv_sec as u64)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    None
+}
+
+/// Whether `published` was read from every registrar in `kept`, where this
+/// phone posts its revocations, or with none kept, from any of
+/// `registrars`; vacuously where there are none to read.
+pub(crate) fn read_whole(kept: &[String], registrars: &[String], published: &Published) -> bool {
+    match kept.is_empty() {
+        true => registrars.is_empty() || !published.read.is_empty(),
+        false => kept
+            .iter()
+            .all(|k| published.read.iter().any(|r| same_registrar(r, k))),
+    }
+}
+
+/// Whether `device`'s revocation is unknown on what was read: a key this
+/// identity may have revoked, one `listed` here or asking with a `prev` it
+/// signed, where the read is not `whole` and `last` does not stand in for
+/// it. A key known to neither could only have been revoked elsewhere,
+/// which the records alone say.
+pub(crate) fn standing_unknown(
+    device: &PublicKey,
+    prev: bool,
+    listed: &[(PublicKey, u64)],
+    whole: bool,
+    last: Option<&WholeRead>,
+    kept: &[String],
+    (now, uptime, boot): (u64, u64, &str),
+) -> bool {
+    let known = prev || listed.iter().any(|(d, _)| d == device);
+    // A boot not known stands in for nothing, so a read made in one is never taken for this one's.
+    let same_boot = |l: &WholeRead| !boot.is_empty() && l.boot == boot;
+    known && !whole && !last.is_some_and(|l| same_boot(l) && stands(l, kept, now, uptime))
+}
+
+/// Whether `last` stands in for a read that is not whole: within
+/// [`READ_STANDS`] by the wall clock and by the clock since boot alike,
+/// so a wall clock moved since makes it count for nothing, and of every
+/// registrar `kept` now. The caller holds it to the same boot.
+fn stands(last: &WholeRead, kept: &[String], now: u64, uptime: u64) -> bool {
+    let (Some(wall), Some(booted)) = (now.checked_sub(last.at), uptime.checked_sub(last.uptime))
+    else {
+        return false;
+    };
+    wall <= READ_STANDS
+        && booted <= READ_STANDS
+        && wall.abs_diff(booted) <= CLOCKS_DRIFT
+        && kept
+            .iter()
+            .all(|k| last.registrars.iter().any(|r| same_registrar(r, k)))
+}
+
+/// Whether `a` and `b` name one registrar: the same text, or one origin.
+pub(crate) fn same_registrar(a: &str, b: &str) -> bool {
+    let origin = |r: &str| registrar_base(r).ok().map(|b| b.origin());
+    a == b || origin(a).is_some_and(|o| Some(o) == origin(b))
 }
 
 /// What `reg`'s per-identity records list says of `identity`, page after
@@ -200,7 +377,12 @@ pub(crate) async fn published(
                 detail: "the identity's records do not read".into(),
             })?;
         for (_, bytes) in &list.entries {
-            match Record::parse(bytes, Some(keys)) {
+            let record = Record::parse(bytes, Some(keys));
+            // Kept as it is verified, whatever the pages after it come to.
+            if let Ok(record) = &record {
+                kept_record(identity, record);
+            }
+            match record {
                 Ok(Record::DeviceEpoch(r)) if r.identity == *identity && r.epoch >= out.epoch => {
                     use sha2::Digest;
                     (out.epoch, out.time) = (r.epoch, r.time);
@@ -231,6 +413,16 @@ pub(crate) mod tests {
     /// A registrar at 127.0.0.1 publishing `records` for whoever is asked
     /// about, `per_page` to a page, and answering anything else 404.
     pub(crate) async fn registrar_publishing(records: Vec<Vec<u8>>, per_page: usize) -> Url {
+        registrar_failing(records, per_page, usize::MAX).await
+    }
+
+    /// As [`registrar_publishing`], answering 503 for every page from the
+    /// `from`th record on.
+    pub(crate) async fn registrar_failing(
+        records: Vec<Vec<u8>>,
+        per_page: usize,
+        from: usize,
+    ) -> Url {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let key = ServerKey::from_seed(&[5; 32]);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -254,7 +446,14 @@ pub(crate) mod tests {
                         Some((fp, s)) => (fp, Some(s.parse::<u64>().unwrap())),
                         None => (rest, None),
                     };
-                    let from = since.map_or(0, |s| s as usize);
+                    let from_seq = since.map_or(0, |s| s as usize);
+                    if from_seq >= from {
+                        let reply =
+                            "HTTP/1.1 503 X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                        let _ = s.write_all(reply.as_bytes()).await;
+                        continue;
+                    }
+                    let from = from_seq;
                     let page: Vec<_> = records
                         .iter()
                         .enumerate()
@@ -308,7 +507,7 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    fn revocation(id: &IdentityKey, device: PublicKey) -> Vec<u8> {
+    pub(crate) fn revocation(id: &IdentityKey, device: PublicKey) -> Vec<u8> {
         DeviceRevocation {
             identity: id.public(),
             device,
@@ -501,5 +700,31 @@ pub(crate) mod tests {
             let kept: Vec<String> = kept.into_iter().map(String::from).collect();
             assert_eq!(registrars_of(&kept, &card), want, "{kept:?}");
         }
+    }
+
+    #[test]
+    fn a_key_seen_revoked_stays_in_the_evidence_whatever_floor_is_learned_after() {
+        let id = IdentityKey::generate();
+        let (lost, manager) = (DeviceKey::generate().public(), DeviceKey::generate());
+        let mut cert = DeviceCert::for_device(&id, &manager, 1_000, 1_000_000).unwrap();
+        cert.epoch = 1;
+        cert.caps = Some(hl_identity::caps::LOGIN | hl_identity::caps::MANAGE);
+        let signed = DeviceRevocation {
+            identity: id.public(),
+            device: lost,
+            time: 2_000,
+            until: 3_000,
+            reason: None,
+            signer: None,
+            signer_cert: None,
+        }
+        .sign_as_device(&manager, cert.sign(&id))
+        .unwrap();
+        let record = Record::parse(&signed, None).unwrap();
+        kept_record(&id.public(), &record);
+        // Past the floor its signer was certified at.
+        at_floor(&id.public(), 2, |_| ());
+        let evidence = evidence_of(&id.public());
+        assert_eq!((evidence.revoked, evidence.floor), (vec![lost.to_vec()], 2));
     }
 }

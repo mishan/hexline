@@ -44,6 +44,7 @@ import androidx.compose.ui.unit.dp
 import org.foggyden.hexline.R
 import org.foggyden.hexline.core.Caps
 import org.foggyden.hexline.core.CertifyEnd
+import org.foggyden.hexline.core.DeviceStanding
 import org.foggyden.hexline.core.Qr
 import org.foggyden.hexline.core.RevokeReason
 import org.foggyden.hexline.identity.Certifying
@@ -200,23 +201,35 @@ fun DevicesScreen(
         }
         if (devices?.setAside == true) {
             Problem(stringResource(R.string.devices_unreadable))
+            if (devices.setAsideLoses) Problem(stringResource(R.string.devices_discard_loses))
             TextButton({ actions.discardUnreadable(fingerprint) }) { Text(stringResource(R.string.devices_discard_unreadable)) }
         }
+        if (devices?.unchecked == true) {
+            Problem(stringResource(R.string.devices_unchecked))
+            TextButton({ actions.openDevices(fingerprint) }) { Text(stringResource(R.string.try_again)) }
+        }
         for (device in devices?.devices.orEmpty()) {
+            val revoked = devices?.revoked(device) == true
+            val signedOut = devices?.standing?.get(device.fingerprint) == DeviceStanding.SIGNED_OUT
+            // Revoked here, and no read has shown the registrar holds it.
+            val unconfirmed = device.revoked && devices?.confirmed?.contains(device.fingerprint) != true
             Column {
                 Text(device.name ?: stringResource(R.string.device_unnamed), style = MaterialTheme.typography.bodyLarge)
                 Text(stringResource(R.string.enroll_fingerprint, device.fingerprint), style = MaterialTheme.typography.bodySmall)
                 for (about in listOfNotNull(
                     stringResource(R.string.device_this_phone).takeIf { device.own },
-                    stringResource(R.string.device_revoked).takeIf { device.revoked },
-                    stringResource(R.string.device_revoking).takeIf { device.revoking && !device.revoked },
-                    stringResource(R.string.device_can_manage).takeIf { device.canManage && !device.revoked },
-                    stringResource(R.string.enroll_until, expiry(device.expires.toULong())).takeIf { !device.revoked },
+                    stringResource(R.string.device_revoked).takeIf { revoked },
+                    stringResource(R.string.device_unconfirmed).takeIf { unconfirmed },
+                    stringResource(R.string.device_signed_out).takeIf { signedOut && !revoked },
+                    stringResource(R.string.device_can_manage).takeIf { device.canManage && !revoked },
+                    stringResource(R.string.enroll_until, expiry(device.expires.toULong())).takeIf { !revoked },
                 )) {
                     Text(about, style = MaterialTheme.typography.bodySmall)
                 }
-                if (!device.own && !device.revoked) {
-                    TextButton({ revokingDevice = device }, enabled = !busy && !elsewhere) { Text(stringResource(R.string.revoke)) }
+                if (!device.own && (!revoked || unconfirmed)) {
+                    TextButton({ revokingDevice = device }, enabled = !busy && !elsewhere) {
+                        Text(stringResource(if (unconfirmed) R.string.revoke_again else R.string.revoke))
+                    }
                 }
             }
         }
@@ -314,6 +327,7 @@ private fun describe(why: CertifyEnd): String =
             CertifyEnd.UNREADABLE -> R.string.certify_unreadable
             CertifyEnd.NO_LOGIN -> R.string.certify_no_login
             CertifyEnd.SIGNED_OUT -> R.string.certify_signed_out
+            CertifyEnd.UNCHECKED -> R.string.certify_unchecked
         },
     )
 

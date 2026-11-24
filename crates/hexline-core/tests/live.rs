@@ -1332,6 +1332,9 @@ fn kept(registrar: &str) -> hexline_core::HolderKept {
         registrar: Some(registrar.to_owned()),
         epoch: 0,
         devices: Vec::new(),
+        read: None,
+        uptime: 0,
+        boot: String::new(),
     }
 }
 
@@ -3634,4 +3637,77 @@ async fn a_certificate_from_a_holder_behind_a_reset_is_refused_by_the_device() {
     stale.approve(&s, &asked, 30).await;
     let e = asking.await.unwrap().unwrap_err();
     assert_eq!(refused_as(&e), "behind_reset");
+}
+
+/// A session for `card` keeping `kept`, and what `phone` asking at it by
+/// its code comes to: the request as shown, or the refusal.
+async fn asked_keeping(
+    server: &Server,
+    card: &[u8],
+    kept: hexline_core::HolderKept,
+    phone: &Arc<hexline_core::Enrollee>,
+) -> (
+    Arc<hexline_core::HolderSession>,
+    Result<hexline_core::HolderRequest, CoreError>,
+    tokio::task::JoinHandle<Result<hexline_core::Enrolled, CoreError>>,
+) {
+    let session = hexline_core::open_holder_session(server.http.clone(), card.to_vec(), kept)
+        .await
+        .unwrap();
+    let typed = session.code().to_lowercase().replace('-', " ");
+    let asking = tokio::spawn(phone.clone().enroll(
+        server.url.clone(),
+        Some(typed),
+        "Tablet".into(),
+    ));
+    let asked = within(session.clone().next_request()).await;
+    (session, asked, asking)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_this_phone_may_have_revoked_is_not_certified_on_records_it_cannot_read() {
+    use hexline_core::{Enrollee, HolderKept, ListedDevice};
+    use std::sync::atomic::Ordering;
+    let server = Server::with_registrar_fresh_records().await;
+    let (seed, _, card) = held(&server, "una").await;
+    let front = Front::to(&server).await;
+    let keeping = |devices: Vec<ListedDevice>| HolderKept {
+        registrar: Some(front.url.clone()),
+        epoch: 0,
+        devices,
+        read: None,
+        uptime: 0,
+        boot: String::new(),
+    };
+    let phone = Enrollee::new();
+    let (session, asked, asking) = asked_keeping(&server, &card, keeping(Vec::new()), &phone).await;
+    let certified = approved(&session, &seed, false, asked.unwrap().device)
+        .await
+        .unwrap();
+    within(asking).await.unwrap().unwrap();
+    let listed = |revoked| ListedDevice {
+        device: certified.device.clone(),
+        epoch: certified.epoch,
+        revoked,
+    };
+
+    // Its registrar out of reach, a key this phone certified is not certified again.
+    front.down.store(true, Ordering::SeqCst);
+    let (_, down, asking) =
+        asked_keeping(&server, &card, keeping(vec![listed(false)]), &phone).await;
+    assert_eq!(refused_as(&down.unwrap_err()), "unchecked_request");
+    within(asking).await.unwrap().unwrap_err();
+
+    // In reach, and the records not showing it revoked, one marked revoked here is not either.
+    front.down.store(false, Ordering::SeqCst);
+    let (_, marked, asking) =
+        asked_keeping(&server, &card, keeping(vec![listed(true)]), &phone).await;
+    assert_eq!(refused_as(&marked.unwrap_err()), "signed_out_request");
+    within(asking).await.unwrap().unwrap_err();
+    let (session, fine, asking) =
+        asked_keeping(&server, &card, keeping(vec![listed(false)]), &phone).await;
+    approved(&session, &seed, false, fine.unwrap().device)
+        .await
+        .unwrap();
+    within(asking).await.unwrap().unwrap();
 }

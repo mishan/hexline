@@ -4,6 +4,9 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.yield
 import org.foggyden.hexline.core.Certified
 import org.foggyden.hexline.core.CoreException
+import org.foggyden.hexline.core.DeviceStanding
+import org.foggyden.hexline.core.DeviceStandings
+import org.foggyden.hexline.core.Evidence
 import org.foggyden.hexline.core.HeldRestore
 import org.foggyden.hexline.core.HolderCommitted
 import org.foggyden.hexline.core.HolderKept
@@ -163,6 +166,8 @@ class FakeSetups : HolderSetups {
     }
 
     class Revocation(
+        /** The card of the identity it is published for. */
+        val card: ByteArray?,
         val seed: ByteArray,
         val registrar: String,
         val device: ByteArray,
@@ -175,8 +180,22 @@ class FakeSetups : HolderSetups {
     /** What the next revocation throws, if anything, the registrar's answer not had. */
     var revokeFails: Exception? = null
 
+    /** What the next revocation throws once the registrar has taken it, its answer lost. */
+    var revokeAnswerLost: Exception? = null
+
     /** Called as each revocation reaches the registrar. */
     var onRevoke: () -> Unit = {}
+
+    /** Each revocation asked of the registrar, taken or not. */
+    var revokeCalls = 0
+
+    /** [device] revoked at the registrar by another holder of the identity whose card is [card]. */
+    fun revokedElsewhere(
+        card: ByteArray,
+        device: ByteArray,
+    ) {
+        revocations += Revocation(card, ByteArray(32), "reg.example", device, RevokeReason.LOST, 0)
+    }
 
     override suspend fun revoke(
         identitySeed: ByteArray,
@@ -187,14 +206,66 @@ class FakeSetups : HolderSetups {
         thisDevice: ByteArray,
     ) {
         yield()
+        revokeCalls++
         if (device.contentEquals(thisDevice)) throw CoreException.Refused("own_device", "", null)
         onRevoke()
         revokeFails?.let {
             revokeFails = null
             throw it
         }
-        revocations += Revocation(identitySeed, registrar, device, reason, until)
+        val card = made.find { it.holds(identitySeed) }?.card()
+        revocations += Revocation(card, identitySeed, registrar, device, reason, until)
+        revokeAnswerLost?.let {
+            revokeAnswerLost = null
+            throw it
+        }
     }
+
+    /** Whether the registrars' lists read: each publishes the revocations taken and [floor]. */
+    var listsRead = true
+
+    /** What a read of the registrars' records throws, if anything. */
+    var standingFails: CoreException? = null
+
+    /** What each read of the registrars' records waits for, if anything. */
+    var standingWaits: CompletableDeferred<Unit>? = null
+
+    override suspend fun standing(
+        card: ByteArray,
+        registrars: List<String>,
+        epoch: Long,
+        devices: List<ListedDevice>,
+    ): DeviceStandings {
+        yield()
+        standingWaits?.await()
+        standingFails?.let { throw it }
+        val floor = maxOf(epoch, floor)
+        val revocations = revocations.filter { it.card.contentEquals(card) }
+        return DeviceStandings(
+            devices.map { d ->
+                when {
+                    d.epoch.toLong() < floor -> DeviceStanding.SIGNED_OUT
+                    listsRead && revocations.any { it.device.contentEquals(d.device) } -> DeviceStanding.REVOKED
+                    else -> DeviceStanding.IN_FORCE
+                }
+            },
+            listsRead,
+        ).also { if (listsRead) verified(card, *revocations.map { it.device }.toTypedArray()) }
+    }
+
+    /** What the core has verified of each identity's records, by its card: only ever added to. */
+    private val evidence = HashMap<List<Byte>, List<ByteArray>>()
+
+    /** [keys] verified revoked for the identity whose card is [card], as a read of its records would. */
+    fun verified(
+        card: ByteArray,
+        vararg keys: ByteArray,
+    ) {
+        val had = evidence[card.toList()].orEmpty()
+        evidence[card.toList()] = had + keys.filter { k -> had.none { it.contentEquals(k) } }
+    }
+
+    override fun evidence(card: ByteArray) = Evidence(evidence[card.toList()].orEmpty(), floor.toULong())
 
     override fun deviceFingerprint(device: ByteArray) = deviceFingerprintOf(device)
 
@@ -355,6 +426,8 @@ class FakeSetups : HolderSetups {
         var onCommit: () -> Unit = {}
 
         override fun card() = identity.card
+
+        fun holds(seed: ByteArray) = identity.seed.contentEquals(seed)
 
         override suspend fun commit(
             registrar: String,

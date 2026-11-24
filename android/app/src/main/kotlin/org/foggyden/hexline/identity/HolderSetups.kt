@@ -1,11 +1,14 @@
 package org.foggyden.hexline.identity
 
+import org.foggyden.hexline.core.DeviceStandings
+import org.foggyden.hexline.core.Evidence
 import org.foggyden.hexline.core.HeldRestore
 import org.foggyden.hexline.core.HolderKept
 import org.foggyden.hexline.core.HolderSession
 import org.foggyden.hexline.core.HolderSessionInterface
 import org.foggyden.hexline.core.HolderSetup
 import org.foggyden.hexline.core.HolderSetupInterface
+import org.foggyden.hexline.core.ListedDevice
 import org.foggyden.hexline.core.PostOutcome
 import org.foggyden.hexline.core.RecoveryCodeSetup
 import org.foggyden.hexline.core.RecoveryCodeSetupInterface
@@ -15,9 +18,11 @@ import org.foggyden.hexline.core.backupDelete
 import org.foggyden.hexline.core.backupPassphrase
 import org.foggyden.hexline.core.checkHolderRegistrar
 import org.foggyden.hexline.core.deviceFingerprintOf
+import org.foggyden.hexline.core.deviceStanding
 import org.foggyden.hexline.core.heldFloor
 import org.foggyden.hexline.core.holderRenew
 import org.foggyden.hexline.core.openHolderSession
+import org.foggyden.hexline.core.readEvidence
 import org.foggyden.hexline.core.restoreIdentityToHold
 import org.foggyden.hexline.core.revokeDevice
 
@@ -100,6 +105,17 @@ interface HolderSetups {
         thisDevice: ByteArray,
     )
 
+    /** Where each of [devices] stands at the registrars of the identity whose card is [card], [registrars] read beside them, [epoch] the device epoch kept (the core's `device_standing`). */
+    suspend fun standing(
+        card: ByteArray,
+        registrars: List<String>,
+        epoch: Long,
+        devices: List<ListedDevice>,
+    ): DeviceStandings
+
+    /** What the core has verified of the records of the identity whose card is [card], whatever each read came to (the core's `read_evidence`). */
+    fun evidence(card: ByteArray): Evidence
+
     /** [device]'s key as a holder's prompt shows it. */
     fun deviceFingerprint(device: ByteArray): String
 
@@ -175,6 +191,15 @@ object CoreHolderSetups : HolderSetups {
         until: Long,
         thisDevice: ByteArray,
     ) = revokeDevice(identitySeed, registrar, device, reason, until.toULong(), thisDevice)
+
+    override suspend fun standing(
+        card: ByteArray,
+        registrars: List<String>,
+        epoch: Long,
+        devices: List<ListedDevice>,
+    ) = deviceStanding(card, registrars, epoch.toULong(), devices)
+
+    override fun evidence(card: ByteArray) = readEvidence(card)
 
     override fun deviceFingerprint(device: ByteArray) = deviceFingerprintOf(device)
 

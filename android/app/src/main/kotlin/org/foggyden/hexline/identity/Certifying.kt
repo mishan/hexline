@@ -3,6 +3,7 @@ package org.foggyden.hexline.identity
 import org.foggyden.hexline.core.CertTime
 import org.foggyden.hexline.core.CertifyEnd
 import org.foggyden.hexline.core.CoreException
+import org.foggyden.hexline.core.DeviceStanding
 import org.foggyden.hexline.core.HolderRequest
 import org.foggyden.hexline.core.HolderSessionInterface
 import org.foggyden.hexline.core.Qr
@@ -114,14 +115,25 @@ sealed interface Revoking {
 /**
  * The devices [identity]'s key certified here, this phone's own first;
  * [unreadable] when the list would not open just now, and [setAside] when
- * one that did not read is kept aside.
+ * one that did not read is kept aside, [setAsideLoses] when part of that
+ * cannot be read at all. [standing] is what the identity's
+ * registrars last said of each, by its fingerprint, and [unchecked] that
+ * none of their lists read.
  */
 data class DeviceList(
     val identity: String,
     val devices: List<MintedDevice>,
     val unreadable: Boolean = false,
     val setAside: Boolean = false,
-)
+    val setAsideLoses: Boolean = false,
+    val standing: Map<String, DeviceStanding> = emptyMap(),
+    val unchecked: Boolean = false,
+    /** The devices, by fingerprint, whose revocation a read of the records has shown: confirmed, whatever their standing reads as. */
+    val confirmed: Set<String> = emptySet(),
+) {
+    /** Whether [device] is revoked, as this phone marked it or as the registrars publish it. */
+    fun revoked(device: MintedDevice) = device.revoked || standing[device.fingerprint] == DeviceStanding.REVOKED
+}
 
 /** A device certified by a held identity's key on this phone, this phone's own among them. */
 class MintedDevice(
@@ -135,15 +147,10 @@ class MintedDevice(
     val revoked: Boolean = false,
     /** This phone's own device: revoked only with the identity. */
     val own: Boolean = false,
-    /** Asked of the registrar, whose answer was not had: counted as revoked, and to be asked again. */
-    val revoking: Boolean = false,
     /** The device epoch it was certified in. */
     val epoch: Long = 0,
 ) {
-    fun with(
-        revoked: Boolean = this.revoked,
-        revoking: Boolean = this.revoking,
-    ) = MintedDevice(device, fingerprint, name, expires, canManage, revoked, own, revoking, epoch)
+    fun with(revoked: Boolean = this.revoked) = MintedDevice(device, fingerprint, name, expires, canManage, revoked, own, epoch)
 
     override fun equals(other: Any?) =
         other is MintedDevice &&
@@ -154,17 +161,16 @@ class MintedDevice(
             canManage == other.canManage &&
             revoked == other.revoked &&
             own == other.own &&
-            revoking == other.revoking &&
             epoch == other.epoch
 
     /**
-     * Whether it is still listed at [now]: revoked or being revoked, as that
-     * is what refuses its key a renewal, or its certificate in its time as
-     * the core judges it, skew included.
+     * Whether it is still listed at [now]: revoked, as that is what refuses
+     * its key a renewal, or its certificate in its time as the core judges
+     * it, skew included.
      */
-    fun listed(now: Long) = revoked || revoking || certTime(0uL, expires.toULong(), now.toULong()) != CertTime.EXPIRED
+    fun listed(now: Long) = revoked || certTime(0uL, expires.toULong(), now.toULong()) != CertTime.EXPIRED
 
     override fun hashCode() = device.contentHashCode()
 
-    override fun toString() = "MintedDevice($fingerprint, $name, revoked=$revoked, revoking=$revoking, own=$own)"
+    override fun toString() = "MintedDevice($fingerprint, $name, revoked=$revoked, own=$own)"
 }

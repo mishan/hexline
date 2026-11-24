@@ -97,6 +97,12 @@ abstract class ViewModelHarness {
     /** What the store held of the identity's last try when the holder was asked. */
     protected var triedWhenAsked: Long? = null
     protected var now = ISSUED + DAY
+
+    /** Seconds since the phone booted, as the next model reads them. */
+    protected var uptime = DAY
+
+    /** The boot [uptime] counts from, as the next model reads it. */
+    protected var boot = "1"
     protected var owner = ViewModelStore()
 
     /** How the next model waits so many seconds: for ever, unless a test says otherwise. */
@@ -138,6 +144,9 @@ abstract class ViewModelHarness {
         /** Whether a device list written is lost while the write says it was made, as a failed rename can. */
         var losesLists = false
 
+        /** How many of the next writes of a device list fail, as a full disk's do. */
+        var listsFail = 0
+
         /** Whether an identity's file fails to be written, as a full disk does. */
         var identitiesFail = false
 
@@ -147,6 +156,10 @@ abstract class ViewModelHarness {
             Identities(app, secrets, identityDir, syncDir = { synced += it }) { file, bytes ->
                 if (rotationsFail && file.name.startsWith("rotation-")) throw IOException("disk full")
                 if (identitiesFail && file.name.startsWith("identity-")) throw IOException("disk full")
+                if (listsFail > 0 && file.name.startsWith("minted-")) {
+                    listsFail--
+                    throw IOException("disk full")
+                }
                 if (!(losesLists && file.name.startsWith("minted-"))) writeAtomically(file, bytes)
             }
         val keys = FakeHolderKeys()
@@ -194,7 +207,7 @@ abstract class ViewModelHarness {
                         connection(url, sink).also { opened += it }
                     }, { renewing, expecting ->
                         enrollment(renewing, expecting).also { enrollments += it }
-                    }, setups, { now }, process.lifecycle, { wait(it) }) as T
+                    }, setups, { now }, process.lifecycle, { wait(it) }, { uptime }, { boot }) as T
             }
         armed = true
         return ViewModelProvider.create(owner, factory)[ChatViewModel::class.java]

@@ -417,16 +417,24 @@ async fn published(
             .filter(|l| l.fingerprint == Some(fingerprint.0))
             .ok_or_else(|| protocol("the identity's records do not read"))?;
         let last = list.entries.last().map(|(seq, _)| *seq);
-        let found = list.entries.into_iter().find_map(|(_, bytes)| {
-            match Record::parse(&bytes, Some(keys)) {
-                Ok(Record::Rotate(r))
-                    if r.identity == rotation.identity && r.successor == rotation.successor =>
-                {
-                    Some((r, bytes))
-                }
-                _ => None,
+        let mut found = None;
+        for (_, bytes) in list.entries {
+            let record = Record::parse(&bytes, Some(keys));
+            // The same list a reset or a revocation is in: what it says of the devices is kept.
+            if let Ok(record) = &record {
+                crate::epoch::kept_record(&rotation.identity, record);
             }
-        });
+            match record {
+                Ok(Record::Rotate(r))
+                    if found.is_none()
+                        && r.identity == rotation.identity
+                        && r.successor == rotation.successor =>
+                {
+                    found = Some((r, bytes))
+                }
+                _ => {}
+            }
+        }
         match (found, last) {
             (Some(found), _) => return Ok(found),
             (None, Some(last)) if list.more => {
