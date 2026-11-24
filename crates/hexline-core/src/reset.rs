@@ -73,6 +73,18 @@ const CHAIN_MAX: usize = POSTS_MAX;
 const RETRY_EVERY: u64 = 15 * 60;
 const RETRY_LEAST: u64 = 60;
 
+/// The longest a retry is left between tries it was not done at, its wait
+/// doubling from [`RETRY_EVERY`] each time: a registrar asking to be left a
+/// minute is not asked every minute for days.
+const BACKOFF_MOST: u64 = 6 * 3600;
+
+/// A registrar is given up on only once it has been asked this many times
+/// and this long has passed since the reset, both: a phone offline for a
+/// week has made no tries, and one asked often has not yet waited out an
+/// outage.
+const TRIES_LEAST: u32 = 12;
+const RETRY_FOR: u64 = 7 * 24 * 3600;
+
 /// A retry's bytes, read at most, the registrars it is kept for, and the
 /// hashes of the reset's own records it remembers: a retry opens a
 /// connection to each registrar at once.
@@ -131,6 +143,9 @@ pub struct DevicesReset {
     pub retry: Option<Vec<u8>>,
     /// Seconds before `retry` is worth posting: None with no `retry`.
     pub retry_in: Option<u64>,
+    /// The registrars `retry` is kept for: of `not_done`, those it may yet
+    /// reach, and none of the rest.
+    pub later: Vec<String>,
 }
 
 /// What a [`retry_reset`] came to, as [`DevicesReset`] says it.
@@ -145,6 +160,8 @@ pub struct ResetRetried {
     /// To keep in place of the one posted.
     pub retry: Option<Vec<u8>>,
     pub retry_in: Option<u64>,
+    /// As [`DevicesReset::later`], those not due counted among them.
+    pub later: Vec<String>,
 }
 
 /// A registrar the reset is not at yet, and why.
@@ -183,6 +200,9 @@ pub enum NotYet {
     /// Its last reset is dated after the records a retry holds for it,
     /// which it would refuse: only a new reset reaches it.
     DatedBefore,
+    /// Asked for long enough without the reset reaching it: only a new
+    /// reset asks it again.
+    GaveUp,
 }
 
 /// Signs out every device the identity whose seed is `identity_seed`
@@ -269,6 +289,7 @@ async fn resetting(
         not_registrars: report.not_registrars,
         cert,
         cert_epoch,
+        later: retry.chains.iter().map(|c| c.registrar.clone()).collect(),
         retry: encode(&retry),
         retry_in,
     })
@@ -936,6 +957,8 @@ struct Chain {
     records: Vec<Signed>,
     /// When it is next asked, in seconds.
     due: u64,
+    /// The times a retry has asked it and it was not done.
+    tries: u32,
 }
 
 /// What a reset keeps for the registrars it was not done at.
@@ -1020,6 +1043,7 @@ fn lagging(
                 kept: kept(registrar),
                 records: chain_to(id, report.target, cur)?,
                 due: at.saturating_add(wait(registrar)),
+                tries: 0,
             })
         })
         .collect::<Result<_, CoreError>>()?;
@@ -1040,12 +1064,18 @@ fn encode(retry: &Retry) -> Option<Vec<u8>> {
         .iter()
         .map(|c| {
             let records: Vec<String> = c.records.iter().map(|r| b64(&r.bytes)).collect();
-            json!({ "registrar": c.registrar, "kept": c.kept, "records": records, "due": c.due })
+            json!({
+                "registrar": c.registrar,
+                "kept": c.kept,
+                "records": records,
+                "due": c.due,
+                "tries": c.tries,
+            })
         })
         .collect();
     let posted: Vec<String> = retry.posted.iter().map(|h| b64(h)).collect();
     Some(
-        json!({ "v": 1, "posted": posted, "at": at })
+        json!({ "v": 2, "posted": posted, "at": at })
             .to_string()
             .into_bytes(),
     )
@@ -1060,7 +1090,13 @@ fn decode(bytes: &[u8], identity: &PublicKey) -> Result<Retry, CoreError> {
         return Err(bad());
     }
     let v: Value = serde_json::from_slice(bytes).map_err(|_| bad())?;
-    if v["v"] != 1 {
+    // One a version before kept no tries, and has made none that count.
+    let tries = |c: &Value| match v["v"].as_u64() {
+        Some(1) => Some(0),
+        Some(2) => c["tries"].as_u64().and_then(|t| u32::try_from(t).ok()),
+        _ => None,
+    };
+    if !matches!(v["v"].as_u64(), Some(1 | 2)) {
         return Err(bad());
     }
     let posted = v["posted"]
@@ -1106,6 +1142,7 @@ fn decode(bytes: &[u8], identity: &PublicKey) -> Result<Retry, CoreError> {
                 kept: c["kept"].as_bool().ok_or_else(bad)?,
                 records,
                 due: c["due"].as_u64().ok_or_else(bad)?,
+                tries: tries(c).ok_or_else(bad)?,
             })
         })
         .collect::<Result<Vec<Chain>, CoreError>>()?;
@@ -1131,6 +1168,19 @@ fn decode(bytes: &[u8], identity: &PublicKey) -> Result<Retry, CoreError> {
 /// asked for, and nothing where it did not say.
 fn wait_of(retry_after: Option<u64>) -> u64 {
     retry_after.map_or(0, |s| s.max(RETRY_LEAST))
+}
+
+/// How long a registrar not done after `tries` tries is left at least.
+fn backoff(tries: u32) -> u64 {
+    let doublings = tries.saturating_sub(1).min(16);
+    RETRY_EVERY.saturating_mul(1 << doublings).min(BACKOFF_MOST)
+}
+
+/// Whether `chain`, not done at `at`, has been tried enough and for long
+/// enough since its reset was signed to be let go of.
+fn given_up(chain: &Chain, at: u64) -> bool {
+    let since = chain.records.last().map_or(0, |r| r.time);
+    chain.tries >= TRIES_LEAST && at >= since.saturating_add(RETRY_FOR)
 }
 
 /// Seconds from `at` until the next retry is worth making: when the first
@@ -1226,6 +1276,7 @@ async fn retry_all<D: Desk>(
         not_registrars: Vec::new(),
         retry: None,
         retry_in: None,
+        later: Vec::new(),
     };
     for (mut chain, (listed, caught)) in caught {
         out.published = out.published.max(listed);
@@ -1233,20 +1284,24 @@ async fn retry_all<D: Desk>(
             Caught::Done => out.done.push(chain.registrar),
             Caught::NotARegistrar => out.not_registrars.push(chain.registrar),
             Caught::NotDone(r) => {
+                chain.tries = chain.tries.saturating_add(1);
+                let gave_up = waits(&r) && given_up(&chain, at);
                 out.not_done.push(NotYetReset {
                     registrar: chain.registrar.clone(),
-                    why: r.why,
+                    why: if gave_up { NotYet::GaveUp } else { r.why },
                     code: r.code.clone(),
                     retry_after: r.retry_after,
                 });
-                if waits(&r) {
-                    chain.due = at.saturating_add(wait_of(r.retry_after));
+                if waits(&r) && !gave_up {
+                    let wait = wait_of(r.retry_after).max(backoff(chain.tries));
+                    chain.due = at.saturating_add(wait);
                     left.push(chain);
                 }
             }
         }
     }
     out.retry_in = retry_in(&left, at);
+    out.later = left.iter().map(|c| c.registrar.clone()).collect();
     out.retry = encode(&Retry {
         chains: left,
         ..retry
@@ -2351,6 +2406,7 @@ mod tests {
                 kept: true,
                 records: chain_to(&alice(), epoch, &cur).unwrap(),
                 due: 0,
+                tries: 0,
             }],
         }
     }
@@ -2369,6 +2425,7 @@ mod tests {
             not_registrars: vec![],
             retry: None,
             retry_in: None,
+            later: vec![],
         }
     }
 
@@ -2530,13 +2587,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_registrar_asking_for_less_than_a_minute_is_left_a_minute() {
+    async fn a_registrar_asking_for_less_than_the_backoff_is_left_the_backoff() {
         let mut sim = Sim {
             limited_reads: Some(5),
             ..Sim::default()
         };
         let got = retry(&for_r0(1, Current::default(), vec![]), &mut [&mut sim]).await;
-        assert_eq!(got.retry_in, Some(RETRY_LEAST));
+        assert_eq!(got.retry_in, Some(RETRY_EVERY));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2555,6 +2612,7 @@ mod tests {
                 kept: true,
                 records: chain_to(&id, 1, &Current::default()).unwrap(),
                 due: 0,
+                tries: 0,
             }],
         };
         let _resetting = Resetting::take(&id.public()).unwrap();
@@ -2578,6 +2636,7 @@ mod tests {
                 })
                 .collect(),
             due: 9,
+            tries: 0,
         };
         let blob = |chains: Vec<Chain>| {
             encode(&Retry {
@@ -2587,7 +2646,7 @@ mod tests {
             })
             .unwrap()
         };
-        let good = Retry {
+        let mut good = Retry {
             epoch: 40,
             posted: vec![[3; 32]],
             chains: vec![
@@ -2595,8 +2654,15 @@ mod tests {
                 chain("r1", &alice(), &[40]),
             ],
         };
+        good.chains[0].tries = 3;
         let kept = encode(&good).unwrap();
         assert_eq!(decode(&kept, &alice().public()).unwrap(), good);
+        // One kept before tries were counted has made none that count.
+        let mut first: Value = serde_json::from_slice(&kept).unwrap();
+        first["v"] = json!(1);
+        first["at"][0].as_object_mut().unwrap().remove("tries");
+        let first = decode(&serde_json::to_vec(&first).unwrap(), &alice().public()).unwrap();
+        assert_eq!(first.chains[0].tries, 0);
 
         let mut flipped = chain("r0", &alice(), &[8, 24, 40]);
         let last = flipped.records[2].bytes.len() - 1;
@@ -2611,7 +2677,7 @@ mod tests {
             ("not json", b"<html>".to_vec(), "bad_retry"),
             (
                 "another version",
-                br#"{"v": 2, "posted": [], "at": []}"#.to_vec(),
+                br#"{"v": 3, "posted": [], "at": []}"#.to_vec(),
                 "bad_retry",
             ),
             (
@@ -2790,7 +2856,7 @@ mod tests {
     #[tokio::test]
     async fn a_wait_is_counted_from_when_the_retry_is_done_asking() {
         // Asked at `at` and done asking 90 s later: `r0` asks for a
-        // minute, and `r1` is not due.
+        // minute, left the backoff, and `r1` is not due.
         let at = now();
         let mut limited = Sim {
             limited_reads: Some(60),
@@ -2808,8 +2874,8 @@ mod tests {
         };
         let got = retry_by(&kept, &mut [&mut limited, &mut untouched], clock).await;
         let dues: Vec<u64> = kept_of(&got.retry).chains.iter().map(|c| c.due).collect();
-        assert_eq!(dues, vec![at + 3600, at + 90 + 60]);
-        assert_eq!(got.retry_in, Some(60));
+        assert_eq!(dues, vec![at + 3600, at + 90 + RETRY_EVERY]);
+        assert_eq!(got.retry_in, Some(RETRY_EVERY));
         assert_eq!(untouched.reads, 0);
     }
 
@@ -2850,5 +2916,124 @@ mod tests {
             retried(40, 2, &[], vec![not_done("r0", NotYet::DatedBefore, None)])
         );
         assert_eq!(sim.posts, 0);
+    }
+
+    /// `retry` asked at each of `times` in turn, each time with what the
+    /// last handed back, while `down` stays down: each try's not-done
+    /// reason, and what is left to post.
+    async fn tried_at(retry: Retry, down: &mut Sim, times: &[u64]) -> (Vec<NotYet>, Option<Retry>) {
+        let mut whys = Vec::new();
+        let mut kept = Some(retry);
+        for &at in times {
+            let Some(r) = kept.take() else { break };
+            let got = retry_at(&r, &mut [&mut *down], at).await;
+            whys.extend(got.not_done.iter().map(|n| n.why));
+            kept = got.retry.as_ref().map(|_| kept_of(&got.retry));
+        }
+        (whys, kept)
+    }
+
+    #[tokio::test]
+    async fn a_registrar_is_given_up_on_only_once_it_was_tried_enough_and_for_long_enough() {
+        let mut down = Sim {
+            unreachable: true,
+            ..Sim::default()
+        };
+        let kept = for_r0(1, Current::default(), vec![]);
+        let since = kept.chains[0].records[0].time;
+        let hours = |h: u64| since + h * 3600;
+
+        // Twenty tries inside the week: never given up, however many.
+        let often: Vec<u64> = (1..=20).map(|i| hours(7 * i)).collect();
+        let (whys, left) = tried_at(kept.clone(), &mut down, &often).await;
+        assert_eq!(whys, vec![NotYet::Unreachable; 20]);
+        let left = left.unwrap();
+        assert_eq!(left.chains[0].tries, 20);
+        // Past the week, the next try is the last.
+        let (whys, left) = tried_at(left, &mut down, &[hours(7 * 24 + 1)]).await;
+        assert_eq!((whys, left), (vec![NotYet::GaveUp], None));
+
+        // Past the week after two tries: tried on until it has made twelve.
+        let rare: Vec<u64> = std::iter::once(hours(1))
+            .chain((0..12).map(|i| hours(8 * 24 + 6 * i)))
+            .collect();
+        let (whys, left) = tried_at(kept, &mut down, &rare).await;
+        let mut want = vec![NotYet::Unreachable; 11];
+        want.push(NotYet::GaveUp);
+        assert_eq!((whys, left), (want, None));
+    }
+
+    #[tokio::test]
+    async fn a_registrar_not_done_is_left_longer_after_each_try() {
+        let mut down = Sim {
+            unreachable: true,
+            ..Sim::default()
+        };
+        let mut kept = for_r0(1, Current::default(), vec![]);
+        let mut at = now();
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            let got = retry_at(&kept, &mut [&mut down], at).await;
+            let wait = got.retry_in.unwrap();
+            waits.push(wait);
+            kept = kept_of(&got.retry);
+            at += wait;
+        }
+        let m = 60;
+        assert_eq!(
+            waits,
+            vec![15 * m, 30 * m, 60 * m, 120 * m, 240 * m, 360 * m, 360 * m]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_names_the_registrars_it_is_kept_for_and_no_other() {
+        let mut down = Sim {
+            unreachable: true,
+            ..Sim::default()
+        };
+        let mut refusing = Sim {
+            unregistered: true,
+            ..Sim::default()
+        };
+        let mut kept = for_r0(1, Current::default(), vec![]);
+        let mut r1 = kept.chains[0].clone();
+        r1.registrar = "r1".into();
+        kept.chains.push(r1);
+        let got = retry(&kept, &mut [&mut down, &mut refusing]).await;
+        assert_eq!(got.not_done.len(), 2, "{:?}", got.not_done);
+        assert_eq!(got.later, vec!["r0".to_string()]);
+        assert_eq!(
+            kept_of(&got.retry)
+                .chains
+                .iter()
+                .map(|c| c.registrar.as_str())
+                .collect::<Vec<_>>(),
+            vec!["r0"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_a_reset_or_a_retry_reads_of_the_records_is_kept_whatever_the_read_comes_to() {
+        let id = IdentityKey::generate();
+        let lost = DeviceKey::generate().public();
+        // The revocation on the first page, and the second page refused.
+        let records = vec![
+            crate::epoch::tests::revocation(&id, lost),
+            sign_epoch(&id, 3, 1_000).unwrap(),
+        ];
+        let registrar = crate::epoch::tests::registrar_failing(records, 1, 1)
+            .await
+            .to_string();
+        let mut remote = Remote {
+            target: registrar,
+            identity: id.public(),
+            kept: true,
+            reg: None,
+        };
+        assert_eq!(remote.discover().await, Ok(()));
+        assert!(remote.read().await.is_err());
+        let evidence = crate::epoch::evidence_of(&id.public());
+        assert_eq!(evidence.revoked, vec![lost.to_vec()]);
     }
 }

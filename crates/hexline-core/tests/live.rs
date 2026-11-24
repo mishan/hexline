@@ -3562,6 +3562,7 @@ async fn a_registrar_down_at_a_reset_is_caught_up_by_its_retry_at_the_same_epoch
     .unwrap();
     assert_eq!((reset.epoch, &reset.done), (1, &vec![home.http.clone()]));
     assert!(reset.retry_in.is_some());
+    assert!(reset.later.contains(&front.url), "{:?}", reset.later);
 
     front.down.store(false, Ordering::SeqCst);
     let retried = hexline_core::retry_reset(reset.retry.unwrap(), card)
@@ -3571,6 +3572,7 @@ async fn a_registrar_down_at_a_reset_is_caught_up_by_its_retry_at_the_same_epoch
         (retried.published, &retried.done),
         (1, &vec![front.url.clone()])
     );
+    assert!(!retried.later.contains(&front.url), "{:?}", retried.later);
     assert_eq!(epochs_at(&other, &id).await, vec![1]);
     assert_eq!(epochs_at(&home, &id).await, vec![1]);
 }
