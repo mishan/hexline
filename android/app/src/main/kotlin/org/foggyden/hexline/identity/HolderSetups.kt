@@ -1,6 +1,7 @@
 package org.foggyden.hexline.identity
 
 import org.foggyden.hexline.core.DeviceStandings
+import org.foggyden.hexline.core.Evidence
 import org.foggyden.hexline.core.HeldRestore
 import org.foggyden.hexline.core.HolderKept
 import org.foggyden.hexline.core.HolderSession
@@ -21,6 +22,7 @@ import org.foggyden.hexline.core.deviceStanding
 import org.foggyden.hexline.core.heldFloor
 import org.foggyden.hexline.core.holderRenew
 import org.foggyden.hexline.core.openHolderSession
+import org.foggyden.hexline.core.readEvidence
 import org.foggyden.hexline.core.restoreIdentityToHold
 import org.foggyden.hexline.core.revokeDevice
 
@@ -111,6 +113,9 @@ interface HolderSetups {
         devices: List<ListedDevice>,
     ): DeviceStandings
 
+    /** What the core has verified of the records of the identity whose card is [card], whatever each read came to (the core's `read_evidence`). */
+    fun evidence(card: ByteArray): Evidence
+
     /** [device]'s key as a holder's prompt shows it. */
     fun deviceFingerprint(device: ByteArray): String
 
@@ -193,6 +198,8 @@ object CoreHolderSetups : HolderSetups {
         epoch: Long,
         devices: List<ListedDevice>,
     ) = deviceStanding(card, registrars, epoch.toULong(), devices)
+
+    override fun evidence(card: ByteArray) = readEvidence(card)
 
     override fun deviceFingerprint(device: ByteArray) = deviceFingerprintOf(device)
 

@@ -6,6 +6,7 @@ import org.foggyden.hexline.core.Certified
 import org.foggyden.hexline.core.CoreException
 import org.foggyden.hexline.core.DeviceStanding
 import org.foggyden.hexline.core.DeviceStandings
+import org.foggyden.hexline.core.Evidence
 import org.foggyden.hexline.core.HeldRestore
 import org.foggyden.hexline.core.HolderCommitted
 import org.foggyden.hexline.core.HolderKept
@@ -248,10 +249,23 @@ class FakeSetups : HolderSetups {
                     else -> DeviceStanding.IN_FORCE
                 }
             },
-            if (listsRead) revocations.map { it.device } else emptyList(),
             listsRead,
-        )
+        ).also { if (listsRead) verified(card, *revocations.map { it.device }.toTypedArray()) }
     }
+
+    /** What the core has verified of each identity's records, by its card: only ever added to. */
+    private val evidence = HashMap<List<Byte>, List<ByteArray>>()
+
+    /** [keys] verified revoked for the identity whose card is [card], as a read of its records would. */
+    fun verified(
+        card: ByteArray,
+        vararg keys: ByteArray,
+    ) {
+        val had = evidence[card.toList()].orEmpty()
+        evidence[card.toList()] = had + keys.filter { k -> had.none { it.contentEquals(k) } }
+    }
+
+    override fun evidence(card: ByteArray) = Evidence(evidence[card.toList()].orEmpty(), floor.toULong())
 
     override fun deviceFingerprint(device: ByteArray) = deviceFingerprintOf(device)
 

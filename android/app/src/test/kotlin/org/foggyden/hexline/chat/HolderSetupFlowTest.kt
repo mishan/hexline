@@ -225,6 +225,19 @@ class HolderSetupFlowTest : ViewModelHarness() {
     }
 
     @Test
+    fun whatARestoreReadOfTheRecordsIsKeptWithTheIdentity() {
+        val identity = newIdentity("Dana")
+        setups.restores = identity
+        val lost = ByteArray(32) { 7 }
+        setups.verified(identity.card, lost)
+        val vm = model()
+        settle()
+        vm.restore("reg.example", "dana", SecretKind.RECOVERY_CODE, "code", "Pixel", stores.keys.authorizer())
+        settle()
+        assertEquals(listOf(lost.toList()), outside { identities.seenRevoked(identity.fingerprint) }.map { it.toList() })
+    }
+
+    @Test
     fun aDeviceNameNoServerReadsIsRefusedBeforeAnyCodeIsMade() {
         val vm = model()
         settle()

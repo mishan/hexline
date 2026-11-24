@@ -211,8 +211,8 @@ fun DevicesScreen(
         for (device in devices?.devices.orEmpty()) {
             val revoked = devices?.revoked(device) == true
             val signedOut = devices?.standing?.get(device.fingerprint) == DeviceStanding.SIGNED_OUT
-            // Revoked here, and no read since has shown the registrar holds it.
-            val unconfirmed = device.revoked && devices?.standing?.get(device.fingerprint) != DeviceStanding.REVOKED
+            // Revoked here, and no read has shown the registrar holds it.
+            val unconfirmed = device.revoked && devices?.confirmed?.contains(device.fingerprint) != true
             Column {
                 Text(device.name ?: stringResource(R.string.device_unnamed), style = MaterialTheme.typography.bodyLarge)
                 Text(stringResource(R.string.enroll_fingerprint, device.fingerprint), style = MaterialTheme.typography.bodySmall)

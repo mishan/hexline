@@ -30,6 +30,7 @@ import org.foggyden.hexline.core.Caps
 import org.foggyden.hexline.core.Certified
 import org.foggyden.hexline.core.DeviceStanding
 import org.foggyden.hexline.core.DeviceStandings
+import org.foggyden.hexline.core.Evidence
 import org.foggyden.hexline.core.HeldRestore
 import org.foggyden.hexline.core.HolderCommitted
 import org.foggyden.hexline.core.HolderKept
@@ -436,7 +437,9 @@ class HolderSetupScreenTest {
             registrars: List<String>,
             epoch: Long,
             devices: List<ListedDevice>,
-        ) = DeviceStandings(devices.map { DeviceStanding.IN_FORCE }, emptyList(), complete = false)
+        ) = DeviceStandings(devices.map { DeviceStanding.IN_FORCE }, complete = false)
+
+        override fun evidence(card: ByteArray) = Evidence(emptyList(), 0uL)
 
         override fun deviceFingerprint(device: ByteArray) = deviceFingerprintOf(device)
 

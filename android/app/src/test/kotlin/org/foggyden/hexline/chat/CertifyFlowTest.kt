@@ -596,7 +596,7 @@ class CertifyFlowTest : ViewModelHarness() {
         setups.revokedElsewhere(cardOf(fingerprint), ByteArray(32) { 3 })
         vm.openDevices(fingerprint)
         settle()
-        val read = WholeRead(now.toULong(), uptime.toULong(), boot, listOf("reg.example"))
+        val read = WholeRead(now.toULong(), uptime.toULong(), boot, listOf("reg.example"), 0uL)
         setups.listsRead = false
         now += 60
         uptime += 60
@@ -703,6 +703,8 @@ class CertifyFlowTest : ViewModelHarness() {
         val session = shown(vm, fingerprint)
         asked(vm, fingerprint, session, Revoked.Yes)
         assertTrue("handed to the core", handed(session, tablet.device))
+        // No read from now on finds it: only what the core held of the read refused can reach the disk.
+        setups.listsRead = false
         setups.standingWaits = null
         held.complete(Unit)
         settle()
@@ -834,6 +836,51 @@ class CertifyFlowTest : ViewModelHarness() {
         setups.standingWaits = CompletableDeferred()
         val session = shown(vm, fingerprint)
         assertTrue(handed(session, ByteArray(32) { 9 }))
+    }
+
+    @Test
+    fun whatTheCoreVerifiedReachesTheDiskFromEveryCallThatReadsTheRecordsWhateverItComesTo() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val card = cardOf(fingerprint)
+        val key = { b: Int -> ByteArray(32) { b.toByte() } }
+        val onDisk = { outside { identities.seenRevoked(fingerprint) }.map { it[0].toInt() }.toSet() }
+        // A read of the devices.
+        setups.verified(card, key(1))
+        vm.openDevices(fingerprint)
+        settle()
+        assertTrue("a read of the devices", 1 in onDisk())
+        // A request the session refused.
+        val refused = shown(vm, fingerprint)
+        setups.verified(card, key(2))
+        refused.next.completeExceptionally(CoreException.Refused("signed_out_request", "", null))
+        settle()
+        assertTrue("a request refused", 2 in onDisk())
+        // A request shown, and its certifying failing.
+        val failing = shown(vm, fingerprint)
+        setups.verified(card, key(3))
+        asked(vm, fingerprint, failing)
+        assertTrue("a request shown", 3 in onDisk())
+        failing.onCertify = {
+            setups.verified(card, key(4))
+            throw CoreException.Refused("signed_out_request", "", null)
+        }
+        vm.approveDevice(fingerprint, manage = false, stores.keys.authorizer())
+        settle()
+        assertTrue("a certifying refused", 4 in onDisk())
+    }
+
+    @Test
+    fun aListWhoseEvidenceIsNotAListIsSetAside() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        minted(fingerprint).writeText("""{"devices":[],"revoked":"not a list"}""")
+        setups.standingWaits = CompletableDeferred()
+        vm.openDevices(fingerprint)
+        settle()
+        assertTrue(checkNotNull(vm.devices.value).setAside)
     }
 
     @Test

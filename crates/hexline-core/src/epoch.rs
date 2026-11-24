@@ -60,6 +60,68 @@ pub fn held_floor(card: Vec<u8>) -> u64 {
     }
 }
 
+/// Every device revocation a read of each identity's records verified in
+/// this process, kept page by page as it is read: [`published`] is the one
+/// reader, so a read that fails on a later page, or whose caller refuses
+/// or fails after, loses nothing it verified.
+static SEEN: Mutex<BTreeMap<PublicKey, Vec<DeviceRevocation>>> = Mutex::new(BTreeMap::new());
+
+/// `revocation`, verified, kept as seen for `identity`.
+fn saw(identity: &PublicKey, revocation: &DeviceRevocation) {
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let all = seen.entry(*identity).or_default();
+    if !all.contains(revocation) {
+        all.push(revocation.clone());
+    }
+}
+
+/// What this process has verified of an identity's records, whatever
+/// became of each read: every key a revocation it verified names, and
+/// `floor`, the highest it has learned.
+#[derive(Debug, Clone, Default, PartialEq, uniffi::Record)]
+pub struct Evidence {
+    pub revoked: Vec<Vec<u8>>,
+    pub floor: u64,
+}
+
+/// What this process has verified of the records of the identity whose
+/// card is `card`, for the app to keep: it only ever grows, so one asked
+/// for late still holds all of it. Nothing for a card that does not read.
+#[uniffi::export]
+pub fn read_evidence(card: Vec<u8>) -> Evidence {
+    let Ok(card) = hl_identity::Card::parse(&card) else {
+        return Evidence::default();
+    };
+    evidence_of(&card.identity)
+}
+
+pub(crate) fn evidence_of(identity: &PublicKey) -> Evidence {
+    let floor = floor_of(identity);
+    let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    // Every key seen revoked, whatever floor its signer was at: what this
+    // hands the app never shrinks, so a floor risen since takes back none.
+    let mut revoked: Vec<Vec<u8>> = Vec::new();
+    for r in seen.get(identity).into_iter().flatten() {
+        if !revoked.contains(&r.device.to_vec()) {
+            revoked.push(r.device.to_vec());
+        }
+    }
+    Evidence { revoked, floor }
+}
+
+/// `record`, verified from `identity`'s records, kept as evidence: the
+/// floor an epoch record raises, and a revocation as seen. Each reader of
+/// the records calls it on every record as its page is verified.
+pub(crate) fn kept_record(identity: &PublicKey, record: &Record) {
+    match record {
+        Record::DeviceEpoch(r) if r.identity == *identity => {
+            at_floor(identity, r.epoch, |_| ());
+        }
+        Record::RevokeDevice(r) if r.identity == *identity => saw(identity, r),
+        _ => {}
+    }
+}
+
 /// The highest device epoch this process has learned for `identity`.
 pub(crate) fn floor_of(identity: &PublicKey) -> u64 {
     let floors = FLOORS.lock().unwrap_or_else(|e| e.into_inner());
@@ -192,6 +254,9 @@ pub struct WholeRead {
     pub uptime: u64,
     pub boot: String,
     pub registrars: Vec<String>,
+    /// The floor learned as it was read, which it stands in with: a read
+    /// is never taken without the floor it saw.
+    pub floor: u64,
 }
 
 /// Seconds since boot, time asleep counted, where the platform says.
@@ -220,17 +285,6 @@ pub(crate) fn read_whole(kept: &[String], registrars: &[String], published: &Pub
             .iter()
             .all(|k| published.read.iter().any(|r| same_registrar(r, k))),
     }
-}
-
-/// The keys a revocation that stands at `floor` names.
-pub(crate) fn revoked_keys(floor: u64, published: &Published) -> Vec<PublicKey> {
-    let mut keys: Vec<PublicKey> = Vec::new();
-    for r in &published.revocations {
-        if r.check_signer_floor(floor).is_ok() && !keys.contains(&r.device) {
-            keys.push(r.device);
-        }
-    }
-    keys
 }
 
 /// Whether `device`'s revocation is unknown on what was read: a key this
@@ -314,7 +368,12 @@ pub(crate) async fn published(
                 detail: "the identity's records do not read".into(),
             })?;
         for (_, bytes) in &list.entries {
-            match Record::parse(bytes, Some(keys)) {
+            let record = Record::parse(bytes, Some(keys));
+            // Kept as it is verified, whatever the pages after it come to.
+            if let Ok(record) = &record {
+                kept_record(identity, record);
+            }
+            match record {
                 Ok(Record::DeviceEpoch(r)) if r.identity == *identity && r.epoch >= out.epoch => {
                     use sha2::Digest;
                     (out.epoch, out.time) = (r.epoch, r.time);
@@ -345,6 +404,16 @@ pub(crate) mod tests {
     /// A registrar at 127.0.0.1 publishing `records` for whoever is asked
     /// about, `per_page` to a page, and answering anything else 404.
     pub(crate) async fn registrar_publishing(records: Vec<Vec<u8>>, per_page: usize) -> Url {
+        registrar_failing(records, per_page, usize::MAX).await
+    }
+
+    /// As [`registrar_publishing`], answering 503 for every page from the
+    /// `from`th record on.
+    pub(crate) async fn registrar_failing(
+        records: Vec<Vec<u8>>,
+        per_page: usize,
+        from: usize,
+    ) -> Url {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let key = ServerKey::from_seed(&[5; 32]);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -368,7 +437,14 @@ pub(crate) mod tests {
                         Some((fp, s)) => (fp, Some(s.parse::<u64>().unwrap())),
                         None => (rest, None),
                     };
-                    let from = since.map_or(0, |s| s as usize);
+                    let from_seq = since.map_or(0, |s| s as usize);
+                    if from_seq >= from {
+                        let reply =
+                            "HTTP/1.1 503 X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                        let _ = s.write_all(reply.as_bytes()).await;
+                        continue;
+                    }
+                    let from = from_seq;
                     let page: Vec<_> = records
                         .iter()
                         .enumerate()
@@ -615,5 +691,31 @@ pub(crate) mod tests {
             let kept: Vec<String> = kept.into_iter().map(String::from).collect();
             assert_eq!(registrars_of(&kept, &card), want, "{kept:?}");
         }
+    }
+
+    #[test]
+    fn a_key_seen_revoked_stays_in_the_evidence_whatever_floor_is_learned_after() {
+        let id = IdentityKey::generate();
+        let (lost, manager) = (DeviceKey::generate().public(), DeviceKey::generate());
+        let mut cert = DeviceCert::for_device(&id, &manager, 1_000, 1_000_000).unwrap();
+        cert.epoch = 1;
+        cert.caps = Some(hl_identity::caps::LOGIN | hl_identity::caps::MANAGE);
+        let signed = DeviceRevocation {
+            identity: id.public(),
+            device: lost,
+            time: 2_000,
+            until: 3_000,
+            reason: None,
+            signer: None,
+            signer_cert: None,
+        }
+        .sign_as_device(&manager, cert.sign(&id))
+        .unwrap();
+        let record = Record::parse(&signed, None).unwrap();
+        kept_record(&id.public(), &record);
+        // Past the floor its signer was certified at.
+        at_floor(&id.public(), 2, |_| ());
+        let evidence = evidence_of(&id.public());
+        assert_eq!((evidence.revoked, evidence.floor), (vec![lost.to_vec()], 2));
     }
 }

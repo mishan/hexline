@@ -16,8 +16,8 @@ use zeroize::Zeroizing;
 
 use crate::enroll::mailbox_base;
 use crate::epoch::{
-    at_floor, published_at, read_whole, registrars_of, revoked, revoked_keys, signed_out,
-    standing_unknown, Published, WholeRead,
+    at_floor, published_at, read_whole, registrars_of, revoked, signed_out, standing_unknown,
+    Published, WholeRead,
 };
 use crate::restore::{b64, endpoint, issued};
 use crate::CoreError;
@@ -235,9 +235,6 @@ pub enum DeviceStanding {
 pub struct DeviceStandings {
     /// Each device asked about, in the order asked.
     pub devices: Vec<DeviceStanding>,
-    /// Every key a revocation that stands names, of those asked about or
-    /// not.
-    pub revoked: Vec<Vec<u8>>,
     /// Whether every registrar this phone keeps for the identity was read,
     /// or with none kept, any: those are where its revocations are posted,
     /// so without one a device revoked from here may read as in force.
@@ -501,9 +498,13 @@ impl HolderSession {
         card: Vec<u8>,
         kept: HolderKept,
     ) -> Result<Arc<HolderSession>, CoreError> {
+        // Taken with the phone's clock since boot as it was read for this.
+        let opened_at = (crate::epoch::boot_secs(), tokio::time::Instant::now());
         let parsed = hl_identity::Card::parse(&card).map_err(|_| refused("bad_card"))?;
         let registrars = registrars_of(kept.registrar.as_slice(), &parsed);
         let listed = pairs(&kept.devices);
+        // A whole read stands in with the floor it saw.
+        let floor = kept.epoch.max(kept.read.as_ref().map_or(0, |r| r.floor));
         let revoked_here = revoked_of(&kept.devices);
         let base = mailbox_base(mailbox)?;
         let http = auth::http_client(base.as_str(), None)?;
@@ -558,14 +559,14 @@ impl HolderSession {
             deadline: Mutex::new(tokio::time::Instant::now() + Duration::from_secs(expires_in)),
             card,
             registrars,
-            kept: kept.epoch,
+            kept: floor,
             listed,
             kept_registrars: kept.registrar.into_iter().collect(),
             revoked_here,
             last_read: kept.read,
             uptime: kept.uptime,
             boot: kept.boot,
-            opened: (crate::epoch::boot_secs(), tokio::time::Instant::now()),
+            opened: opened_at,
             pairing,
             qr,
             #[cfg(feature = "live-tests")]
@@ -1208,10 +1209,6 @@ pub async fn device_standing(
                 .collect();
             DeviceStandings {
                 devices,
-                revoked: revoked_keys(floor, &published)
-                    .iter()
-                    .map(|k| k.to_vec())
-                    .collect(),
                 complete: read_whole(&kept, &all, &published),
             }
         })
@@ -1723,7 +1720,6 @@ mod tests {
             none,
             DeviceStandings {
                 devices: vec![SignedOut, InForce, InForce, InForce],
-                revoked: vec![],
                 complete: false,
             }
         );
@@ -1736,7 +1732,6 @@ mod tests {
             read,
             DeviceStandings {
                 devices: vec![SignedOut, SignedOut, Revoked, InForce],
-                revoked: vec![lost.to_vec()],
                 complete: true,
             }
         );
@@ -1790,7 +1785,6 @@ mod tests {
                 got,
                 DeviceStandings {
                     devices: vec![DeviceStanding::Revoked],
-                    revoked: vec![lost.to_vec()],
                     complete,
                 },
                 "{kept:?}"
@@ -1895,6 +1889,7 @@ mod tests {
                 } else {
                     vec!["https://other.invalid".into()]
                 },
+                floor: 0,
             }),
             uptime: UPTIME as u64,
             boot: if case.no_boot { "" } else { "7" }.into(),
@@ -2165,6 +2160,84 @@ mod tests {
             let got = judged(case).await;
             if got != want {
                 wrong.push(format!("{what}: {got}, not {want}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_read_of_the_records_keeps_what_it_verified_whatever_it_comes_to() {
+        use crate::epoch::evidence_of;
+        use crate::epoch::tests::{registrar_failing, reset, revocation};
+        let mut wrong = Vec::new();
+        // How the registrar answers, and whether what its first page holds is kept.
+        for (answers, kept) in [
+            ("whole", true),
+            ("its second page refused", true),
+            ("its epoch first, its second page refused", false),
+            ("gone", false),
+        ] {
+            for entry in [
+                "published_at",
+                "device_standing",
+                "a request from the revoked key",
+                "a request from another key",
+            ] {
+                let id = IdentityKey::generate();
+                let card = hl_identity::Card::new(&id, "Alice", 10)
+                    .sign(&id, Vec::new())
+                    .unwrap();
+                let lost = DeviceKey::generate();
+                let lost_key = lost.public();
+                // The revocation on the first page, a reset on the second, or the other way about.
+                let mut records = vec![revocation(&id, lost_key), reset(&id, 3)];
+                if answers.starts_with("its epoch first") {
+                    records.reverse();
+                }
+                let registrar = match answers {
+                    "whole" => registrar_failing(records, 1, usize::MAX).await.to_string(),
+                    "gone" => {
+                        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                        format!("http://{}", l.local_addr().unwrap())
+                    }
+                    _ => registrar_failing(records, 1, 1).await.to_string(),
+                };
+                match entry {
+                    "published_at" => {
+                        published_at(std::slice::from_ref(&registrar), &id.public(), FLOOR_WAIT)
+                            .await;
+                    }
+                    "device_standing" => {
+                        let _ =
+                            device_standing(card.clone(), vec![registrar.clone()], 0, Vec::new())
+                                .await;
+                    }
+                    _ => {
+                        let asking = if entry == "a request from the revoked key" {
+                            lost
+                        } else {
+                            DeviceKey::generate()
+                        };
+                        let now = crate::restore::now();
+                        let request = EnrollRequest::new(&asking, now).sign(&asking);
+                        let (sessions, _) = mailbox(&request, now).await;
+                        let s = session(
+                            sessions,
+                            card.clone(),
+                            vec![registrar.clone()],
+                            0,
+                            Vec::new(),
+                        );
+                        let _ = s.waiting().await;
+                    }
+                }
+                let evidence = evidence_of(&id.public());
+                let has = evidence.revoked.contains(&lost_key.to_vec());
+                let floor = evidence.floor == 3;
+                let read_floor = answers == "whole" || answers.starts_with("its epoch first");
+                if has != kept || floor != read_floor {
+                    wrong.push(format!("{entry}, {answers}: {evidence:?}"));
+                }
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");

@@ -519,8 +519,8 @@ class Identities(
             } else {
                 val json = JSONObject(text)
                 val list = json.getJSONArray("devices")
-                val (seen, seenWhole) = keys(json.optJSONArray("revoked"))
-                val (certified, certifiedWhole) = certified(json.optJSONArray("certified"))
+                val (seen, seenWhole) = keys(json, "revoked")
+                val (certified, certifiedWhole) = certified(json, "certified")
                 // Part of the evidence not reading sets the file aside, where what does read still counts.
                 if (!seenWhole || !certifiedWhole) error("evidence that does not read")
                 val devices = (0 until list.length()).map { device(list.getJSONObject(it)) }
@@ -534,16 +534,22 @@ class Identities(
         }
     }
 
-    /** The keys in [array] that read, and whether all of them did. */
-    private fun keys(array: JSONArray?): Pair<List<ByteArray>, Boolean> {
-        if (array == null) return emptyList<ByteArray>() to true
+    /** The keys [json] holds under [name] that read, and whether all of them did: none held, or one not a list, being none read. */
+    private fun keys(
+        json: JSONObject,
+        name: String,
+    ): Pair<List<ByteArray>, Boolean> {
+        val array = json.optJSONArray(name) ?: return emptyList<ByteArray>() to !json.has(name)
         val keys = (0 until array.length()).mapNotNull { i -> key { array.getString(i) } }
         return keys to (keys.size == array.length())
     }
 
-    /** The keys certified here in [array] that read, each with its epoch, and whether all of them did. */
-    private fun certified(array: JSONArray?): Pair<List<Pair<ByteArray, Long>>, Boolean> {
-        if (array == null) return emptyList<Pair<ByteArray, Long>>() to true
+    /** The keys certified here [json] holds under [name] that read, each with its epoch, and whether all of them did. */
+    private fun certified(
+        json: JSONObject,
+        name: String,
+    ): Pair<List<Pair<ByteArray, Long>>, Boolean> {
+        val array = json.optJSONArray(name) ?: return emptyList<Pair<ByteArray, Long>>() to !json.has(name)
         val keys =
             (0 until array.length()).mapNotNull { i ->
                 val entry = array.optJSONObject(i)
@@ -570,6 +576,7 @@ class Identities(
                     r.getLong("uptime").toULong(),
                     r.getString("boot"),
                     (0 until registrars.length()).map { registrars.getString(it) },
+                    r.getLong("floor").toULong(),
                 )
             }
         } catch (_: org.json.JSONException) {
@@ -670,8 +677,8 @@ class Identities(
                     JSONArray(text)
                 } else {
                     val json = JSONObject(text)
-                    seen = keys(json.optJSONArray("revoked"))
-                    certified = certified(json.optJSONArray("certified"))
+                    seen = keys(json, "revoked")
+                    certified = certified(json, "certified")
                     json.getJSONArray("devices")
                 }
             } catch (_: Exception) {
@@ -828,7 +835,8 @@ class Identities(
                     .put("at", r.at.toLong())
                     .put("uptime", r.uptime.toLong())
                     .put("boot", r.boot)
-                    .put("registrars", JSONArray(r.registrars)),
+                    .put("registrars", JSONArray(r.registrars))
+                    .put("floor", r.floor.toLong()),
             )
         }
         commit(mintedFile(fingerprint), json.toString().toByteArray())

@@ -128,6 +128,8 @@ data class DeviceList(
     val setAsideLoses: Boolean = false,
     val standing: Map<String, DeviceStanding> = emptyMap(),
     val unchecked: Boolean = false,
+    /** The devices, by fingerprint, whose revocation a read of the records has shown: confirmed, whatever their standing reads as. */
+    val confirmed: Set<String> = emptySet(),
 ) {
     /** Whether [device] is revoked, as this phone marked it or as the registrars publish it. */
     fun revoked(device: MintedDevice) = device.revoked || standing[device.fingerprint] == DeviceStanding.REVOKED
