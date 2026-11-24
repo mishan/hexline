@@ -488,7 +488,6 @@ class Identities(
                         json.getLong("expires"),
                         json.optBoolean("manage"),
                         json.optBoolean("revoked"),
-                        revoking = json.optBoolean("revoking"),
                         epoch = json.optLong("epoch"),
                     )
                 }
@@ -549,7 +548,6 @@ class Identities(
                     given.canManage,
                     given.revoked,
                     given.own,
-                    given.revoking,
                     epoch,
                 )
             // The list may hold the only copy of a floor, after a crash between its write and the
@@ -585,7 +583,6 @@ class Identities(
                         d.name?.let { put("name", it) }
                         if (d.canManage) put("manage", true)
                         if (d.revoked) put("revoked", true)
-                        if (d.revoking) put("revoking", true)
                         if (d.epoch != 0L) put("epoch", d.epoch)
                     },
             )

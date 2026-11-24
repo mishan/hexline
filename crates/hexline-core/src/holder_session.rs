@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
 use crate::enroll::mailbox_base;
-use crate::epoch::{at_floor, published_at, registrars_of, signed_out, Published};
+use crate::epoch::{at_floor, published_at, registrars_of, revoked, signed_out, Published};
 use crate::restore::{b64, endpoint, issued};
 use crate::CoreError;
 
@@ -190,6 +190,28 @@ pub struct HolderKept {
 pub struct ListedDevice {
     pub device: Vec<u8>,
     pub epoch: u64,
+}
+
+/// Where a device a holder certified stands, as its identity's registrars
+/// publish it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum DeviceStanding {
+    InForce,
+    /// Certified below the floor: a reset signed it out.
+    SignedOut,
+    /// A revocation that stands names it.
+    Revoked,
+}
+
+/// What `device_standing` read.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct DeviceStandings {
+    /// Each device asked about, in the order asked.
+    pub devices: Vec<DeviceStanding>,
+    /// Whether every registrar this phone keeps for the identity was read,
+    /// or with none kept, any: those are where its revocations are posted,
+    /// so without one a device revoked from here may read as in force.
+    pub complete: bool,
 }
 
 /// Why a device is revoked, as the registrar's record says it (registrar §4.4).
@@ -1019,6 +1041,59 @@ pub async fn revoke_device(
         .unwrap_or_else(|_| Err(protocol("the revocation stopped")))
 }
 
+/// Where each of `devices`, certified by the identity whose card is
+/// `card`, stands at its registrars: `registrars`, those this phone keeps
+/// for it, read beside the ones its card's attestations name, each for up
+/// to the floor's wait. The floor is the highest of `epoch`, the one this
+/// phone keeps, what this process learned and what the lists publish.
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn device_standing(
+    card: Vec<u8>,
+    registrars: Vec<String>,
+    epoch: u64,
+    devices: Vec<ListedDevice>,
+) -> Result<DeviceStandings, CoreError> {
+    let card = hl_identity::Card::parse(&card).map_err(|_| refused("bad_card"))?;
+    let devices = devices
+        .iter()
+        .map(|d| {
+            Ok((
+                d.device
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| refused("bad_device"))?,
+                d.epoch,
+            ))
+        })
+        .collect::<Result<Vec<(PublicKey, u64)>, CoreError>>()?;
+    let kept = registrars.clone();
+    let registrars = registrars_of(&registrars, &card);
+    crate::connection::RUNTIME
+        .spawn(async move {
+            let published = published_at(&registrars, &card.identity, FLOOR_WAIT).await;
+            let floor = at_floor(&card.identity, epoch.max(published.epoch), |f| f);
+            let devices = devices
+                .iter()
+                .map(|(device, at)| {
+                    if *at < floor {
+                        DeviceStanding::SignedOut
+                    } else if revoked(device, floor, &published) {
+                        DeviceStanding::Revoked
+                    } else {
+                        DeviceStanding::InForce
+                    }
+                })
+                .collect();
+            let complete = match kept.is_empty() {
+                true => !published.read.is_empty(),
+                false => kept.iter().all(|k| published.read.contains(k)),
+            };
+            DeviceStandings { devices, complete }
+        })
+        .await
+        .map_err(|_| protocol("the read stopped"))
+}
+
 fn refused(code: &str) -> CoreError {
     CoreError::Refused {
         code: code.into(),
@@ -1482,6 +1557,99 @@ mod tests {
             );
             let kept = if silent { 5 } else { 0 };
             assert_eq!(crate::epoch::held_floor(card), kept, "{age} {left}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_device_stands_as_the_identitys_lists_publish_it_and_by_the_kept_floor_where_none_reads(
+    ) {
+        use crate::epoch::tests::{registrar_publishing, reset, revocation};
+        let id = IdentityKey::generate();
+        let card = hl_identity::Card::new(&id, "Alice", 10)
+            .sign(&id, vec![])
+            .unwrap();
+        let [old, mid, lost, kept] = [(); 4].map(|_| DeviceKey::generate().public());
+        let at = |device: PublicKey, epoch| ListedDevice {
+            device: device.to_vec(),
+            epoch,
+        };
+        let devices = vec![at(old, 1), at(mid, 2), at(lost, 3), at(kept, 3)];
+        let gone = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        use DeviceStanding::*;
+        // Read first, nothing is learned yet: the kept floor alone signs out.
+        let none = device_standing(card.clone(), vec![gone], 2, devices.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            none,
+            DeviceStandings {
+                devices: vec![SignedOut, InForce, InForce, InForce],
+                complete: false,
+            }
+        );
+        let records = vec![reset(&id, 3), revocation(&id, lost)];
+        let registrar = registrar_publishing(records, 1).await.to_string();
+        let read = device_standing(card.clone(), vec![registrar], 0, devices)
+            .await
+            .unwrap();
+        assert_eq!(
+            read,
+            DeviceStandings {
+                devices: vec![SignedOut, SignedOut, Revoked, InForce],
+                complete: true,
+            }
+        );
+        let short = device_standing(
+            card,
+            vec![],
+            0,
+            vec![ListedDevice {
+                device: vec![1; 31],
+                epoch: 0,
+            }],
+        )
+        .await;
+        assert!(matches!(short, Err(CoreError::Refused { code, .. }) if code == "bad_device"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_is_complete_only_where_every_registrar_the_phone_keeps_answered() {
+        use crate::epoch::tests::{registrar_publishing, revocation};
+        let id = IdentityKey::generate();
+        let card = hl_identity::Card::new(&id, "Alice", 10)
+            .sign(&id, vec![])
+            .unwrap();
+        let lost = DeviceKey::generate().public();
+        let live = registrar_publishing(vec![revocation(&id, lost)], 8)
+            .await
+            .to_string();
+        let gone = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let devices = vec![ListedDevice {
+            device: lost.to_vec(),
+            epoch: 0,
+        }];
+        for (kept, complete) in [
+            (vec![gone.clone(), live.clone()], false),
+            (vec![live.clone(), gone], false),
+            (vec![live], true),
+        ] {
+            let got = device_standing(card.clone(), kept.clone(), 0, devices.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                got,
+                DeviceStandings {
+                    devices: vec![DeviceStanding::Revoked],
+                    complete,
+                },
+                "{kept:?}"
+            );
         }
     }
 }

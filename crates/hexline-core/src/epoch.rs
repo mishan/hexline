@@ -75,6 +75,8 @@ pub(crate) struct Published {
     pub(crate) time: u64,
     pub(crate) hash: Option<[u8; 32]>,
     pub(crate) revocations: Vec<DeviceRevocation>,
+    /// The registrars whose lists were read, as they were named.
+    pub(crate) read: Vec<String>,
 }
 
 impl Published {
@@ -83,6 +85,7 @@ impl Published {
             (self.epoch, self.time, self.hash) = (other.epoch, other.time, other.hash);
         }
         self.revocations.extend(other.revocations);
+        self.read.extend(other.read);
     }
 }
 
@@ -102,10 +105,20 @@ pub(crate) fn signed_out(
 ) -> bool {
     prev.is_some_and(|p| p.check_floor(floor).is_err())
         || listed.iter().any(|(d, e)| d == device && *e < floor)
-        || published.revocations.iter().any(|r| {
-            let below = r.check_signer_floor(floor).is_err();
-            (r.device == *device && !below) || (r.signer.as_ref() == Some(device) && below)
-        })
+        || revoked(device, floor, published)
+        || published
+            .revocations
+            .iter()
+            .any(|r| r.signer.as_ref() == Some(device) && r.check_signer_floor(floor).is_err())
+}
+
+/// Whether a revocation that stands at `floor` names `device`: one by the
+/// identity, or by a device certified at or past the floor.
+pub(crate) fn revoked(device: &PublicKey, floor: u64, published: &Published) -> bool {
+    published
+        .revocations
+        .iter()
+        .any(|r| r.device == *device && r.check_signer_floor(floor).is_ok())
 }
 
 /// What `registrars` publish of `identity`, each reached at its base and
@@ -124,7 +137,8 @@ pub(crate) async fn published_at(
             let base = registrar_base(&registrar)?;
             let http = auth::http_client(base.as_str(), None)?;
             let reg = discovered(&http, &base).await?;
-            let p = published(&http, &base, &reg, &identity).await?;
+            let mut p = published(&http, &base, &reg, &identity).await?;
+            p.read.push(registrar);
             // Kept as it is read, so a wait given up on before the others
             // answer still learns it.
             at_floor(&identity, p.epoch, |_| ());
@@ -308,7 +322,7 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    fn revocation(id: &IdentityKey, device: PublicKey) -> Vec<u8> {
+    pub(crate) fn revocation(id: &IdentityKey, device: PublicKey) -> Vec<u8> {
         DeviceRevocation {
             identity: id.public(),
             device,

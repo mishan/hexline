@@ -4,6 +4,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.yield
 import org.foggyden.hexline.core.Certified
 import org.foggyden.hexline.core.CoreException
+import org.foggyden.hexline.core.DeviceStanding
+import org.foggyden.hexline.core.DeviceStandings
 import org.foggyden.hexline.core.HeldRestore
 import org.foggyden.hexline.core.HolderCommitted
 import org.foggyden.hexline.core.HolderKept
@@ -175,6 +177,9 @@ class FakeSetups : HolderSetups {
     /** What the next revocation throws, if anything, the registrar's answer not had. */
     var revokeFails: Exception? = null
 
+    /** What the next revocation throws once the registrar has taken it, its answer lost. */
+    var revokeAnswerLost: Exception? = null
+
     /** Called as each revocation reaches the registrar. */
     var onRevoke: () -> Unit = {}
 
@@ -194,6 +199,37 @@ class FakeSetups : HolderSetups {
             throw it
         }
         revocations += Revocation(identitySeed, registrar, device, reason, until)
+        revokeAnswerLost?.let {
+            revokeAnswerLost = null
+            throw it
+        }
+    }
+
+    /** Whether the registrars' lists read: each publishes the revocations taken and [floor]. */
+    var listsRead = true
+
+    /** What a read of the registrars' records throws, if anything. */
+    var standingFails: CoreException? = null
+
+    override suspend fun standing(
+        card: ByteArray,
+        registrars: List<String>,
+        epoch: Long,
+        devices: List<ListedDevice>,
+    ): DeviceStandings {
+        yield()
+        standingFails?.let { throw it }
+        val floor = if (listsRead) maxOf(epoch, floor) else epoch
+        return DeviceStandings(
+            devices.map { d ->
+                when {
+                    d.epoch.toLong() < floor -> DeviceStanding.SIGNED_OUT
+                    listsRead && revocations.any { it.device.contentEquals(d.device) } -> DeviceStanding.REVOKED
+                    else -> DeviceStanding.IN_FORCE
+                }
+            },
+            listsRead,
+        )
     }
 
     override fun deviceFingerprint(device: ByteArray) = deviceFingerprintOf(device)

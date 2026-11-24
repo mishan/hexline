@@ -28,6 +28,8 @@ import kotlinx.coroutines.Dispatchers
 import org.foggyden.hexline.R
 import org.foggyden.hexline.core.Caps
 import org.foggyden.hexline.core.Certified
+import org.foggyden.hexline.core.DeviceStanding
+import org.foggyden.hexline.core.DeviceStandings
 import org.foggyden.hexline.core.HeldRestore
 import org.foggyden.hexline.core.HolderCommitted
 import org.foggyden.hexline.core.HolderKept
@@ -428,6 +430,13 @@ class HolderSetupScreenTest {
             until: Long,
             thisDevice: ByteArray,
         ): Unit = error("no registrar here")
+
+        override suspend fun standing(
+            card: ByteArray,
+            registrars: List<String>,
+            epoch: Long,
+            devices: List<ListedDevice>,
+        ) = DeviceStandings(devices.map { DeviceStanding.IN_FORCE }, complete = false)
 
         override fun deviceFingerprint(device: ByteArray) = deviceFingerprintOf(device)
 
