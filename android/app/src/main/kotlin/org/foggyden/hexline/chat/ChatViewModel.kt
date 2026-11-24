@@ -168,7 +168,14 @@ class ChatViewModel internal constructor(
         CoreHolderSetups,
         { System.currentTimeMillis() / 1000 },
         ProcessLifecycleOwner.get().lifecycle,
-        boot = { Settings.Global.getInt(app.contentResolver, Settings.Global.BOOT_COUNT, -1).toString() },
+        // Where the platform keeps no count, no boot is known, and no read stands in for another.
+        boot = {
+            Settings.Global
+                .getInt(app.contentResolver, Settings.Global.BOOT_COUNT, -1)
+                .takeIf { it >= 0 }
+                ?.toString()
+                .orEmpty()
+        },
     )
 
     private val store = queue.dispatcher
@@ -929,6 +936,9 @@ class ChatViewModel internal constructor(
     /** What each identity's registrars last said of its devices, by fingerprint, and whether a list read: on the store queue alone. */
     private val atRegistrars = HashMap<String, Pair<Map<String, DeviceStanding>, Boolean>>()
 
+    /** Keys a read of each identity's records showed revoked that the disk has not taken yet: on the store queue alone. */
+    private val unsavedRevoked = HashMap<String, List<ByteArray>>()
+
     /** Each identity's reads of its registrars' records begun, numbered: on the main thread alone. */
     private val standingReads = HashMap<String, Int>()
 
@@ -958,25 +968,38 @@ class ChatViewModel internal constructor(
             // One read for an identity opened since is dropped.
             if (devicesFor == fingerprint) mintedDevices.value = list
             val said = list?.let { standingOf(fingerprint, it) } ?: return@launch
-            // An answer to a read begun before another, which may know of a revocation since, is dropped.
-            if (read != standingReads[fingerprint]) return@launch
+            // An answer to a read begun before another is not let say where each device stands
+            // or stand in as the last whole read, for the newer may know more; the revocations it
+            // found are kept all the same.
+            val current = read == standingReads[fingerprint]
             val again =
                 withContext(store) {
                     // A read that is not whole takes back no revocation an earlier one found.
-                    atRegistrars[fingerprint] =
-                        if (said.complete) {
-                            said.standing to true
-                        } else {
-                            val found = said.standing.filterValues { it != DeviceStanding.IN_FORCE }
-                            atRegistrars[fingerprint]?.first.orEmpty() + found to false
-                        }
+                    if (current) {
+                        atRegistrars[fingerprint] =
+                            if (said.complete) {
+                                said.standing to true
+                            } else {
+                                val found = said.standing.filterValues { it != DeviceStanding.IN_FORCE }
+                                atRegistrars[fingerprint]?.first.orEmpty() + found to false
+                            }
+                    }
                     // Each key the records show revoked is marked here for good, and a whole read is
-                    // kept for the core to judge by while the records do not read.
+                    // kept for the core to judge by while the records do not read. What the disk will
+                    // not take is held here, counted as kept, and written with the next read.
+                    val found = (unsavedRevoked[fingerprint].orEmpty() + said.revoked).distinctBy { it.toList() }
                     try {
-                        val whole = WholeRead(now().toULong(), uptime().toULong(), boot(), said.registrars).takeIf { said.complete }
-                        identities.recordsRead(fingerprint, whole, said.revoked)
+                        identities.recordsRead(fingerprint, said.whole.takeIf { current }, found)
+                        unsavedRevoked.remove(fingerprint)
                     } catch (e: IOException) {
+                        unsavedRevoked[fingerprint] = found
                         Log.w("hexline", "a read of the records not kept", e)
+                        // A whole read kept from before predates what this one found: it stands in no more.
+                        try {
+                            identities.forgetRead(fingerprint)
+                        } catch (e: IOException) {
+                            Log.w("hexline", "a whole read not let go of", e)
+                        }
                     }
                     devicesOf(fingerprint)
                 }
@@ -988,13 +1011,14 @@ class ChatViewModel internal constructor(
     /**
      * What a read of an identity's records said: of each device by
      * fingerprint, whether it was whole, every key it showed revoked, and
-     * the registrars kept as it was asked.
+     * the read as kept to stand in for one not whole: whole, of a boot
+     * known, and timed as the registrars answered; null otherwise.
      */
     private class Said(
         val standing: Map<String, DeviceStanding>,
         val complete: Boolean,
         val revoked: List<ByteArray>,
-        val registrars: List<String>,
+        val whole: WholeRead?,
     )
 
     /**
@@ -1016,9 +1040,10 @@ class ChatViewModel internal constructor(
             try {
                 setups.standing(stored.card, kept, epoch, listing(others))
             } catch (_: CoreException) {
-                return Said(emptyMap(), false, emptyList(), kept)
+                return Said(emptyMap(), false, emptyList(), null)
             }
-        return Said(others.map { it.fingerprint }.zip(read.devices).toMap(), read.complete, read.revoked, kept)
+        val whole = WholeRead(now().toULong(), uptime().toULong(), boot(), kept).takeIf { read.complete && it.boot.isNotEmpty() }
+        return Said(others.map { it.fingerprint }.zip(read.devices).toMap(), read.complete, read.revoked, whole)
     }
 
     /** [fingerprint]'s devices, the disk's trouble reading them told as a list that did not read. */
@@ -1093,7 +1118,7 @@ class ChatViewModel internal constructor(
         val list = devicesOf(fingerprint) ?: return Revoked.Unknown
         val seen =
             try {
-                identities.seenRevoked(fingerprint)
+                seenRevoked(fingerprint)
             } catch (_: IOException) {
                 return Revoked.Unknown
             }
@@ -1125,7 +1150,7 @@ class ChatViewModel internal constructor(
                         // A list that does not read lists nothing here; it blocks the approval instead.
                         val (listed, read) =
                             try {
-                                listing(identities.minted(fingerprint), identities.seenRevoked(fingerprint)) to
+                                known(fingerprint) to
                                     identities.lastRead(fingerprint)
                             } catch (_: IOException) {
                                 emptyList<ListedDevice>() to null
@@ -1178,12 +1203,28 @@ class ChatViewModel internal constructor(
         }
     }
 
-    /** [devices] as the core is handed them, each key in [seen], revoked by the records, among them marked revoked. */
-    private fun listing(
-        devices: List<MintedDevice>,
-        seen: List<ByteArray> = emptyList(),
-    ) = devices.map { ListedDevice(it.device, it.epoch.toULong(), it.revoked || seen.any { s -> s.contentEquals(it.device) }) } +
-        seen.filter { s -> devices.none { it.device.contentEquals(s) } }.map { ListedDevice(it, 0uL, true) }
+    /** Every key a read of [fingerprint]'s records showed revoked, those the disk has yet to take among them. */
+    private fun seenRevoked(fingerprint: String) = identities.seenRevoked(fingerprint) + unsavedRevoked[fingerprint].orEmpty()
+
+    /** [devices] as the core is handed them alone, with nothing else known of their identity. */
+    private fun listing(devices: List<MintedDevice>) = devices.map { ListedDevice(it.device, it.epoch.toULong(), it.revoked) }
+
+    /**
+     * [fingerprint]'s devices as the core is handed them to judge a request
+     * by: each it lists, each key ever certified here (a device let go of
+     * past its certificate among them), and each key seen revoked, marked
+     * revoked as the list or a read of the records says.
+     */
+    private fun known(fingerprint: String): List<ListedDevice> {
+        val devices = identities.minted(fingerprint)
+        val seen = seenRevoked(fingerprint)
+        val certified = identities.everCertified(fingerprint).filter { (k, _) -> devices.none { it.device.contentEquals(k) } }
+        val listed =
+            devices.map { ListedDevice(it.device, it.epoch.toULong(), it.revoked) } +
+                certified.distinctBy { it.first.toList() }.map { (k, e) -> ListedDevice(k, e.toULong(), false) }
+        val marked = listed.map { it.copy(revoked = it.revoked || seen.any { s -> s.contentEquals(it.device) }) }
+        return marked + seen.filter { s -> marked.none { it.device.contentEquals(s) } }.map { ListedDevice(it, 0uL, true) }
+    }
 
     /** [fingerprint]'s device epoch raised to [epoch], learned from its registrars, even as the model goes. */
     private suspend fun learn(
@@ -1238,7 +1279,7 @@ class ChatViewModel internal constructor(
                                         seed,
                                         manage,
                                         device,
-                                        withContext(store) { listing(identities.minted(fingerprint), identities.seenRevoked(fingerprint)) },
+                                        withContext(store) { known(fingerprint) },
                                     )
                                 }
                             } ?: return@keeping asked.copy(revoked = revokedNow())

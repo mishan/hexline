@@ -3704,6 +3704,10 @@ async fn a_key_this_phone_may_have_revoked_is_not_certified_on_records_it_cannot
         asked_keeping(&server, &card, keeping(vec![listed(true)]), &phone).await;
     assert_eq!(refused_as(&marked.unwrap_err()), "signed_out_request");
     within(asking).await.unwrap().unwrap_err();
-    let (_, fine, _) = asked_keeping(&server, &card, keeping(vec![listed(false)]), &phone).await;
-    assert!(fine.is_ok(), "{fine:?}");
+    let (session, fine, asking) =
+        asked_keeping(&server, &card, keeping(vec![listed(false)]), &phone).await;
+    approved(&session, &seed, false, fine.unwrap().device)
+        .await
+        .unwrap();
+    within(asking).await.unwrap().unwrap();
 }

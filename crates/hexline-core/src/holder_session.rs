@@ -359,7 +359,11 @@ impl HolderSession {
     /// read, whose pairing does not hold, made too long ago, or for a key
     /// signed out, is denied unasked, spending the code: refused
     /// `unreadable_request`, `unpaired_request`, `stale_request` or
-    /// `signed_out_request`.
+    /// `signed_out_request`. So is one for a key this identity may have
+    /// revoked while its records do not read whole, refused
+    /// `unchecked_request`: the mailbox takes the denial and the code is
+    /// spent, so once the registrars can be reached the device asks again
+    /// by a new code.
     #[uniffi::method(async_runtime = "tokio")]
     pub async fn next_request(self: Arc<Self>) -> Result<HolderRequest, CoreError> {
         crate::connection::RUNTIME
@@ -788,18 +792,7 @@ impl HolderSession {
         let can_manage = cert.caps.unwrap_or(0) & caps::MANAGE != 0;
         // A `prev` this identity signed was minted at a floor known then.
         let prev = own_prev(&request, &id.public());
-        // Either list marking it revoked keeps it from a certificate.
-        if let Some((why, code)) = self.kept_from(
-            &request.device,
-            prev.is_some(),
-            listed,
-            &revoked_of(given),
-            &published,
-        ) {
-            self.answer(json!({ "id": asked_id, "denied": why }))
-                .await?;
-            return Err(refused(code));
-        }
+        let listed_now = listed;
         let listed: Vec<_> = self.listed.iter().chain(listed).copied().collect();
         // As does each device listed, certified at a floor known then.
         let known = listed
@@ -809,16 +802,33 @@ impl HolderSession {
             .max()
             .unwrap_or(0);
         let minted = at_floor(&id.public(), known, |floor| {
-            // The floor may have risen since the request was shown.
-            (!signed_out(&request.device, prev.as_ref(), floor, &listed, &published)).then(|| {
-                cert.epoch = floor;
-                cert.sign(&id)
-            })
+            // The floor may have risen since the request was shown, and a key signed out is told
+            // so before a read that leaves its standing unknown is.
+            if signed_out(&request.device, prev.as_ref(), floor, &listed, &published) {
+                return Err((SIGNED_OUT, "signed_out_request"));
+            }
+            // Either list marking it revoked keeps it from a certificate.
+            let revoked = revoked_of(given);
+            let refused = self.kept_from(
+                &request.device,
+                prev.is_some(),
+                listed_now,
+                &revoked,
+                &published,
+            );
+            if let Some(refused) = refused {
+                return Err(refused);
+            }
+            cert.epoch = floor;
+            Ok(cert.sign(&id))
         });
-        let Some(signed) = minted else {
-            self.answer(json!({ "id": asked_id, "denied": SIGNED_OUT }))
-                .await?;
-            return Err(refused("signed_out_request"));
+        let signed = match minted {
+            Ok(signed) => signed,
+            Err((why, code)) => {
+                self.answer(json!({ "id": asked_id, "denied": why }))
+                    .await?;
+                return Err(refused(code));
+            }
         };
         let epoch = cert.epoch;
         DeviceCert::parse(&signed).map_err(|_| refused("bad_device_name"))?;
@@ -1804,6 +1814,12 @@ mod tests {
         attested: bool,
         last: Option<(i64, i64, bool)>,
         rebooted: bool,
+        /// No boot known, then or now.
+        no_boot: bool,
+        /// Listed, unmarked, only in the list given at certifying, with the
+        /// floor raised to `floor_since` before it is.
+        listed_since: bool,
+        floor_since: u64,
     }
 
     /// What `case` comes to: certified, or the code it was refused with,
@@ -1868,7 +1884,12 @@ mod tests {
             last_read: case.last.map(|(wall, booted, reached)| WholeRead {
                 at: (now as i64 - wall) as u64,
                 uptime: (UPTIME - booted) as u64,
-                boot: if case.rebooted { "6" } else { "7" }.into(),
+                boot: match (case.no_boot, case.rebooted) {
+                    (true, _) => "",
+                    (_, true) => "6",
+                    _ => "7",
+                }
+                .into(),
                 registrars: if reached {
                     kept.clone()
                 } else {
@@ -1876,7 +1897,7 @@ mod tests {
                 },
             }),
             uptime: UPTIME as u64,
-            boot: "7".into(),
+            boot: if case.no_boot { "" } else { "7" }.into(),
             ..session(sessions, card, registrars, 0, pairs(listed_here.as_slice()))
         });
         let code = |e: CoreError| match e {
@@ -1898,7 +1919,15 @@ mod tests {
                 epoch: 0,
                 revoked: true,
             }))
+            .chain(case.listed_since.then(|| ListedDevice {
+                device: device.public().to_vec(),
+                epoch: 0,
+                revoked: false,
+            }))
             .collect();
+        if case.floor_since > 0 {
+            at_floor(&id.public(), case.floor_since, |_| ());
+        }
         match s
             .certifying(&*id.seed(), false, &shown.device, &given)
             .await
@@ -2079,6 +2108,33 @@ mod tests {
                     ..down
                 },
                 unchecked,
+            ),
+            (
+                "down, no boot known",
+                Case {
+                    last: fresh,
+                    no_boot: true,
+                    ..down
+                },
+                unchecked,
+            ),
+            (
+                "down, listed since below a floor raised since",
+                Case {
+                    listed: None,
+                    listed_since: true,
+                    floor_since: 2,
+                    ..down
+                },
+                no,
+            ),
+            (
+                "certified here below a floor raised since, read whole",
+                Case {
+                    floor_since: 2,
+                    ..listed
+                },
+                no,
             ),
             (
                 "down, the read was of another registrar",

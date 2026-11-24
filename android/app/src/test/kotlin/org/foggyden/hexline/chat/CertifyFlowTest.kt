@@ -20,6 +20,7 @@ import org.foggyden.hexline.identity.SetupProblem
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -667,7 +668,7 @@ class CertifyFlowTest : ViewModelHarness() {
     }
 
     @Test
-    fun aKeySeenRevokedStandsPastAKeyBesideItThatDoesNotRead() {
+    fun aListWithAKeySeenRevokedThatDoesNotReadIsSetAsideAndTheOneBesideItStillRefused() {
         val vm = model()
         settle()
         val fingerprint = heldHere(vm)
@@ -676,10 +677,175 @@ class CertifyFlowTest : ViewModelHarness() {
         setups.standingWaits = CompletableDeferred()
         vm.openDevices(fingerprint)
         settle()
-        assertFalse("not set aside", checkNotNull(vm.devices.value).setAside)
+        val list = checkNotNull(vm.devices.value)
+        assertTrue("set aside", list.setAside)
+        assertTrue("warned", list.setAsideLoses)
         val session = shown(vm, fingerprint)
         asked(vm, fingerprint, session, Revoked.Yes)
         assertTrue(handed(session, tablet.device))
+        assertNull("no read stands in from it", session.kept.read)
+    }
+
+    @Test
+    fun revocationsAReadFindsThatTheDiskWillNotTakeAreHeldAndWrittenWithTheNext() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        setups.revokedElsewhere(cardOf(fingerprint), tablet.device)
+        unwritable {
+            vm.openDevices(fingerprint)
+            settle()
+        }
+        assertEquals("not on disk", emptyList<ByteArray>(), outside { identities.seenRevoked(fingerprint) })
+        // Asked before any other read lands.
+        val held = CompletableDeferred<Unit>()
+        setups.standingWaits = held
+        val session = shown(vm, fingerprint)
+        asked(vm, fingerprint, session, Revoked.Yes)
+        assertTrue("handed to the core", handed(session, tablet.device))
+        setups.standingWaits = null
+        held.complete(Unit)
+        settle()
+        assertEquals(listOf(tablet.device.toList()), outside { identities.seenRevoked(fingerprint) }.map { it.toList() })
+    }
+
+    @Test
+    fun theRevocationsARecordsReadOvertakenFoundAreKeptAndNothingElseOfIt() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val earlier = CompletableDeferred<Unit>()
+        setups.standingWaits = earlier
+        vm.openDevices(fingerprint)
+        settle()
+        // A newer read, not whole and finding nothing, lands first.
+        setups.standingWaits = null
+        setups.listsRead = false
+        vm.openDevices(fingerprint)
+        settle()
+        setups.listsRead = true
+        setups.revokedElsewhere(cardOf(fingerprint), tablet.device)
+        earlier.complete(Unit)
+        settle()
+        setups.standingWaits = CompletableDeferred()
+        val session = shown(vm, fingerprint)
+        asked(vm, fingerprint, session, Revoked.Yes)
+        assertNull("the overtaken read stands in for nothing", session.kept.read)
+    }
+
+    @Test
+    fun aListSetAsideIsKeptWhereTheListDoesNotHoldWhatIsCarriedFromIt() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val key = { b: Byte -> android.util.Base64.encodeToString(ByteArray(32) { b }, android.util.Base64.NO_WRAP) }
+        minted(fingerprint).writeText("""{"devices":[{"device":12}],"revoked":["${key(7)}"]}""")
+        setups.standingWaits = CompletableDeferred()
+        vm.openDevices(fingerprint)
+        settle()
+        stores.losesLists = true
+        vm.discardUnreadable(fingerprint)
+        settle()
+        stores.losesLists = false
+        assertTrue("still set aside", checkNotNull(vm.devices.value).setAside)
+        val session = shown(vm, fingerprint)
+        asked(vm, fingerprint, session, Revoked.Yes)
+    }
+
+    @Test
+    fun aListSetAsideCarriesItsRevokedDevicesAtTheirEpochAndMarksThoseItsKeysSeenRevokedName() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val key = { b: Byte -> android.util.Base64.encodeToString(ByteArray(32) { b }, android.util.Base64.NO_WRAP) }
+        val ends = now + DAY
+        outside { identities.minted(fingerprint, entry(8, ends), now) }
+        File(stores.identityDir, minted(fingerprint).name + ".unread-0").writeText(
+            """{"devices":[{"device":"${key(9)}","expires":$ends,"revoked":true,"epoch":5}],"revoked":["${key(8)}"]}""",
+        )
+        vm.discardUnreadable(fingerprint)
+        settle()
+        val kept = onDisk(fingerprint)
+        assertEquals(5L, kept.single { it.device[0] == 9.toByte() }.epoch)
+        assertTrue(kept.single { it.device[0] == 9.toByte() }.revoked)
+        assertTrue("marked by a key seen revoked", kept.single { it.device[0] == 8.toByte() }.revoked)
+    }
+
+    @Test
+    fun aKeyCertifiedHereIsHandedToTheCoreLongAfterItsEntryIsLetGo() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        vm.openDevices(fingerprint)
+        val first = certified(vm, fingerprint)
+        now = lapsed(first.expires.toLong())
+        outside { identities.minted(fingerprint, entry(9, now + DAY), now) }
+        assertFalse("let go of", onDisk(fingerprint).any { it.device.contentEquals(tablet.device) })
+        setups.listsRead = false
+        val again = model2()
+        val session = shown(again, fingerprint)
+        val handedIt = session.kept.devices.find { it.device.contentEquals(tablet.device) }
+        assertEquals("known, for the core to judge", false, handedIt?.revoked)
+        assertEquals("at the epoch it was certified in", first.epoch, handedIt?.epoch)
+    }
+
+    @Test
+    fun aListSetAsideMeanwhileIsNotDiscardedUnread() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val key = { b: Byte -> android.util.Base64.encodeToString(ByteArray(32) { b }, android.util.Base64.NO_WRAP) }
+        File(stores.identityDir, minted(fingerprint).name + ".unread-0").writeText("""{"devices":[],"revoked":["${key(7)}"]}""")
+        // The list itself turns unreadable after the copy was looked at.
+        minted(fingerprint).writeText("""{"devices":[],"revoked":[12,"${key(5)}"]}""")
+        setups.standingWaits = CompletableDeferred()
+        vm.discardUnreadable(fingerprint)
+        settle()
+        assertEquals(
+            listOf(5, 7),
+            outside { identities.seenRevoked(fingerprint) }.map { it[0].toInt() }.sorted(),
+        )
+    }
+
+    @Test
+    fun aWholeReadKeptIsLetGoOfWhenALaterReadsRevocationsCannotBeKept() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        vm.openDevices(fingerprint)
+        settle()
+        assertNotNull(outside { identities.lastRead(fingerprint) })
+        setups.revokedElsewhere(cardOf(fingerprint), tablet.device)
+        stores.listsFail = 1
+        vm.openDevices(fingerprint)
+        settle()
+        assertNull("a read from before stands in no more", outside { identities.lastRead(fingerprint) })
+    }
+
+    @Test
+    fun aDeviceRevokedInAListSetAsideIsHandedToTheCoreRevoked() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val key = { b: Byte -> android.util.Base64.encodeToString(ByteArray(32) { b }, android.util.Base64.NO_WRAP) }
+        File(stores.identityDir, minted(fingerprint).name + ".unread-0").writeText(
+            """{"devices":[{"device":"${key(9)}","expires":${now + DAY},"revoked":true}]}""",
+        )
+        setups.standingWaits = CompletableDeferred()
+        val session = shown(vm, fingerprint)
+        assertTrue(handed(session, ByteArray(32) { 9 }))
+    }
+
+    @Test
+    fun aWholeReadIsNotKeptToStandInWhereNoBootIsKnown() {
+        boot = ""
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        vm.openDevices(fingerprint)
+        settle()
+        val session = shown(vm, fingerprint)
+        assertNull(session.kept.read)
     }
 
     @Test

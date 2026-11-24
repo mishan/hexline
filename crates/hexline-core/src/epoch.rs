@@ -248,7 +248,9 @@ pub(crate) fn standing_unknown(
     (now, uptime, boot): (u64, u64, &str),
 ) -> bool {
     let known = prev || listed.iter().any(|(d, _)| d == device);
-    known && !whole && !last.is_some_and(|l| l.boot == boot && stands(l, kept, now, uptime))
+    // A boot not known stands in for nothing, so a read made in one is never taken for this one's.
+    let same_boot = |l: &WholeRead| !boot.is_empty() && l.boot == boot;
+    known && !whole && !last.is_some_and(|l| same_boot(l) && stands(l, kept, now, uptime))
 }
 
 /// Whether `last` stands in for a read that is not whole: within
