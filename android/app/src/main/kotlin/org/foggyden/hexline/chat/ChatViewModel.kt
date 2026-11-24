@@ -942,9 +942,11 @@ class ChatViewModel internal constructor(
         }
     }
 
+    /** The number of [fingerprint]'s next records read: an answer to any read begun before it is dropped. */
+    private fun nextRead(fingerprint: String): Int = ((standingReads[fingerprint] ?: 0) + 1).also { standingReads[fingerprint] = it }
+
     private fun refreshDevices(fingerprint: String) {
-        val read = (standingReads[fingerprint] ?: 0) + 1
-        standingReads[fingerprint] = read
+        val read = nextRead(fingerprint)
         viewModelScope.launch {
             val list = withContext(store) { devicesOf(fingerprint) }
             // One read for an identity opened since is dropped.
@@ -1024,7 +1026,8 @@ class ChatViewModel internal constructor(
         val merged =
             (listed.filter { l -> pending.none { it.device.contentEquals(l.device) } } + pending)
                 .filter { it.listed(now()) || standing[it.fingerprint] == DeviceStanding.REVOKED }
-        val unchecked = !read && merged.isNotEmpty()
+        // One listed since the last read was not asked about.
+        val unchecked = merged.any { !read || it.fingerprint !in standing }
         return DeviceList(fingerprint, listOf(own) + merged, unreadable, identities.mintedUnreadable(fingerprint), standing, unchecked)
     }
 
@@ -1317,7 +1320,9 @@ class ChatViewModel internal constructor(
                             throw e
                         } catch (e: Exception) {
                             if (sent) {
-                                // Unknown until a whole read says, as the registrar may have it.
+                                // Unknown until a whole read says, as the registrar may have it; no
+                                // read begun before this lands after it.
+                                nextRead(fingerprint)
                                 withContext(store) { atRegistrars[fingerprint]?.let { atRegistrars[fingerprint] = it.first to false } }
                                 refreshDevices(fingerprint)
                             }

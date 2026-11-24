@@ -735,6 +735,50 @@ class CertifyFlowTest : ViewModelHarness() {
     }
 
     @Test
+    fun aDeviceListedSinceTheLastRecordsReadIsUncheckedAndARequestFromItUnknown() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        outside { identities.minted(fingerprint, entry(9, now + DAY), now) }
+        vm.openDevices(fingerprint)
+        settle()
+        assertFalse(checkNotNull(vm.devices.value).unchecked)
+        outside { identities.minted(fingerprint, entry(7, now + DAY), now) }
+        setups.standingWaits = CompletableDeferred()
+        val session = shown(vm, fingerprint)
+        asked(vm, fingerprint, session, Revoked.Unknown)
+        assertTrue(checkNotNull(vm.devices.value).unchecked)
+    }
+
+    @Test
+    fun aRecordsReadBegunBeforeAnUnconfirmedRevocationDoesNotLandAfterIt() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        vm.openDevices(fingerprint)
+        certified(vm, fingerprint)
+        val device = devices(vm).single { !it.own }
+        val earlier = CompletableDeferred<Unit>()
+        setups.standingWaits = earlier
+        vm.openDevices(fingerprint)
+        settle()
+        setups.standingWaits = CompletableDeferred()
+        var sent = false
+        setups.onRevoke = { sent = true }
+        setups.revokeFails = CoreException.Refused("server_error", "", null)
+        vm.revokeDevice(fingerprint, device, RevokeReason.LOST, stores.keys.authorizer())
+        while (!sent) {
+            onMain()
+            if (!sent) onDisk()
+        }
+        // The earlier read answers with the failure's invalidation queued and not yet run.
+        earlier.complete(Unit)
+        settle()
+        val session = shown(vm, fingerprint)
+        asked(vm, fingerprint, session, Revoked.Unknown)
+    }
+
+    @Test
     fun aRevocationUnconfirmedLeavesARequestFromItUnknownUntilTheRecordsAreRead() {
         val vm = model()
         settle()
