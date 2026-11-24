@@ -18,9 +18,10 @@ cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -P 29 -o "$OUT/jniLibs" \
     build $flag -p hexline-core
 
 cargo build -p hexline-core
+host=${CARGO_TARGET_DIR:-target}/debug/libhexline_core.so
 mkdir -p "$OUT/host"
-cp target/debug/libhexline_core.so "$OUT/host/"
+cp "$host" "$OUT/host/"
 
 rm -rf "$OUT/kotlin"
-cargo run -q -p uniffi-bindgen -- generate --library target/debug/libhexline_core.so \
+cargo run -q -p uniffi-bindgen -- generate --library "$host" \
     --language kotlin --out-dir "$OUT/kotlin"
