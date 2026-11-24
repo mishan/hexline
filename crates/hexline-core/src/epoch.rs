@@ -109,6 +109,15 @@ pub(crate) fn evidence_of(identity: &PublicKey) -> Evidence {
     Evidence { revoked, floor }
 }
 
+/// Whether a read of `identity`'s records in this process verified a
+/// revocation of `device`. It takes no lock but the store's own, so it
+/// may be asked with the floor's held, as a mint asks it.
+pub(crate) fn seen_revoked(identity: &PublicKey, device: &PublicKey) -> bool {
+    let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    seen.get(identity)
+        .is_some_and(|all| all.iter().any(|r| r.device == *device))
+}
+
 /// `record`, verified from `identity`'s records, kept as evidence: the
 /// floor an epoch record raises, and a revocation as seen. Each reader of
 /// the records calls it on every record as its page is verified.

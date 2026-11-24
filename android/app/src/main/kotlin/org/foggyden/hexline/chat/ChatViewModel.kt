@@ -979,8 +979,9 @@ class ChatViewModel internal constructor(
             // or stand in as the last whole read, for the newer may know more; the revocations it
             // found are kept all the same.
             val current = read == standingReads[fingerprint]
+            // Kept however the model ends meanwhile, as every other write of what a read found is.
             val again =
-                withContext(store) {
+                withContext(NonCancellable + store) {
                     // A read that is not whole takes back no revocation an earlier one found.
                     if (current) {
                         atRegistrars[fingerprint] =
@@ -1256,10 +1257,12 @@ class ChatViewModel internal constructor(
     ) {
         val card = identities.list().find { it.fingerprint == fingerprint }?.card ?: return
         val evidence = setups.evidence(card)
+        // The identity's epoch is the floor's home, the whole read's own among it: never the marker alone.
+        val floor = maxOf(evidence.floor, whole?.floor ?: 0uL).toLong()
         try {
-            identities.learned(fingerprint, evidence.floor.toLong())
+            identities.learned(fingerprint, floor)
         } catch (e: IOException) {
-            Log.w("hexline", "device epoch ${evidence.floor} not kept", e)
+            Log.w("hexline", "device epoch $floor not kept", e)
         }
         try {
             identities.recordsRead(fingerprint, whole, evidence.revoked)

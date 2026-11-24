@@ -864,6 +864,12 @@ impl HolderSession {
         if self.revoked_here.iter().chain(revoked).any(|r| r == device) {
             return Some((SIGNED_OUT, "signed_out_request"));
         }
+        // Nor one any read of the records in this process verified revoked, whatever became of
+        // that read: the same evidence, never shrinking, that the app is handed.
+        let card = hl_identity::Card::parse(&self.card).ok()?;
+        if crate::epoch::seen_revoked(&card.identity, device) {
+            return Some((SIGNED_OUT, "signed_out_request"));
+        }
         let listed: Vec<_> = self.listed.iter().chain(listed).copied().collect();
         let whole = read_whole(&self.kept_registrars, &self.registrars, published);
         let now = crate::restore::now();
@@ -2241,5 +2247,34 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_key_named_by_a_revocation_a_failed_read_verified_is_not_certified() {
+        use crate::epoch::tests::{registrar_failing, reset, revocation};
+        let id = IdentityKey::generate();
+        let card = hl_identity::Card::new(&id, "Alice", 10)
+            .sign(&id, Vec::new())
+            .unwrap();
+        let lost = DeviceKey::generate();
+        // Its revocation on the first page, the second refused: the read is not whole.
+        let records = vec![revocation(&id, lost.public()), reset(&id, 3)];
+        let registrar = registrar_failing(records, 1, 1).await.to_string();
+        let now = crate::restore::now();
+        // Not listed here, no prev, and not handed in as revoked.
+        let (sessions, answers) = mailbox(&EnrollRequest::new(&lost, now).sign(&lost), now).await;
+        let s = HolderSession {
+            kept_registrars: vec![registrar.clone()],
+            ..session(sessions, card, vec![registrar], 0, Vec::new())
+        };
+        let refused = s.waiting().await;
+        assert!(
+            matches!(&refused, Err(CoreError::Refused { code, .. }) if code == "signed_out_request"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            *answers.lock().unwrap(),
+            vec![json!({ "id": "r1", "denied": SIGNED_OUT })]
+        );
     }
 }

@@ -905,6 +905,26 @@ class CertifyFlowTest : ViewModelHarness() {
     }
 
     @Test
+    fun theFloorAWholeReadSawOutlivesItsListSetAsideAndDiscarded() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        outside { identities.learned(fingerprint, 1) }
+        minted(fingerprint).writeText(
+            """{"devices":[],"revoked":"not a list","read":{"at":1,"uptime":1,"boot":"1","registrars":[],"floor":7}}""",
+        )
+        setups.standingWaits = CompletableDeferred()
+        vm.openDevices(fingerprint)
+        settle()
+        assertTrue(checkNotNull(vm.devices.value).setAside)
+        vm.discardUnreadable(fingerprint)
+        settle()
+        assertFalse(checkNotNull(vm.devices.value).setAside)
+        val session = shown(vm, fingerprint)
+        assertEquals("the core sees the floor", 7uL, session.kept.epoch)
+    }
+
+    @Test
     fun aWholeReadIsNotKeptToStandInWhereNoBootIsKnown() {
         boot = ""
         val vm = model()

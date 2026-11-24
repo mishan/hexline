@@ -612,6 +612,13 @@ class Identities(
             val carried = salvaged.flatMap { it.revoked }
             val seen = distinct(salvaged.flatMap { it.seen })
             val certified = salvaged.flatMap { it.certified }
+            // The floor a copy's whole read saw goes to the identity, where floors are kept: not
+            // as a whole read to stand in by, which it no longer is.
+            val floor = salvaged.maxOfOrNull { it.floor } ?: 0
+            if (floor > 0) {
+                learned(fingerprint, floor)
+                if ((load(file(fingerprint))?.epoch ?: 0) < floor) throw java.io.IOException("the floor set aside not kept")
+            }
             if (carried.isNotEmpty() || seen.isNotEmpty() || certified.isNotEmpty()) {
                 val kept = kept(fingerprint)
                 if (unread(fingerprint).size != copies.size) throw java.io.IOException("the list was set aside meanwhile")
@@ -664,12 +671,15 @@ class Identities(
         val seen: List<ByteArray>,
         val certified: List<Pair<ByteArray, Long>>,
         val whole: Boolean,
+        /** The floor its whole read saw, where that reads. */
+        val floor: Long = 0,
     )
 
     /** What [copy], a list set aside, still says that can be read. */
     private fun salvaged(copy: File): Salvaged {
         var seen: Pair<List<ByteArray>, Boolean> = emptyList<ByteArray>() to true
         var certified: Pair<List<Pair<ByteArray, Long>>, Boolean> = emptyList<Pair<ByteArray, Long>>() to true
+        var floor = 0L
         val list =
             try {
                 val text = String(AtomicFile(copy).readFully())
@@ -679,10 +689,11 @@ class Identities(
                     val json = JSONObject(text)
                     seen = keys(json, "revoked")
                     certified = certified(json, "certified")
+                    floor = wholeRead(json.optJSONObject("read"))?.floor?.toLong() ?: 0
                     json.getJSONArray("devices")
                 }
             } catch (_: Exception) {
-                return Salvaged(emptyList(), seen.first, certified.first, false)
+                return Salvaged(emptyList(), seen.first, certified.first, false, floor)
             }
         var whole = seen.second && certified.second
         val devices =
@@ -697,7 +708,8 @@ class Identities(
             devices.filter { (_, json) -> json.optBoolean("revoked") }.map { (device, json) ->
                 MintedDevice(device, deviceFingerprintOf(device), null, json.optLong("expires"), false, true, epoch = json.optLong("epoch"))
             }
-        return Salvaged(revoked, seen.first, certified.first + devices.map { (device, json) -> device to json.optLong("epoch") }, whole)
+        val all = certified.first + devices.map { (device, json) -> device to json.optLong("epoch") }
+        return Salvaged(revoked, seen.first, all, whole, floor)
     }
 
     /** [bytes], [file]'s, under a name of their own beside any kept before, and then [file] gone. */
