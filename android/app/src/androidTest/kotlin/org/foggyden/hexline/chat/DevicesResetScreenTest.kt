@@ -150,6 +150,25 @@ class DevicesResetScreenTest {
     }
 
     @Test
+    fun aResetEveryRegistrarWasResetPastIsNotToldAsReachingNone() {
+        val past = listOf(NotYetReset("https://hl.example", NotYet.OVERTAKEN, null, null))
+        show(list(ResetKept(epoch = 1)), Resetting.Done("fp", ResetShown(emptyList(), past, emptyList(), emptyList())))
+        shows(text(R.string.reset_reset_past))
+        rule.onAllNodesWithText(text(R.string.reset_reached_none)).assertCountEquals(0)
+    }
+
+    @Test
+    fun aRegistrarARetryReachedWhileTheScreenIsOpenIsShownReset() {
+        val down = listOf(NotYetReset("https://down.example", NotYet.UNREACHABLE, null, null))
+        val shown = ResetShown(listOf("https://hl.example"), down, emptyList(), listOf("https://down.example"))
+        // What the reset came to as it was made, and what a retry has kept since.
+        show(list(ResetKept(epoch = 1)), Resetting.Done("fp", shown))
+        shows(text(R.string.reset_at, "down.example"))
+        rule.onAllNodesWithText(text(R.string.reset_unreachable, "down.example")).assertCountEquals(0)
+        rule.onAllNodesWithText(text(R.string.reset_still_signed_in, "down.example")).assertCountEquals(0)
+    }
+
+    @Test
     fun aResetThatMayNotHaveFinishedIsSaidAndOfferedAgain() {
         show(list(ResetKept(underWay = 1)))
         shows(text(R.string.reset_unfinished))

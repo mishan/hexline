@@ -258,6 +258,8 @@
     <string name="reset_confirm_body">Every other device will be signed out on servers that check %1$s within the hour. Each one you add back starts over: messages encrypted to it that it hasn\'t read are lost, and it signs up for notifications again. Servers that don\'t support device resets yet won\'t see this.</string>
     <string name="reset_confirm_again">This signs out every device again, including ones you\'ve added back since the last reset.</string>
     <string name="reset_done">Devices reset. Add back each device you still use: open it and enroll it again with a new code.</string>
+    <string name="reset_reset_past">Another holder of this identity has already reset its devices past this reset, so the devices it certified before are signed out.</string>
+    <string name="reset_not_kept">This phone couldn\'t keep what the reset came to, so it may not have finished. Reset again.</string>
     <string name="reset_reached_none">The reset didn\'t reach any registrar yet, so the devices shown as signed out are still signed in everywhere.</string>
     <string name="reset_at">Reset at %1$s.</string>
     <string name="reset_unreachable">Not yet at %1$s, which couldn\'t be reached; trying again.</string>

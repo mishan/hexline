@@ -249,9 +249,7 @@ fun DevicesScreen(
             is Resetting.Working -> Text(stringResource(R.string.holder_working))
             is Resetting.Failed -> Problem(describe(resetting.problem))
             is Resetting.Done -> {
-                // Signed out only where a registrar took it: none did, and it is not said to have.
-                Text(stringResource(if (resetting.reset.done.isEmpty()) R.string.reset_reached_none else R.string.reset_done))
-                ResetLines(resetting.reset)
+                ResetLines(resetting.reset, devices?.reset)
                 Button({ actions.startCertifying(fingerprint, mailbox.trim()) }, enabled = mailbox.isNotBlank() && !busy) {
                     Text(stringResource(R.string.certify_start))
                 }
@@ -320,11 +318,31 @@ fun DevicesScreen(
 
 /** What a reset just made came to, registrar by registrar. */
 @Composable
-private fun ResetLines(reset: ResetShown) {
-    for (r in reset.done) Text(stringResource(R.string.reset_at, hostOf(r)))
-    for (n in reset.notDone) Text(notYet(n, n.registrar in reset.later))
+private fun ResetLines(
+    reset: ResetShown,
+    kept: ResetKept?,
+) {
+    // What retries have come to since, as kept: a registrar in none of its lists has taken it.
+    val owed = kept?.let { it.pending + it.unreset + it.givenUp }
+    val (since, notDone) = reset.notDone.partition { it.why != NotYet.OVERTAKEN && owed != null && it.registrar !in owed }
+    val done = reset.done + since.map { it.registrar }
+    // Signed out only where a registrar took it, or another holder's reset went past it.
+    val headline =
+        when {
+            done.isNotEmpty() -> R.string.reset_done
+            notDone.any { it.why == NotYet.OVERTAKEN } -> R.string.reset_reset_past
+            else -> R.string.reset_reached_none
+        }
+    Text(stringResource(headline))
+    for (r in done) Text(stringResource(R.string.reset_at, hostOf(r)))
+    for (n in notDone) {
+        when (n.registrar) {
+            in kept?.givenUp.orEmpty() -> Text(stringResource(R.string.reset_gave_up, hostOf(n.registrar)))
+            else -> Text(notYet(n, n.registrar in (kept?.pending ?: reset.later)))
+        }
+    }
     for (r in reset.notRegistrars) Text(stringResource(R.string.reset_not_a_registrar, hostOf(r)))
-    StillSignedIn(reset.notDone.filter { it.why != NotYet.OVERTAKEN }.map { it.registrar })
+    StillSignedIn(owed ?: notDone.filter { it.why != NotYet.OVERTAKEN }.map { it.registrar })
 }
 
 /** What is kept of the last reset, as a start finds it: what is still retried, and what never will be. */

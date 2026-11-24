@@ -3565,7 +3565,12 @@ async fn a_registrar_down_at_a_reset_is_caught_up_by_its_retry_at_the_same_epoch
     assert!(reset.later.contains(&front.url), "{:?}", reset.later);
 
     front.down.store(false, Ordering::SeqCst);
-    let retried = hexline_core::retry_reset(reset.retry.unwrap(), card)
+    // Not asked before the backoff's first wait is up.
+    let early = hexline_core::retry_reset(reset.retry.clone().unwrap(), card.clone())
+        .await
+        .unwrap();
+    assert!(early.done.is_empty(), "{:?}", early.done);
+    let retried = hexline_core::retry_reset_ahead(reset.retry.unwrap(), card, 15 * 60)
         .await
         .unwrap();
     assert_eq!(

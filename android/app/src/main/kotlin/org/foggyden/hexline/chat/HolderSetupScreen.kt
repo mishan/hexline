@@ -348,5 +348,6 @@ internal fun describe(problem: SetupProblem): String =
         SetupProblem.OwnDevice -> stringResource(R.string.revoke_own_device)
         SetupProblem.ResetUnderWay -> stringResource(R.string.reset_under_way)
         SetupProblem.NoRegistrarReached -> stringResource(R.string.reset_none_reached)
+        SetupProblem.ResetNotKept -> stringResource(R.string.reset_not_kept)
         SetupProblem.Other -> stringResource(R.string.holder_failed)
     }

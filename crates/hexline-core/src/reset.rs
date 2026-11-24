@@ -1042,7 +1042,8 @@ fn lagging(
                 registrar: registrar.clone(),
                 kept: kept(registrar),
                 records: chain_to(id, report.target, cur)?,
-                due: at.saturating_add(wait(registrar)),
+                // The backoff's first wait, as every later retry's, or longer where it asked.
+                due: at.saturating_add(wait(registrar).max(RETRY_EVERY)),
                 tries: 0,
             })
         })
@@ -1214,12 +1215,26 @@ fn is_due(chain: &Chain, at: u64) -> bool {
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn retry_reset(retry: Vec<u8>, card: Vec<u8>) -> Result<ResetRetried, CoreError> {
     crate::connection::RUNTIME
-        .spawn(retrying(retry, card))
+        .spawn(retrying(retry, card, 0))
         .await
         .unwrap_or_else(|_| Err(protocol("the retry stopped")))
 }
 
-async fn retrying(retry: Vec<u8>, card: Vec<u8>) -> Result<ResetRetried, CoreError> {
+/// As [`retry_reset`], by a clock `ahead` seconds on: a live test's retry
+/// once a wait is up, without waiting for it.
+#[cfg(feature = "live-tests")]
+pub async fn retry_reset_ahead(
+    retry: Vec<u8>,
+    card: Vec<u8>,
+    ahead: u64,
+) -> Result<ResetRetried, CoreError> {
+    crate::connection::RUNTIME
+        .spawn(retrying(retry, card, ahead))
+        .await
+        .unwrap_or_else(|_| Err(protocol("the retry stopped")))
+}
+
+async fn retrying(retry: Vec<u8>, card: Vec<u8>, ahead: u64) -> Result<ResetRetried, CoreError> {
     let identity = Card::parse(&card)
         .map_err(|_| refused("wrong_identity"))?
         .identity;
@@ -1236,7 +1251,8 @@ async fn retrying(retry: Vec<u8>, card: Vec<u8>) -> Result<ResetRetried, CoreErr
         })
         .collect();
     let desks = chains.into_iter().zip(remotes.iter_mut()).collect();
-    Ok(retry_all(retry, desks, &Floors(identity), now).await)
+    let clock = move || now().saturating_add(ahead);
+    Ok(retry_all(retry, desks, &Floors(identity), clock).await)
 }
 
 /// What a retry came to at one registrar.
@@ -2616,7 +2632,7 @@ mod tests {
             }],
         };
         let _resetting = Resetting::take(&id.public()).unwrap();
-        match retrying(encode(&kept).unwrap(), card).await {
+        match retrying(encode(&kept).unwrap(), card, 0).await {
             Err(CoreError::Refused { code, .. }) => assert_eq!(code, "busy"),
             other => panic!("{other:?}"),
         }
@@ -2841,10 +2857,10 @@ mod tests {
         (limited.allowance, down.unreachable) = (None, false);
         let asked = (limited.posts, limited.reads);
         let sims = &mut [&mut good, &mut limited, &mut down];
-        // One that asked for no wait is asked at once.
-        let got = retry_at(&kept, sims, at).await;
+        // One that asked for no wait is asked once the backoff's first wait is up.
+        let got = retry_at(&kept, sims, at + RETRY_EVERY).await;
         assert_eq!((got.done, got.not_done), (vec!["r2".to_string()], vec![]));
-        assert_eq!(got.retry_in, Some(3600));
+        assert_eq!(got.retry_in, Some(3600 - RETRY_EVERY));
         assert_eq!((limited.posts, limited.reads), asked, "not asked yet");
 
         // Asked once the clock is set back past any wait.
@@ -3035,5 +3051,33 @@ mod tests {
         assert!(remote.read().await.is_err());
         let evidence = crate::epoch::evidence_of(&id.public());
         assert_eq!(evidence.revoked, vec![lost.to_vec()]);
+    }
+
+    #[test]
+    fn a_registrars_first_retry_waits_the_backoff_or_longer_where_it_asked() {
+        let at = now();
+        let limited = |registrar: &str, retry_after: Option<u64>| NotYetReset {
+            retry_after,
+            ..not_done(registrar, NotYet::Refused, Some("rate_limited"))
+        };
+        let report = Report {
+            target: 1,
+            published: 0,
+            done: vec![],
+            not_done: vec![
+                limited("r0", Some(5)),
+                limited("r1", Some(3600)),
+                not_done("r2", NotYet::Unreachable, None),
+            ],
+            not_registrars: vec![],
+            behind: ["r0", "r1", "r2"]
+                .iter()
+                .map(|r| (r.to_string(), Current::default()))
+                .collect(),
+            posted: vec![],
+        };
+        let kept = lagging(&alice(), &report, |_| true, at).unwrap();
+        let dues: Vec<u64> = kept.chains.iter().map(|c| c.due - at).collect();
+        assert_eq!(dues, vec![RETRY_EVERY, 3600, RETRY_EVERY]);
     }
 }

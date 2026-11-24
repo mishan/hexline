@@ -1,6 +1,7 @@
 package org.foggyden.hexline.identity
 
 import android.content.Context
+import android.util.Log
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingWorkPolicy
@@ -19,7 +20,7 @@ import org.foggyden.hexline.core.NotYet
 import org.foggyden.hexline.core.ResetRetried
 import org.foggyden.hexline.core.shortHash
 import org.foggyden.hexline.servers.StoreQueue
-import org.foggyden.hexline.servers.stored
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /** When each identity's reset is next retried: the one place it is asked for. */
@@ -132,6 +133,7 @@ class ResetRetrier(
         var got: ResetRetried? = null
         var unreadable = false
         var failed: Long? = null
+        var unsaved = false
         try {
             got = setups.retryReset(retry, stored.card)
         } catch (e: CoreException.Refused) {
@@ -145,11 +147,15 @@ class ResetRetrier(
             failed = RETRY_EVERY
         } finally {
             withContext(NonCancellable + queue.dispatcher) {
-                stored {
+                try {
                     got?.let { r -> identities.retried(fingerprint, r.epoch.toLong()) { kept -> after(kept, r) } }
                     if (unreadable) {
                         identities.retried(fingerprint, reset.epoch) { it.copy(retry = null, pending = emptyList(), unread = true) }
                     }
+                } catch (e: IOException) {
+                    // What it came to is owed: the retry kept is posted again, no sooner than it would have been.
+                    Log.w("hexline", "a reset's retry not kept", e)
+                    unsaved = true
                 }
                 absorbing.absorb(fingerprint, null)
             }
@@ -157,6 +163,7 @@ class ResetRetrier(
         }
         val kept = withContext(queue.dispatcher) { identities.list().find { it.fingerprint == fingerprint }?.reset }
         if (kept?.retry == null) return null
+        if (unsaved) return maxOf(got?.retryIn?.toLong() ?: 0, RETRY_EVERY)
         // The same retry, not posted: asked again after a while. Anything else is when the kept one is due.
         if (failed != null && kept.epoch == reset.epoch) return failed
         return maxOf(0, kept.retryAt - now())

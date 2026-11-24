@@ -1562,6 +1562,8 @@ class ChatViewModel internal constructor(
                                         else -> throw e
                                     }
                                 return@keeping Resetting.Failed(fingerprint, problem)
+                            } catch (_: ResetUnkept) {
+                                return@keeping Resetting.Failed(fingerprint, SetupProblem.ResetNotKept)
                             } ?: return@keeping Resetting.Idle
                         Resetting.Done(fingerprint, ResetShown(got.done, got.notDone, got.notRegistrars, got.later))
                     }
@@ -1597,6 +1599,7 @@ class ChatViewModel internal constructor(
             if (noted && e.code in BEFORE_POSTING) withContext(NonCancellable + store) { stored { identities.resetNotBegun(fingerprint) } }
             throw e
         } finally {
+            var unkept = false
             withContext(NonCancellable + store) {
                 got?.let { r ->
                     val later = r.later.toSet()
@@ -1609,8 +1612,14 @@ class ChatViewModel internal constructor(
                             r.later,
                             unreset,
                         )
-                    stored { identities.resetDone(fingerprint, r.cert, kept.cert, outcome) }
-                    if (r.retry != null) retries.schedule(fingerprint, r.retryIn?.toLong() ?: 0) else retries.cancel(fingerprint)
+                    try {
+                        identities.resetDone(fingerprint, r.cert, kept.cert, outcome)
+                        if (r.retry != null) retries.schedule(fingerprint, r.retryIn?.toLong() ?: 0) else retries.cancel(fingerprint)
+                    } catch (e: IOException) {
+                        // Its note under way stays: another is offered, now and after a restart.
+                        Log.w("hexline", "a reset's outcome not kept", e)
+                        unkept = true
+                    }
                 }
                 // What its reads verified, and the floor it raised, whatever it came to.
                 if (begun) absorbing(fingerprint, null)
@@ -1618,8 +1627,12 @@ class ChatViewModel internal constructor(
             }
             // A read of the records begun before the reset answers for a floor it may not know: it is overtaken.
             if (begun) standingReads[fingerprint] = (standingReads[fingerprint] ?: 0) + 1
+            if (unkept) throw ResetUnkept()
         }
     }
+
+    /** What a reset came to, which the disk would not take. */
+    private class ResetUnkept : IOException("a reset's outcome not kept")
 
     fun resettingSeen() {
         if (reset.value !is Resetting.Working) reset.value = Resetting.Idle

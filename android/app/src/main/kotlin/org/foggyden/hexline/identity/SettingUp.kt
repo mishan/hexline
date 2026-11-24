@@ -54,6 +54,9 @@ enum class SetupProblem {
 
     /** None of the identity's registrars could be reached: nothing was reset. */
     NoRegistrarReached,
+
+    /** A reset made, and what it came to not kept: it may not have finished. */
+    ResetNotKept,
     Other,
 }
 

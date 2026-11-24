@@ -214,6 +214,57 @@ class ResetDevicesTest : ViewModelHarness() {
     }
 
     @Test
+    fun aWriteTheDiskWillNotTakeIsNeverToldAsDoneNorRetriedWithoutTheBackoff() {
+        // Each identity write a reset makes, refused in turn.
+        var write = 0
+        while (true) {
+            fresh()
+            setups = FakeSetups()
+            val vm = model()
+            settle()
+            val fingerprint = heldHere(vm)
+            downAtReset()
+            val asked = retries.asked.size
+            stores.identityWriteFails = write
+            reset(vm, fingerprint)
+            if (stores.identityWriteFails != null) break
+            val kept = kept(fingerprint).reset
+            val saved = kept?.epoch == 1L && kept.retry != null && !kept.uncertain
+            if (vm.resetting.value is Resetting.Done) {
+                assertTrue("write $write: told done, and not kept", saved)
+            } else {
+                assertTrue("write $write: posted, and not offered again", setups.resets.isEmpty() || kept?.uncertain == true)
+            }
+            if (!saved) {
+                assertTrue("write $write: retried, and not kept", retries.asked.drop(asked).none { it.first == "schedule" })
+            }
+            write++
+        }
+        assertTrue("the reset's writes all refused in turn", write >= 2)
+        // Each identity write a retry makes, refused in turn.
+        write = 0
+        while (true) {
+            fresh()
+            setups = FakeSetups()
+            val vm = model()
+            settle()
+            val fingerprint = heldHere(vm)
+            downAtReset()
+            reset(vm, fingerprint)
+            now += 900
+            setups.retryAnswers += { retried(1, listOf("other.example")) }
+            stores.identityWriteFails = write
+            var next: Long? = null
+            CoroutineScope(main).launch { next = retrier().run(fingerprint) }
+            settle()
+            if (stores.identityWriteFails != null) break
+            assertTrue("write $write: the next run in $next", next.let { it == null || it >= 900 })
+            write++
+        }
+        assertTrue("the retry's writes all refused in turn", write >= 1)
+    }
+
+    @Test
     fun aRetryIsMadeOnlyWithANetwork() {
         val request = WorkResetRetries.request("fp", 900)
         assertEquals(NetworkType.CONNECTED, request.workSpec.constraints.requiredNetworkType)
