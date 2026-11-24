@@ -569,6 +569,21 @@ class Identities(
             if (minted(fingerprint).none { it == device }) throw java.io.IOException("not kept")
         }
 
+    /**
+     * [devices], of those [fingerprint]'s key certified here, marked
+     * revoked in one write. Throws an [java.io.IOException] the disk gives.
+     */
+    fun revoked(
+        fingerprint: String,
+        devices: List<ByteArray>,
+    ): Unit =
+        synchronized(LOCK) {
+            val all = minted(fingerprint)
+            val marking = all.filter { d -> !d.revoked && devices.any { it.contentEquals(d.device) } }
+            if (marking.isEmpty()) return
+            writeMinted(fingerprint, all.map { d -> if (d in marking) d.with(revoked = true) else d })
+        }
+
     private fun writeMinted(
         fingerprint: String,
         devices: List<MintedDevice>,

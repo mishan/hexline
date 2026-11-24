@@ -211,6 +211,9 @@ class FakeSetups : HolderSetups {
     /** What a read of the registrars' records throws, if anything. */
     var standingFails: CoreException? = null
 
+    /** What each read of the registrars' records waits for, if anything. */
+    var standingWaits: CompletableDeferred<Unit>? = null
+
     override suspend fun standing(
         card: ByteArray,
         registrars: List<String>,
@@ -218,8 +221,9 @@ class FakeSetups : HolderSetups {
         devices: List<ListedDevice>,
     ): DeviceStandings {
         yield()
+        standingWaits?.await()
         standingFails?.let { throw it }
-        val floor = if (listsRead) maxOf(epoch, floor) else epoch
+        val floor = maxOf(epoch, floor)
         return DeviceStandings(
             devices.map { d ->
                 when {

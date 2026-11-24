@@ -158,7 +158,6 @@ pub(crate) async fn published_at(
 /// phone set it up or restored it, and each its card's attestations
 /// name, as a host reached over https, each origin once.
 pub(crate) fn registrars_of(kept: &[String], card: &hl_identity::Card) -> Vec<String> {
-    let origin = |r: &str| registrar_base(r).ok().map(|b| b.origin());
     let mut out: Vec<String> = Vec::new();
     let attested = card
         .attestations
@@ -166,14 +165,18 @@ pub(crate) fn registrars_of(kept: &[String], card: &hl_identity::Card) -> Vec<St
         .filter(|a| a.identity == card.identity)
         .map(|a| &a.registrar);
     for r in kept.iter().chain(attested) {
-        let seen = out
-            .iter()
-            .any(|o| o == r || origin(o).is_some_and(|o| Some(o) == origin(r)));
+        let seen = out.iter().any(|o| same_registrar(o, r));
         if !seen {
             out.push(r.clone());
         }
     }
     out
+}
+
+/// Whether `a` and `b` name one registrar: the same text, or one origin.
+pub(crate) fn same_registrar(a: &str, b: &str) -> bool {
+    let origin = |r: &str| registrar_base(r).ok().map(|b| b.origin());
+    a == b || origin(a).is_some_and(|o| Some(o) == origin(b))
 }
 
 /// What `reg`'s per-identity records list says of `identity`, page after

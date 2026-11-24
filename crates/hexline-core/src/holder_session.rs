@@ -15,7 +15,9 @@ use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
 use crate::enroll::mailbox_base;
-use crate::epoch::{at_floor, published_at, registrars_of, revoked, signed_out, Published};
+use crate::epoch::{
+    at_floor, published_at, registrars_of, revoked, same_registrar, signed_out, Published,
+};
 use crate::restore::{b64, endpoint, issued};
 use crate::CoreError;
 
@@ -1086,7 +1088,9 @@ pub async fn device_standing(
                 .collect();
             let complete = match kept.is_empty() {
                 true => !published.read.is_empty(),
-                false => kept.iter().all(|k| published.read.contains(k)),
+                false => kept
+                    .iter()
+                    .all(|k| published.read.iter().any(|r| same_registrar(r, k))),
             };
             DeviceStandings { devices, complete }
         })
@@ -1637,6 +1641,10 @@ mod tests {
         for (kept, complete) in [
             (vec![gone.clone(), live.clone()], false),
             (vec![live.clone(), gone], false),
+            (
+                vec![live.trim_end_matches('/').to_owned(), live.clone()],
+                true,
+            ),
             (vec![live], true),
         ] {
             let got = device_standing(card.clone(), kept.clone(), 0, devices.clone())

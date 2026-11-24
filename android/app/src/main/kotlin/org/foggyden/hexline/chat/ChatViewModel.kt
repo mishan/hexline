@@ -961,6 +961,15 @@ class ChatViewModel internal constructor(
                         } else {
                             atRegistrars[fingerprint]?.first.orEmpty() + said.first.filterValues { it != DeviceStanding.IN_FORCE } to false
                         }
+                    // Marked here too, so a list written once its certificate ends keeps it.
+                    val revoked = list.devices.filter { !it.revoked && said.first[it.fingerprint] == DeviceStanding.REVOKED }
+                    if (revoked.isNotEmpty()) {
+                        try {
+                            identities.revoked(fingerprint, revoked.map { it.device })
+                        } catch (e: IOException) {
+                            Log.w("hexline", "revocations read not marked", e)
+                        }
+                    }
                     devicesOf(fingerprint)
                 }
             if (devicesFor == fingerprint) mintedDevices.value = again
@@ -1009,12 +1018,12 @@ class ChatViewModel internal constructor(
             } catch (_: IOException) {
                 emptyList<MintedDevice>() to true
             }
+        val (standing, read) = atRegistrars[fingerprint] ?: (emptyMap<String, DeviceStanding>() to false)
         // A certificate past its time is dead whether or not it ever arrived; a revoked one stays,
-        // as it is what refuses its key a renewal.
+        // here or at the registrar, as it is what refuses its key a renewal.
         val merged =
             (listed.filter { l -> pending.none { it.device.contentEquals(l.device) } } + pending)
-                .filter { it.listed(now()) }
-        val (standing, read) = atRegistrars[fingerprint] ?: (emptyMap<String, DeviceStanding>() to false)
+                .filter { it.listed(now()) || standing[it.fingerprint] == DeviceStanding.REVOKED }
         val unchecked = !read && merged.isNotEmpty()
         return DeviceList(fingerprint, listOf(own) + merged, unreadable, identities.mintedUnreadable(fingerprint), standing, unchecked)
     }
@@ -1307,7 +1316,11 @@ class ChatViewModel internal constructor(
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Exception) {
-                            if (sent) refreshDevices(fingerprint)
+                            if (sent) {
+                                // Unknown until a whole read says, as the registrar may have it.
+                                withContext(store) { atRegistrars[fingerprint]?.let { atRegistrars[fingerprint] = it.first to false } }
+                                refreshDevices(fingerprint)
+                            }
                             if (sent && e is CoreException.Refused && e.code == "server_error") {
                                 return@keeping Revoking.Failed(fingerprint, SetupProblem.RevocationUnconfirmed)
                             }
