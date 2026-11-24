@@ -245,14 +245,17 @@ class Identities(
 
     /**
      * The device epoch to mint [stored]'s certificates at: its own, or one a
-     * device listed for it was certified in, whichever is higher, so a floor
-     * written to the list and not yet to the identity is not lost.
+     * device certified for it here was certified in, listed or let go of,
+     * whichever is higher, so a floor written to the list and not yet to
+     * the identity is not lost.
      */
     fun epoch(stored: StoredIdentity): Long =
         synchronized(LOCK) {
+            // At least the epoch of each device certified here, its entry let go of or not.
             val listed =
                 try {
-                    minted(stored.fingerprint).maxOfOrNull { it.epoch } ?: 0
+                    val kept = kept(stored.fingerprint)
+                    maxOf(kept.devices.maxOfOrNull { it.epoch } ?: 0, kept.certified.maxOfOrNull { it.second } ?: 0)
                 } catch (_: java.io.IOException) {
                     0
                 }
@@ -614,7 +617,8 @@ class Identities(
             val certified = salvaged.flatMap { it.certified }
             // The floor a copy's whole read saw goes to the identity, where floors are kept: not
             // as a whole read to stand in by, which it no longer is.
-            val floor = salvaged.maxOfOrNull { it.floor } ?: 0
+            // So is the epoch of each device it certified: the floor was that high then.
+            val floor = salvaged.maxOfOrNull { s -> maxOf(s.floor, s.certified.maxOfOrNull { it.second } ?: 0) } ?: 0
             if (floor > 0) {
                 learned(fingerprint, floor)
                 if ((load(file(fingerprint))?.epoch ?: 0) < floor) throw java.io.IOException("the floor set aside not kept")

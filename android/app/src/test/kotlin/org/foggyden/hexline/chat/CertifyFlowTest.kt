@@ -925,6 +925,28 @@ class CertifyFlowTest : ViewModelHarness() {
     }
 
     @Test
+    fun theEpochADeviceWasCertifiedAtIsAFloorKeptFromTheListAndFromACopySetAside() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val key = { b: Byte -> android.util.Base64.encodeToString(ByteArray(32) { b }, android.util.Base64.NO_WRAP) }
+        // A device let go of from the list, its key kept as certified at 5.
+        minted(fingerprint).writeText("""{"devices":[],"certified":[{"device":"${key(8)}","epoch":5}]}""")
+        setups.standingWaits = CompletableDeferred()
+        assertEquals("from the list", 5uL, shown(vm, fingerprint).kept.epoch)
+        vm.cancelCertifying()
+        // A copy set aside with a device certified at 7, and no read.
+        File(stores.identityDir, minted(fingerprint).name + ".unread-0").writeText(
+            """{"devices":[{"device":"${key(9)}","expires":${now + DAY},"epoch":7}]}""",
+        )
+        vm.discardUnreadable(fingerprint)
+        settle()
+        assertFalse(File(stores.identityDir, minted(fingerprint).name + ".unread-0").exists())
+        assertEquals("from the copy", 7uL, shown(vm, fingerprint).kept.epoch)
+        assertEquals("kept with the identity itself", 7L, outside { identities.list().single { it.fingerprint == fingerprint }.epoch })
+    }
+
+    @Test
     fun aWholeReadIsNotKeptToStandInWhereNoBootIsKnown() {
         boot = ""
         val vm = model()
