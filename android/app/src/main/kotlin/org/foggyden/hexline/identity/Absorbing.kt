@@ -14,6 +14,8 @@ import java.io.IOException
 class Absorbing(
     private val identities: Identities,
     private val setups: HolderSetups,
+    /** Told after each absorb, on the store queue, so what is read from the evidence is read again. */
+    private val absorbed: () -> Unit = {},
 ) {
     /**
      * What the core holds of [fingerprint]'s records written to its files,
@@ -49,5 +51,6 @@ class Absorbing(
                 Log.w("hexline", "a whole read not let go of", e)
             }
         }
+        absorbed()
     }
 }

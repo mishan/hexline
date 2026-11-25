@@ -377,6 +377,18 @@ class ResetDevicesTest : ViewModelHarness() {
     }
 
     @Test
+    fun aReadOfTheDevicesThatFindsThisPhonesKeyRevokedIsRenewedAsANewDeviceAtOnce() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        setups.revokedElsewhere(kept(fingerprint).card, kept(fingerprint).info.device)
+        vm.openDevices(fingerprint)
+        settle()
+        val held = vm.identityList.value.single { it.fingerprint == fingerprint }
+        assertEquals(HeldRenewal.NEW_DEVICE, heldRenewal(held, emptyMap()))
+    }
+
+    @Test
     fun aRetryIsMadeOnlyWithANetwork() {
         val request = WorkResetRetries.request("fp", 900)
         assertEquals(NetworkType.CONNECTED, request.workSpec.constraints.requiredNetworkType)

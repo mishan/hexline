@@ -192,8 +192,12 @@ class ChatViewModel internal constructor(
 
     private val store = queue.dispatcher
 
-    /** The one writer of what reads of the records found, shared with a reset's retries. */
-    private val absorber = Absorbing(identities, setups)
+    /**
+     * The one writer of what reads of the records found, shared with a
+     * reset's retries; whatever it writes, the identities are published
+     * again, as what is shown of them is read from it.
+     */
+    private val absorber = Absorbing(identities, setups) { publishIdentities() }
 
     /**
      * [work] on the store queue, kept to however the person leaves. A store
