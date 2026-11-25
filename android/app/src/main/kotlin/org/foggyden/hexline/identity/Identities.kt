@@ -25,6 +25,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileNotFoundException
+import java.io.FileOutputStream
 
 /**
  * An identity this phone is a device of: what a server is shown, and what
@@ -152,8 +153,10 @@ class Identities(
     private val dir: File = File(context.filesDir, "identities"),
     /** How [dir]'s entries are synced to the disk: a test's may not, where no directory opens. */
     private val syncDir: (File) -> Unit = ::syncDirectory,
+    /** How a list set aside is read back: a test's may fail as a disk can. */
+    private val readCopy: (File) -> ByteArray = { AtomicFile(it).readFully() },
     /** How a file is written whole: a test's may say it wrote what the disk did not keep. */
-    private val commit: (File, ByteArray) -> Unit = ::writeAtomically,
+    private val commit: (File, ByteArray) -> Unit = { file, bytes -> writeAtomically(file, bytes, syncDir = syncDir) },
 ) {
     init {
         dir.mkdirs()
@@ -763,9 +766,10 @@ class Identities(
         synchronized(LOCK) {
             // Only the copies read here go: one the list is set aside into meanwhile was not.
             val copies = unread(fingerprint)
-            // Judged by the copies it would delete, under the same lock: one set aside since a look elsewhere is judged too.
-            if (onlyIfWhole && copies.any { !salvaged(it).whole }) return
+            // Each read once: what is judged whole is what is carried, and what is deleted. Judged
+            // under the same lock, so one set aside since a look elsewhere is judged too.
             val salvaged = copies.map { salvaged(it) }
+            if (onlyIfWhole && salvaged.any { !it.whole }) return
             val carried = salvaged.flatMap { it.revoked }
             val seen = distinct(salvaged.flatMap { it.seen })
             val certified = salvaged.flatMap { it.certified }
@@ -804,7 +808,8 @@ class Identities(
                         certified.all { (k, _) -> back.certified.any { it.first.contentEquals(k) } }
                 if (!held) throw java.io.IOException("what was set aside not kept")
             }
-            copies.forEach { it.delete() }
+            // One the disk would not give back is kept: what it says was carried nowhere.
+            copies.zip(salvaged).filter { (_, s) -> s.read }.forEach { (copy, _) -> copy.delete() }
         }
 
     /** [a] and [b], each key once at the higher epoch either gives it. */
@@ -831,6 +836,8 @@ class Identities(
         val whole: Boolean,
         /** The floor its whole read saw, where that reads. */
         val floor: Long = 0,
+        /** Whether the disk gave its bytes back at all. */
+        val read: Boolean = true,
     )
 
     /** What [copy], a list set aside, still says that can be read. */
@@ -838,9 +845,15 @@ class Identities(
         var seen: Pair<List<ByteArray>, Boolean> = emptyList<ByteArray>() to true
         var certified: Pair<List<Pair<ByteArray, Long>>, Boolean> = emptyList<Pair<ByteArray, Long>>() to true
         var floor = 0L
+        val bytes =
+            try {
+                readCopy(copy)
+            } catch (_: java.io.IOException) {
+                return Salvaged(emptyList(), emptyList(), emptyList(), false, read = false)
+            }
         val list =
             try {
-                val text = String(AtomicFile(copy).readFully())
+                val text = String(bytes)
                 if (text.trimStart().startsWith("[")) {
                     JSONArray(text)
                 } else {
@@ -1219,18 +1232,39 @@ fun syncDirectory(dir: File) {
     }
 }
 
-/** [bytes] written as [file] whole, or not at all, as [AtomicFile] writes. */
+/**
+ * [bytes] written as [file] whole and on the disk, or an [java.io.IOException].
+ * [AtomicFile.finishWrite] logs a failed sync or close and returns as if it
+ * wrote, so a write is kept here only once each step has said it is: written
+ * beside [file], flushed, [sync]ed and closed, then renamed over it, and its
+ * directory synced, which is what makes a rename durable on the file systems
+ * Android uses. A failure before the rename leaves [file] as it was; one
+ * syncing the directory after it leaves the new contents in place but not
+ * known to be on the disk, and is thrown as not kept all the same.
+ */
 fun writeAtomically(
     file: File,
     bytes: ByteArray,
+    sync: (FileOutputStream) -> Unit = { it.fd.sync() },
+    syncDir: (File) -> Unit = ::syncDirectory,
 ) {
-    val atomic = AtomicFile(file)
-    val out = atomic.startWrite()
+    // AtomicFile's own name for a write under way, so its reads and deletes clear one a crash left;
+    // every reader of these files holds the store's lock, so none clears this one meanwhile.
+    val temp = File(file.parentFile, file.name + ".new")
     try {
-        out.write(bytes)
-        atomic.finishWrite(out)
-    } catch (e: Exception) {
-        atomic.failWrite(out)
+        // `use` throws what closing throws, unless something before it already threw.
+        FileOutputStream(temp).use { out ->
+            out.write(bytes)
+            out.flush()
+            sync(out)
+        }
+        if (!temp.renameTo(file)) throw java.io.IOException("not renamed into place")
+        // A backup an interrupted AtomicFile write left would be read in place of this one.
+        val backup = File(file.parentFile, file.name + ".bak")
+        if (backup.exists() && !backup.delete()) throw java.io.IOException("an older backup not removed")
+        syncDir(file.parentFile!!)
+    } catch (e: java.io.IOException) {
+        temp.delete()
         throw e
     }
 }

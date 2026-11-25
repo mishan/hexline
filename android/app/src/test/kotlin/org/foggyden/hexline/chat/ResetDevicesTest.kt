@@ -205,6 +205,44 @@ class ResetDevicesTest : ViewModelHarness() {
     }
 
     @Test
+    fun aResetsOutcomeWhoseSyncFailsIsNotKeptAndLetsGoOfNoListSetAside() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        setAside(vm, fingerprint, """{"devices":[{"device":"${key(6)}"}],"revoked":["${key(5)}"]}""")
+        // Once it has posted: the disk takes the identity's writes but says it could not sync them.
+        setups.onReset = { _, _, _, _ -> stores.identitySyncFails = true }
+        reset(vm, fingerprint)
+        stores.identitySyncFails = false
+        assertEquals(Resetting.Failed(fingerprint, SetupProblem.ResetNotKept), vm.resetting.value)
+        val reset = checkNotNull(kept(fingerprint).reset)
+        assertNotNull("the record from before it, still under way", reset.underWay)
+        assertEquals(0L, reset.epoch)
+        assertEquals(1, copies().size)
+    }
+
+    @Test
+    fun aListSetAsideTheDiskWillNotGiveBackIsNotLetGoOf() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        setAside(vm, fingerprint, """{"devices":[{"device":"${key(6)}"}],"revoked":["${key(5)}"]}""")
+        // Read once and then never again: the read that is carried is the one judged.
+        stores.copyReadsFailAfter = 1
+        outside { identities.discardUnread(fingerprint, onlyIfWhole = true) }
+        stores.copyReadsFailAfter = null
+        assertEquals("let go of only with what it says carried", emptyList<String>(), copies())
+        assertEquals(listOf(ByteArray(32) { 5 }.toList()), outside { identities.seenRevoked(fingerprint) }.map { it.toList() })
+        // Never read at all: kept, even by a discard the person asked for.
+        setAside(vm, fingerprint, """{"devices":[{"device":"${key(3)}"}],"revoked":["${key(2)}"]}""")
+        stores.copyReadsFailAfter = 0
+        vm.discardUnreadable(fingerprint)
+        settle()
+        stores.copyReadsFailAfter = null
+        assertEquals(1, copies().size)
+    }
+
+    @Test
     fun aListSetAsideThatCannotBeCarriedAfterAResetStaysAndTheResetIsKept() {
         val vm = model()
         settle()
@@ -647,8 +685,7 @@ class ResetDevicesTest : ViewModelHarness() {
         outside {
             val json = JSONObject(String(file.readBytes()))
             json.put("reset", JSONObject().put("under_way", "not a time"))
-            org.foggyden.hexline.identity
-                .writeAtomically(file, json.toString().toByteArray())
+            file.writeText(json.toString())
         }
         val again = model().also { settle() }
         assertTrue(checkNotNull(kept(fingerprint).reset).uncertain)
@@ -690,8 +727,7 @@ class ResetDevicesTest : ViewModelHarness() {
         outside {
             val json = JSONObject(String(file.readBytes()))
             json.getJSONObject("reset").put("retry", 5)
-            org.foggyden.hexline.identity
-                .writeAtomically(file, json.toString().toByteArray())
+            file.writeText(json.toString())
         }
         val again = model().also { settle() }
         again.openDevices(fingerprint)

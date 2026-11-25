@@ -116,7 +116,7 @@ fun DevicesScreen(
     ) {
         Text(stringResource(R.string.devices_title, name), style = MaterialTheme.typography.headlineMedium)
         // A reset that may have posted is offered again below instead, so it is asked once.
-        val offer = devices?.restored?.takeIf { devices.reset?.underWay == null && resetting !is Resetting.Working }
+        val offer = devices?.restored?.takeIf { devices.reset?.uncertain != true && resetting !is Resetting.Working }
         if (offer != null) RestoreOffered(offer.lost, devices.registrar?.let(::hostOf) ?: name, !busy && !elsewhere, fingerprint, actions)
         when (certifying) {
             is Certifying.Opening, is Certifying.Answering -> Text(stringResource(R.string.holder_working))
@@ -161,7 +161,11 @@ fun DevicesScreen(
                     Revoked.Unknown ->
                         Problem(
                             stringResource(
-                                if (devices?.setAside == true) R.string.certify_revoked_unknown else R.string.certify_revoked_unopened,
+                                when {
+                                    devices?.setAsideLoses == true -> R.string.certify_revoked_unknown_loses
+                                    devices?.setAside == true -> R.string.certify_revoked_unknown
+                                    else -> R.string.certify_revoked_unopened
+                                },
                             ),
                         )
                     Revoked.No -> Unit
@@ -212,7 +216,10 @@ fun DevicesScreen(
         }
         if (devices?.setAside == true) {
             Problem(stringResource(R.string.devices_unreadable))
-            if (devices.setAsideLoses) Problem(stringResource(R.string.devices_discard_loses))
+            if (devices.setAsideLoses) {
+                Problem(stringResource(R.string.devices_reset_keeps))
+                Problem(stringResource(R.string.devices_discard_loses))
+            }
             TextButton({ actions.discardUnreadable(fingerprint) }) { Text(stringResource(R.string.devices_discard_unreadable)) }
             TextButton({ confirmingReset = true }, enabled = !busy && !elsewhere) { Text(stringResource(R.string.reset_devices)) }
         }

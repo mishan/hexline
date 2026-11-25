@@ -282,9 +282,27 @@ class DevicesResetScreenTest {
 
     @Test
     fun aRestoresOfferIsNotAskedBesideAResetThatMayNotHaveFinished() {
-        show(list(ResetKept(underWay = 1)).copy(restored = RestoreOffer(true)))
-        shows(text(R.string.reset_again))
-        rule.onNodeWithText(text(R.string.restore_reset_title)).assertDoesNotExist()
+        var kept by mutableStateOf(ResetKept(underWay = 1))
+        rule.setContent {
+            MaterialTheme {
+                DevicesScreen(
+                    "fp",
+                    "alice@hl.example",
+                    "mail.example",
+                    list(kept).copy(restored = RestoreOffer(true)),
+                    Certifying.Idle,
+                    Revoking.Idle,
+                    actions,
+                ) {
+                }
+            }
+        }
+        // Under way, or kept in a form that does not read: either may have posted.
+        for (unfinished in listOf(ResetKept(underWay = 1), ResetKept(unread = true))) {
+            kept = unfinished
+            shows(text(R.string.reset_again))
+            rule.onNodeWithText(text(R.string.restore_reset_title)).assertDoesNotExist()
+        }
     }
 
     @Test
@@ -303,8 +321,27 @@ class DevicesResetScreenTest {
                 true,
                 86_400uL,
             )
-        show(list().copy(setAside = true), certifying = Certifying.Asked("fp", request, Revoked.Unknown))
+        var loses by mutableStateOf(false)
+        rule.setContent {
+            MaterialTheme {
+                DevicesScreen(
+                    "fp",
+                    "alice@hl.example",
+                    "mail.example",
+                    list().copy(setAside = true, setAsideLoses = loses),
+                    Certifying.Asked("fp", request, Revoked.Unknown),
+                    Revoking.Idle,
+                    actions,
+                ) {}
+            }
+        }
         shows(text(R.string.certify_revoked_unknown))
+        rule.onNodeWithText(text(R.string.devices_reset_keeps)).assertDoesNotExist()
+        // Part of it unreadable, a reset keeps it: only Discard, with its warning, lets it go.
+        loses = true
+        shows(text(R.string.certify_revoked_unknown_loses))
+        shows(text(R.string.devices_reset_keeps))
+        shows(text(R.string.devices_discard_loses))
         shows(text(R.string.devices_discard_unreadable))
     }
 }

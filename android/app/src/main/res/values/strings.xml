@@ -252,8 +252,10 @@
     <string name="certify_revoked">This device was revoked. It cannot be certified again.</string>
     <string name="certify_revoked_unopened">This phone\'s list of devices it certified would not open, so it cannot tell whether this device was revoked. Try again below to approve it.</string>
     <string name="certify_revoked_unknown">This phone\'s list of devices it certified could not be read, so it cannot tell whether this device was revoked. Discard the unreadable list or reset devices below to approve it.</string>
+    <string name="certify_revoked_unknown_loses">This phone\'s list of devices it certified could not be read, so it cannot tell whether this device was revoked. Part of it can\'t be read at all, so resetting devices won\'t let it go: discard the unreadable list below, after reading what that loses, to approve it.</string>
     <string name="devices_loading">Reading the list&#8230;</string>
     <string name="devices_unreadable">This phone\'s list of devices it certified could not be read. It was kept aside, and devices certified before it may not be listed here. Until it is discarded or devices are reset, no device can be approved.</string>
+    <string name="devices_reset_keeps">Resetting devices won\'t let it go, as part of it can\'t be read: only discarding it does.</string>
     <string name="devices_discard_loses">Part of it can\'t be read at all, so a device revoked there would not be known here as revoked once it is discarded.</string>
     <string name="devices_discard_unreadable">Discard unreadable list</string>
     <string name="devices_unopened">This phone\'s list of devices it certified would not open just now. No device can be approved until it does.</string>
