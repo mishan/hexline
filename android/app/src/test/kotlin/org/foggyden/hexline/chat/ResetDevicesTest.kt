@@ -222,6 +222,26 @@ class ResetDevicesTest : ViewModelHarness() {
     }
 
     @Test
+    fun aResetsOutcomeRenamedIntoPlaceButNotSyncedIsRetriedFromWhatIsOnDiskAndNotToldDone() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        setAside(vm, fingerprint, """{"devices":[{"device":"${key(6)}"}],"revoked":["${key(5)}"]}""")
+        downAtReset()
+        // Once it has posted: each identity write lands, and syncing the directory after it fails.
+        setups.onReset = { _, _, _, _ -> stores.identityDirSyncFails = true }
+        val asked = retries.asked.size
+        reset(vm, fingerprint)
+        stores.identityDirSyncFails = false
+        assertEquals(Resetting.Failed(fingerprint, SetupProblem.ResetNotKept), vm.resetting.value)
+        val reset = checkNotNull(kept(fingerprint).reset)
+        assertNull("the outcome is on disk", reset.underWay)
+        assertArrayEquals("kept".toByteArray(), reset.retry)
+        assertEquals("its retry asked for all the same", listOf(Triple("schedule", fingerprint, 900L)), retries.asked.drop(asked))
+        assertEquals("nothing let go of on an outcome not known kept", 1, copies().size)
+    }
+
+    @Test
     fun aListSetAsideTheDiskWillNotGiveBackIsNotLetGoOf() {
         val vm = model()
         settle()

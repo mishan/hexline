@@ -162,6 +162,9 @@ abstract class ViewModelHarness {
         /** Whether syncing an identity's file fails, as a disk's error a write hears of only then. */
         var identitySyncFails = false
 
+        /** Whether syncing the directory after an identity's file is renamed into place fails. */
+        var identityDirSyncFails = false
+
         /** How many reads of a list set aside go through before every later one fails; null for none. */
         var copyReadsFailAfter: Int? = null
         val identities =
@@ -189,7 +192,11 @@ abstract class ViewModelHarness {
                     if (identitySyncFails && file.name.startsWith("identity-")) throw java.io.SyncFailedException("sync failed")
                     out.fd.sync()
                 }
-                if (!(losesLists && file.name.startsWith("minted-"))) writeAtomically(file, bytes, sync) {}
+                if (!(losesLists && file.name.startsWith("minted-"))) {
+                    writeAtomically(file, bytes, sync) {
+                        if (identityDirSyncFails && file.name.startsWith("identity-")) throw IOException("directory not synced")
+                    }
+                }
             }
         val keys = FakeHolderKeys()
         val held = HeldSeeds(File(app.filesDir, "held-$n"), keys, EmptyCoroutineContext)

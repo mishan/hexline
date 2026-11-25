@@ -1636,9 +1636,25 @@ class ChatViewModel internal constructor(
                         outcomeKept = identities.resetDone(fingerprint, r.cert, kept.cert, outcome) != null
                         if (r.retry != null) retries.schedule(fingerprint, r.retryIn?.toLong() ?: 0) else retries.cancel(fingerprint)
                     } catch (e: IOException) {
-                        // Its note under way stays: another is offered, now and after a restart.
+                        // Not known kept, so told as such and nothing set aside is let go of on it. The
+                        // write may still have landed, its directory unsynced: what is on disk now says
+                        // whether its retry is asked for, or its note under way stands and another is offered.
                         Log.w("hexline", "a reset's outcome not kept", e)
                         unkept = true
+                        identities
+                            .list()
+                            .find { it.fingerprint == fingerprint }
+                            ?.reset
+                            ?.takeIf { it.underWay == null && it.epoch == r.epoch.toLong() }
+                            ?.let { on ->
+                                if (on.retry !=
+                                    null
+                                ) {
+                                    retries.schedule(fingerprint, maxOf(0, on.retryAt - now()))
+                                } else {
+                                    retries.cancel(fingerprint)
+                                }
+                            }
                     }
                 }
                 // What its reads verified, and the floor it raised, whatever it came to.
