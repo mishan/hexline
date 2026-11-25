@@ -67,13 +67,14 @@ interface HolderSetups {
         deviceName: String,
     ): HeldRestore
 
-    /** A new certificate for this phone's device (the core's `holder_renew`), [epoch] the device epoch kept. */
+    /** A new certificate for this phone's device (the core's `holder_renew`), [epoch] the device epoch kept, [revoked] the keys kept as revoked. */
     fun renew(
         identitySeed: ByteArray,
         card: ByteArray,
         deviceSeed: ByteArray,
         cert: ByteArray,
         epoch: Long,
+        revoked: List<ByteArray>,
     ): ByteArray
 
     suspend fun putPassphrase(
@@ -133,8 +134,9 @@ interface HolderSetups {
     /**
      * Every device the identity certified signed out at [registrars] and
      * those its [card] names, from [epoch], the device epoch kept, and this
-     * phone's own, [deviceSeed] with [cert], certified again past it (the
-     * core's `reset_devices`).
+     * phone's own, [deviceSeed] with [cert], certified again past it unless
+     * its key is known revoked, of [revoked] the keys kept as revoked or of
+     * what the core has read (the core's `reset_devices`).
      */
     suspend fun resetDevices(
         identitySeed: ByteArray,
@@ -143,6 +145,7 @@ interface HolderSetups {
         epoch: Long,
         deviceSeed: ByteArray,
         cert: ByteArray,
+        revoked: List<ByteArray>,
     ): DevicesReset
 
     /** A reset's [retry] posted to the registrars it is due at, for the identity whose card is [card] (the core's `retry_reset`). */
@@ -184,7 +187,8 @@ object CoreHolderSetups : HolderSetups {
         deviceSeed: ByteArray,
         cert: ByteArray,
         epoch: Long,
-    ) = holderRenew(identitySeed, card, deviceSeed, cert, epoch.toULong())
+        revoked: List<ByteArray>,
+    ) = holderRenew(identitySeed, card, deviceSeed, cert, epoch.toULong(), revoked)
 
     override suspend fun putPassphrase(
         identitySeed: ByteArray,
@@ -241,8 +245,9 @@ object CoreHolderSetups : HolderSetups {
         epoch: Long,
         deviceSeed: ByteArray,
         cert: ByteArray,
+        revoked: List<ByteArray>,
     ) = org.foggyden.hexline.core
-        .resetDevices(identitySeed, card, registrars, epoch.toULong(), deviceSeed, cert)
+        .resetDevices(identitySeed, card, registrars, epoch.toULong(), deviceSeed, cert, revoked)
 
     override suspend fun retryReset(
         retry: ByteArray,

@@ -106,9 +106,11 @@ class FakeSetups : HolderSetups {
         deviceSeed: ByteArray,
         cert: ByteArray,
         epoch: Long,
+        revoked: List<ByteArray>,
     ): ByteArray {
         renewals += identitySeed.copyOf() to cert
-        return holderRenew(identitySeed, card, deviceSeed, cert, epoch.toULong())
+        renewRevoked += revoked
+        return holderRenew(identitySeed, card, deviceSeed, cert, epoch.toULong(), revoked)
     }
 
     /** Each backup the registrar was asked for, as what and the registrar. */
@@ -299,6 +301,10 @@ class FakeSetups : HolderSetups {
     /** The device epoch each reset was asked to reset from. */
     val resets = mutableListOf<Long>()
 
+    /** The keys each reset, and each renewal, was handed as known revoked. */
+    val resetRevoked = mutableListOf<List<ByteArray>>()
+    val renewRevoked = mutableListOf<List<ByteArray>>()
+
     override suspend fun resetDevices(
         identitySeed: ByteArray,
         card: ByteArray,
@@ -306,9 +312,11 @@ class FakeSetups : HolderSetups {
         epoch: Long,
         deviceSeed: ByteArray,
         cert: ByteArray,
+        revoked: List<ByteArray>,
     ): DevicesReset {
         yield()
         resets += epoch
+        resetRevoked += revoked
         resetWaits?.await()
         resetFails?.let {
             resetFails = null
@@ -328,7 +336,7 @@ class FakeSetups : HolderSetups {
             done = resetDone,
             notDone = resetNotDone,
             notRegistrars = emptyList(),
-            cert = holderRenew(identitySeed, card, deviceSeed, cert, target.toULong()),
+            cert = holderRenew(identitySeed, card, deviceSeed, cert, target.toULong(), revoked),
             certEpoch = target.toULong(),
             retry = resetRetry,
             retryIn = resetRetryIn?.toULong(),

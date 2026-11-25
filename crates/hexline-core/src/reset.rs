@@ -220,7 +220,12 @@ pub enum NotYet {
 /// reset, `no_registrar_reached` where no list could be read (nothing is
 /// posted then, and nothing raised), `no_epoch_left` where the floor is
 /// at its last, and `busy` while another reset of the identity is under
-/// way. Calling it again resets once more.
+/// way. This phone's device key known revoked, one of `revoked` (the keys
+/// the app keeps as revoked) or one this process has read revoked, is
+/// refused `this_device_revoked` before anything is read or posted, and
+/// `revoked_while_resetting` where a read during the reset showed it:
+/// what was posted then stands at those registrars, and no certificate is
+/// minted. Calling it again resets once more.
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn reset_devices(
     identity_seed: Vec<u8>,
@@ -229,10 +234,14 @@ pub async fn reset_devices(
     epoch: u64,
     device_seed: Vec<u8>,
     cert: Vec<u8>,
+    revoked: Vec<Vec<u8>>,
 ) -> Result<DevicesReset, CoreError> {
     let (seed, device) = (seed32(identity_seed)?, seed32(device_seed)?);
+    let revoked = crate::epoch::keys_of(&revoked);
     crate::connection::RUNTIME
-        .spawn(async move { resetting(&seed, card, registrars, epoch, &device, cert).await })
+        .spawn(
+            async move { resetting(&seed, card, registrars, epoch, &device, cert, &revoked).await },
+        )
         .await
         .unwrap_or_else(|_| Err(protocol("the reset stopped")))
 }
@@ -244,6 +253,7 @@ async fn resetting(
     epoch: u64,
     device: &Zeroizing<[u8; 32]>,
     cert: Vec<u8>,
+    revoked: &[PublicKey],
 ) -> Result<DevicesReset, CoreError> {
     let id = IdentityKey::from_seed(seed);
     let device = DeviceKey::from_seed(device);
@@ -253,6 +263,10 @@ async fn resetting(
         return Err(refused("wrong_identity"));
     }
     let parsed = Card::parse(&card).map_err(|_| refused("wrong_identity"))?;
+    // A phone whose own key is revoked has nothing to be certified again by: no reset of its.
+    if crate::epoch::known_revoked(&id.public(), &device.public(), revoked) {
+        return Err(refused("this_device_revoked"));
+    }
     let _resetting = Resetting::take(&id.public())?;
     let targets = registrars_of(&registrars, &parsed);
     if targets.is_empty() {
@@ -284,7 +298,13 @@ async fn resetting(
     let name = info.name.as_deref().unwrap_or("Hexline");
     // The floor is past the target by now, which is past `info.epoch`.
     let (cert, cert_epoch) = at_floor(&id.public(), report.published, |floor| {
-        certify(&id, &device, name, floor).map(|c| (c, floor))
+        certify(&id, &device, name, floor, revoked).map(|c| (c, floor))
+    })
+    .map_err(|e| match e {
+        CoreError::Refused { code, .. } if code == "this_device_revoked" => {
+            refused("revoked_while_resetting")
+        }
+        e => e,
     })?;
     Ok(DevicesReset {
         epoch: report.target,
@@ -2051,7 +2071,7 @@ mod tests {
         let id = IdentityKey::generate();
         let device = DeviceKey::generate();
         let card = Card::new(&id, "Alice", 10).sign(&id, Vec::new()).unwrap();
-        let cert = certify(&id, &device, "Pixel", 0).unwrap();
+        let cert = certify(&id, &device, "Pixel", 0, &[]).unwrap();
         let gone = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             format!("http://{}", l.local_addr().unwrap())
@@ -2063,6 +2083,7 @@ mod tests {
             5,
             device.seed().to_vec(),
             cert,
+            Vec::new(),
         )
         .await;
         match got {
@@ -2148,13 +2169,13 @@ mod tests {
         let id = IdentityKey::generate();
         let device = DeviceKey::generate();
         let card = Card::new(&id, "Alice", 10).sign(&id, Vec::new()).unwrap();
-        let cert = certify(&id, &device, "Pixel", 0).unwrap();
+        let cert = certify(&id, &device, "Pixel", 0, &[]).unwrap();
         // Its one registrar takes the connection and never answers.
         let registrars = vec![crate::epoch::tests::silent().await];
         let reset = || {
             let (seed, dev) = (id.seed(), device.seed());
             let (card, cert, registrars) = (card.clone(), cert.clone(), registrars.clone());
-            async move { resetting(&seed, card, registrars, 0, &dev, cert).await }
+            async move { resetting(&seed, card, registrars, 0, &dev, cert, &[]).await }
         };
         let first = tokio::spawn(reset());
         // Long enough for it to reach its registrar, which holds it there.
@@ -3177,5 +3198,69 @@ mod tests {
             (got.retry_in, got.retry_last_in),
             (Some(RETRY_EVERY), Some(RETRY_MOST))
         );
+    }
+
+    /// `device` marked seen revoked for `id`, as a read of its records in this process would.
+    fn seen(id: &IdentityKey, device: PublicKey) {
+        let bytes = crate::epoch::tests::revocation(id, device);
+        let record = hl_identity::Record::parse(&bytes, None).unwrap();
+        crate::epoch::kept_record(&id.public(), &record);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_phone_whose_device_key_is_known_revoked_resets_nothing() {
+        let id = IdentityKey::generate();
+        let device = DeviceKey::generate();
+        let card = Card::new(&id, "Alice", 10).sign(&id, Vec::new()).unwrap();
+        let cert = certify(&id, &device, "Pixel", 0, &[]).unwrap();
+        seen(&id, device.public());
+        let registrar = crate::epoch::tests::registrar_publishing(vec![], 8)
+            .await
+            .to_string();
+        let got = reset_devices(
+            id.seed().to_vec(),
+            card.clone(),
+            vec![registrar],
+            0,
+            device.seed().to_vec(),
+            cert,
+            Vec::new(),
+        )
+        .await;
+        match got {
+            Err(CoreError::Refused { code, .. }) => assert_eq!(code, "this_device_revoked"),
+            other => panic!("{:?}", other.map(|r| r.epoch)),
+        }
+        assert_eq!(
+            crate::epoch::held_floor(card),
+            0,
+            "nothing read, nothing posted"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_that_learns_this_phones_device_key_revoked_mints_it_nothing() {
+        let id = IdentityKey::generate();
+        let device = DeviceKey::generate();
+        let card = Card::new(&id, "Alice", 10).sign(&id, Vec::new()).unwrap();
+        let cert = certify(&id, &device, "Pixel", 0, &[]).unwrap();
+        let records = vec![crate::epoch::tests::revocation(&id, device.public())];
+        let registrar = crate::epoch::tests::registrar_publishing(records, 8)
+            .await
+            .to_string();
+        let got = reset_devices(
+            id.seed().to_vec(),
+            card,
+            vec![registrar],
+            0,
+            device.seed().to_vec(),
+            cert,
+            Vec::new(),
+        )
+        .await;
+        match got {
+            Err(CoreError::Refused { code, .. }) => assert_eq!(code, "revoked_while_resetting"),
+            other => panic!("{:?}", other.map(|r| r.epoch)),
+        }
     }
 }

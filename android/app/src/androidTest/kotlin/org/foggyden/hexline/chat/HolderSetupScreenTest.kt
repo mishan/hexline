@@ -403,7 +403,8 @@ class HolderSetupScreenTest {
             deviceSeed: ByteArray,
             cert: ByteArray,
             epoch: Long,
-        ) = holderRenew(identitySeed, card, deviceSeed, cert, epoch.toULong())
+            revoked: List<ByteArray>,
+        ) = holderRenew(identitySeed, card, deviceSeed, cert, epoch.toULong(), revoked)
 
         override suspend fun putPassphrase(
             identitySeed: ByteArray,
@@ -461,6 +462,7 @@ class HolderSetupScreenTest {
             epoch: Long,
             deviceSeed: ByteArray,
             cert: ByteArray,
+            revoked: List<ByteArray>,
         ): DevicesReset = error("no registrar here")
 
         override suspend fun retryReset(

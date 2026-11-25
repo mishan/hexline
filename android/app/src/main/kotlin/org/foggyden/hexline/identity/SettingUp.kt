@@ -57,6 +57,9 @@ enum class SetupProblem {
 
     /** A reset made, and what it came to not kept: it may not have finished. */
     ResetNotKept,
+
+    /** This phone's own device key known revoked: it certifies nothing, its own reset included. */
+    ThisDeviceRevoked,
     Other,
 }
 

@@ -2251,6 +2251,7 @@ async fn a_holders_renewed_certificate_logs_its_device_in() {
         minted.device_seed.clone(),
         minted.cert.clone(),
         0,
+        Vec::new(),
     )
     .unwrap();
     let conn = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
@@ -3425,6 +3426,7 @@ async fn a_reset_signs_out_the_devices_certified_before_it_and_not_this_phone() 
         0,
         minted.device_seed.clone(),
         minted.cert.clone(),
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -3480,6 +3482,7 @@ async fn a_reset_whose_reply_is_lost_is_posted_again_and_published_once() {
         0,
         minted.device_seed,
         minted.cert,
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -3509,6 +3512,7 @@ async fn a_registrar_down_at_a_reset_is_caught_up_by_the_next() {
             0,
             minted.device_seed.clone(),
             cert,
+            Vec::new(),
         )
     };
 
@@ -3557,6 +3561,7 @@ async fn a_registrar_down_at_a_reset_is_caught_up_by_its_retry_at_the_same_epoch
         0,
         minted.device_seed,
         minted.cert,
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -3627,6 +3632,7 @@ async fn a_certificate_from_a_holder_behind_a_reset_is_refused_by_the_device() {
         0,
         minted.device_seed,
         minted.cert,
+        Vec::new(),
     )
     .await
     .unwrap();

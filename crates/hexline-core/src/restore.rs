@@ -171,7 +171,7 @@ async fn restore(
     drop(keys);
     let device = DeviceKey::generate();
     let cert = crate::epoch::at_floor(&identity, floor, |floor| {
-        certify(&id, &device, device_name, floor)
+        certify(&id, &device, device_name, floor, &[])
     })?;
     let (card, new_card) = match kept_card {
         Some(card) => (card, false),
@@ -206,12 +206,14 @@ async fn restore(
 /// The phone's certificate: login, messages and managing, no vouch, since
 /// the identity key that could is not kept (design §8); as long as
 /// recommended, in device epoch `epoch`, and read back as a server will
-/// read it.
+/// read it. Refused `this_device_revoked` for a key known revoked, of
+/// `revoked` (what the app keeps) or of what this process has read.
 pub(crate) fn certify(
     id: &IdentityKey,
     device: &DeviceKey,
     name: &str,
     epoch: u64,
+    revoked: &[hl_identity::PublicKey],
 ) -> Result<Vec<u8>, CoreError> {
     let mut cert =
         DeviceCert::for_keys(id, device.public(), device.public_enc(), issued(), LIFETIME)
@@ -219,7 +221,8 @@ pub(crate) fn certify(
     cert.caps = Some(caps::LOGIN | caps::MESSAGE | caps::MANAGE);
     cert.name = Some(name.to_owned());
     cert.epoch = epoch;
-    let cert = cert.sign(id);
+    let cert = crate::epoch::sign_cert(id, &cert, revoked)
+        .ok_or_else(|| refused("this_device_revoked"))?;
     if DeviceCert::parse(&cert).is_err() || cert.len() > MAX_CERT {
         return Err(refused("bad_device_name"));
     }
@@ -236,7 +239,7 @@ const MAX_CERT: usize = 512;
 /// name fits whatever floor it is minted at.
 pub(crate) fn check_name(name: &str) -> Result<(), CoreError> {
     let (id, device) = (IdentityKey::generate(), DeviceKey::generate());
-    certify(&id, &device, name, hl_identity::cert::EPOCH_MAX).map(drop)
+    certify(&id, &device, name, hl_identity::cert::EPOCH_MAX, &[]).map(drop)
 }
 
 /// The base a registrar is reached at: `https://host` for a host, or a

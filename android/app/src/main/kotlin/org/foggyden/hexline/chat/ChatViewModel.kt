@@ -755,7 +755,10 @@ class ChatViewModel internal constructor(
                         val device = checkNotNull(deviceSeed)
                         val epoch = withContext(store) { identities.epoch(kept) }
                         val cert =
-                            held.use(fingerprint, authorizer) { seed -> setups.renew(seed, kept.card, device, kept.cert, epoch) }
+                            held.use(fingerprint, authorizer) { seed ->
+                                val revoked = withContext(store) { revokedKeys(fingerprint) }
+                                setups.renew(seed, kept.card, device, kept.cert, epoch, revoked)
+                            }
                                 ?: return@keeping Renewing.Idle
                         // Only in place of the certificate it began from: one installed meanwhile stands.
                         val list =
@@ -1557,6 +1560,7 @@ class ChatViewModel internal constructor(
                                 val problem =
                                     when (e.code) {
                                         "busy" -> SetupProblem.ResetUnderWay
+                                        "this_device_revoked", "revoked_while_resetting" -> SetupProblem.ThisDeviceRevoked
                                         "no_registrar_reached" -> SetupProblem.NoRegistrarReached
                                         "no_registrar" -> SetupProblem.NotARegistrar
                                         else -> throw e
@@ -1592,7 +1596,8 @@ class ChatViewModel internal constructor(
                 // Before anything is posted, and with no whole read from before it left to waive a check.
                 noted = withContext(store) { identities.resetBegun(fingerprint, now()) } ?: return@use null
                 begun = true
-                setups.resetDevices(seed, kept.card, listOfNotNull(kept.registrar), epoch, device, kept.cert).also { got = it }
+                val revoked = withContext(store) { revokedKeys(fingerprint) }
+                setups.resetDevices(seed, kept.card, listOfNotNull(kept.registrar), epoch, device, kept.cert, revoked).also { got = it }
             }
         } catch (e: CoreException.Refused) {
             // Refused before anything was posted: this one is not under way, though an earlier one may be.
@@ -1642,6 +1647,14 @@ class ChatViewModel internal constructor(
     fun resettingSeen() {
         if (reset.value !is Resetting.Working) reset.value = Resetting.Idle
     }
+
+    /**
+     * Every key [fingerprint]'s files keep as revoked, marked here or seen in
+     * a read of its records in any process: what the core is handed with each
+     * certificate it signs for this phone, as what it read itself goes with it.
+     */
+    private fun revokedKeys(fingerprint: String): List<ByteArray> =
+        identities.seenRevoked(fingerprint) + identities.minted(fingerprint).filter { it.revoked }.map { it.device }
 
     /** [act] on [fingerprint]'s seed, opened behind [authorizer]'s prompt, at its registrar. */
     private fun backingUp(
@@ -2427,6 +2440,6 @@ class ChatViewModel internal constructor(
         const val DENIED = "declined on the holder's phone"
 
         /** What the core refuses a reset with before it posts anything. */
-        val BEFORE_POSTING = setOf("no_registrar", "no_registrar_reached", "busy", "wrong_identity", "no_epoch_left")
+        val BEFORE_POSTING = setOf("no_registrar", "no_registrar_reached", "busy", "wrong_identity", "no_epoch_left", "this_device_revoked")
     }
 }

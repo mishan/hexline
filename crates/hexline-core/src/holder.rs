@@ -77,7 +77,7 @@ pub fn holder_mint(
     }
     let device = DeviceKey::generate();
     let cert = at_floor(&id.public(), epoch, |floor| {
-        certify(&id, &device, &device_name, floor)
+        certify(&id, &device, &device_name, floor, &[])
     })?;
     Ok(HolderMinted {
         device_seed: device.seed().to_vec(),
@@ -91,7 +91,9 @@ pub fn holder_mint(
 /// it, lapsed or not. In the highest device epoch known, of `epoch`, the
 /// one this phone keeps, and `cert`'s: no fetch, as a renewal may be
 /// made offline. Refused `wrong_identity` unless `cert` and `card` are
-/// that identity's and the device's.
+/// that identity's and the device's, and `this_device_revoked` where the
+/// device's key is known revoked: one of `revoked`, the keys the app
+/// keeps as revoked, or one this process has read revoked.
 #[uniffi::export]
 pub fn holder_renew(
     identity_seed: Vec<u8>,
@@ -99,6 +101,7 @@ pub fn holder_renew(
     device_seed: Vec<u8>,
     cert: Vec<u8>,
     epoch: u64,
+    revoked: Vec<Vec<u8>>,
 ) -> Result<Vec<u8>, CoreError> {
     let (seed, device) = (seed32(identity_seed)?, seed32(device_seed)?);
     let id = IdentityKey::from_seed(&seed);
@@ -109,8 +112,9 @@ pub fn holder_renew(
         return Err(refused("wrong_identity"));
     }
     let name = info.name.as_deref().unwrap_or("Hexline");
+    let revoked = crate::epoch::keys_of(&revoked);
     at_floor(&id.public(), epoch.max(info.epoch), |floor| {
-        certify(&id, &device, name, floor)
+        certify(&id, &device, name, floor, &revoked)
     })
 }
 
@@ -302,7 +306,7 @@ impl HolderSetup {
         let id = IdentityKey::from_seed(&s.seed);
         let device = DeviceKey::generate();
         // A new identity: no registrar holds a device epoch for it yet.
-        let cert = certify(&id, &device, &device_name, 0)?;
+        let cert = certify(&id, &device, &device_name, 0, &[])?;
         s.device = Some((device.seed(), cert.clone()));
         // Not the device the app said it keeps, until it says so of this one.
         s.held = false;
@@ -843,7 +847,7 @@ mod tests {
         card.successor = Some([7; 32]);
         let card = card.sign(&id, Vec::new()).unwrap();
         let device = DeviceKey::generate();
-        let cert = certify(&id, &device, "Pixel", 0).unwrap();
+        let cert = certify(&id, &device, "Pixel", 0, &[]).unwrap();
         let resume = |seed: Vec<u8>, card: Vec<u8>, device: Vec<u8>, cert: Vec<u8>| {
             HolderSetup::resume(seed, card, "reg.example".into(), "bob".into(), device, cert)
         };
@@ -854,7 +858,7 @@ mod tests {
         assert_ne!(resumed.recovery_code(), first.recovery_code());
         assert!(resumed.confirm_recovery(resumed.recovery_code().unwrap()));
         assert_eq!(resumed.identity_seed().unwrap(), id.seed().to_vec());
-        let other = certify(&id, &DeviceKey::generate(), "Pixel", 0).unwrap();
+        let other = certify(&id, &DeviceKey::generate(), "Pixel", 0, &[]).unwrap();
         for (seed, card, device, cert, code) in [
             (
                 id.seed().to_vec(),
@@ -918,6 +922,7 @@ mod tests {
             minted.device_seed.clone(),
             minted.cert.clone(),
             0,
+            Vec::new(),
         )
         .unwrap();
         let info = crate::identity::cert_for_device(
@@ -952,7 +957,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                refused_as(holder_renew(seed, card, device, cert, 0)),
+                refused_as(holder_renew(seed, card, device, cert, 0, Vec::new())),
                 "wrong_identity"
             );
         }
@@ -980,6 +985,7 @@ mod tests {
             device.seed().to_vec(),
             lapsed.clone(),
             0,
+            Vec::new(),
         )
         .unwrap();
         let was =
@@ -1029,13 +1035,14 @@ mod tests {
             let made = new_identity("Alice".into()).unwrap();
             let id = IdentityKey::from_seed(&made.seed.clone().try_into().unwrap());
             let device = DeviceKey::generate();
-            let prev = certify(&id, &device, "Pixel", had).unwrap();
+            let prev = certify(&id, &device, "Pixel", had, &[]).unwrap();
             let cert = holder_renew(
                 made.seed.clone(),
                 made.card.clone(),
                 device.seed().to_vec(),
                 prev,
                 kept,
+                Vec::new(),
             )
             .unwrap();
             assert_eq!(
@@ -1046,6 +1053,29 @@ mod tests {
             // What the renewal learned is kept here, whatever the app passes.
             let new = holder_mint(made.seed, made.card, "Tablet".into(), 0).unwrap();
             assert_eq!(epoch_of(&new.cert), minted, "minted after");
+        }
+    }
+
+    #[test]
+    fn a_device_key_known_revoked_is_renewed_by_no_holder() {
+        let made = new_identity("Alice".into()).unwrap();
+        let minted = holder_mint(made.seed.clone(), made.card.clone(), "Pixel".into(), 0).unwrap();
+        let id = IdentityKey::from_seed(&made.seed.clone().try_into().unwrap());
+        let device = DeviceKey::from_seed(&minted.device_seed.clone().try_into().unwrap());
+        let bytes = crate::epoch::tests::revocation(&id, device.public());
+        let record = hl_identity::Record::parse(&bytes, None).unwrap();
+        crate::epoch::kept_record(&id.public(), &record);
+        let renewed = holder_renew(
+            made.seed,
+            made.card,
+            minted.device_seed,
+            minted.cert,
+            0,
+            Vec::new(),
+        );
+        match renewed {
+            Err(CoreError::Refused { code, .. }) => assert_eq!(code, "this_device_revoked"),
+            other => panic!("{:?}", other.map(|c| c.len())),
         }
     }
 }

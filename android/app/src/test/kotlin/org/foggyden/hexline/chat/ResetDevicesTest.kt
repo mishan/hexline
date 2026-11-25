@@ -149,7 +149,7 @@ class ResetDevicesTest : ViewModelHarness() {
                 // A renewal landing while the reset posts, at its epoch or below it; a second on, so
                 // one below it is not the very certificate the reset began from.
                 Thread.sleep(1_100)
-                renewed = holderRenew(seed, card, device, cert, renewedAt.toULong())
+                renewed = holderRenew(seed, card, device, cert, renewedAt.toULong(), emptyList())
                 assertFalse(checkNotNull(renewed).contentEquals(before))
                 outside { identities.renewed(fingerprint, checkNotNull(renewed), replacing = before) }
             }
@@ -325,6 +325,36 @@ class ResetDevicesTest : ViewModelHarness() {
         assertEquals(listOf("other.example"), reset.notRegistrars)
         assertEquals("only what the registrars said was done", listOf("reg.example"), reset.done)
         assertEquals(emptyList<String>(), reset.pending)
+    }
+
+    @Test
+    fun thisPhonesDeviceKeySeenRevokedIsHandedToEveryCertificateTheCoreSignsForIt() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val own = kept(fingerprint).info.device
+        // Seen revoked by a read in an earlier process: the core of this one has not read it.
+        outside { identities.recordsRead(fingerprint, null, listOf(own)) }
+        setups.resetFails = CoreException.Refused("this_device_revoked", "", null)
+        reset(vm, fingerprint)
+        assertTrue("the reset handed it", setups.resetRevoked.single().any { it.contentEquals(own) })
+        assertEquals(Resetting.Failed(fingerprint, SetupProblem.ThisDeviceRevoked), vm.resetting.value)
+        assertNull("refused before posting: nothing under way", kept(fingerprint).reset)
+        vm.renewHeld(fingerprint, stores.keys.authorizer())
+        settle()
+        assertTrue("the renewal handed it", setups.renewRevoked.single().any { it.contentEquals(own) })
+    }
+
+    @Test
+    fun aResetThatLearnsThisPhonesDeviceKeyRevokedAfterPostingStaysOfferedAgain() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        setups.resetFailsAfterPosting = CoreException.Refused("revoked_while_resetting", "", null)
+        reset(vm, fingerprint)
+        assertEquals(Resetting.Failed(fingerprint, SetupProblem.ThisDeviceRevoked), vm.resetting.value)
+        assertTrue("what was posted stands", checkNotNull(kept(fingerprint).reset).uncertain)
+        assertEquals("its floor kept", 1L, kept(fingerprint).epoch)
     }
 
     @Test

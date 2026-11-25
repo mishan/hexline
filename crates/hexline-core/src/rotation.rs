@@ -185,7 +185,7 @@ impl RotationSetup {
         let k1 = IdentityKey::from_seed(&s.successor);
         let device = DeviceKey::generate();
         // A successor starts with no device epoch of its own.
-        let cert = certify(&k1, &device, &device_name, 0)?;
+        let cert = certify(&k1, &device, &device_name, 0, &[])?;
         s.device = Some((device.seed(), cert.clone()));
         Ok(HolderMinted {
             device_seed: device.seed().to_vec(),
@@ -724,13 +724,13 @@ mod tests {
         let uncommitted = Card::new(&k1, "Alice", issued())
             .sign(&k1, Vec::new())
             .unwrap();
-        let theirs = certify(&k1, &DeviceKey::generate(), "Pixel", 0).unwrap();
+        let theirs = certify(&k1, &DeviceKey::generate(), "Pixel", 0, &[]).unwrap();
         let device = DeviceKey::from_seed(&minted.device_seed.clone().try_into().unwrap());
         let vouching =
             DeviceCert::for_keys(&k1, device.public(), device.public_enc(), issued(), 86_400)
                 .unwrap()
                 .sign(&k1);
-        let others_cert = certify(&other, &device, "Pixel", 0).unwrap();
+        let others_cert = certify(&other, &device, "Pixel", 0, &[]).unwrap();
         for (what, seed, card0, card1, cert, record, code) in [
             (
                 "another seed",
@@ -944,7 +944,7 @@ mod tests {
         let s2 = SuccessorCode::generate();
         let card1 = successor_card(&k1, &Card::parse(&card0).unwrap(), &s2).unwrap();
         let device = DeviceKey::generate();
-        let cert = certify(&k1, &device, "Pixel", 0).unwrap();
+        let cert = certify(&k1, &device, "Pixel", 0, &[]).unwrap();
         // Ahead by more than any other test moves the shared clock.
         for time in [1, crate::restore::now() + 10_000] {
             let record = Rotation {

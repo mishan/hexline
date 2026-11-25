@@ -23,6 +23,7 @@ import org.foggyden.hexline.identity.ResetKept
 import org.foggyden.hexline.identity.ResetShown
 import org.foggyden.hexline.identity.Resetting
 import org.foggyden.hexline.identity.Revoking
+import org.foggyden.hexline.identity.SetupProblem
 import org.junit.Assert.assertEquals
 import org.junit.Rule
 import org.junit.Test
@@ -176,6 +177,12 @@ class DevicesResetScreenTest {
         show(list(kept), Resetting.Done("fp", shown))
         shows(text(R.string.reset_not_a_registrar, "down.example"))
         rule.onAllNodesWithText(text(R.string.reset_at, "down.example")).assertCountEquals(0)
+    }
+
+    @Test
+    fun aPhoneWhoseDeviceKeyWasRevokedIsToldItCannotReset() {
+        show(list(), Resetting.Failed("fp", SetupProblem.ThisDeviceRevoked))
+        shows(text(R.string.reset_this_device_revoked))
     }
 
     @Test

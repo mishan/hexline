@@ -9,8 +9,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use hl_identity::{
-    DeviceCert, DeviceRevocation, Fingerprint, ListKind, PublicKey, Record, RegistrarKeys,
-    SignedList,
+    DeviceCert, DeviceRevocation, Fingerprint, IdentityKey, ListKind, PublicKey, Record,
+    RegistrarKeys, SignedList,
 };
 use hxng_client::auth;
 use hxng_client::reqwest::Url;
@@ -116,6 +116,36 @@ pub(crate) fn seen_revoked(identity: &PublicKey, device: &PublicKey) -> bool {
     let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     seen.get(identity)
         .is_some_and(|all| all.iter().any(|r| r.device == *device))
+}
+
+/// Whether `device` is known revoked for `identity`: one of `revoked`, as
+/// the app keeps them (marked here, or seen in a read before this
+/// process), or one a read in this process verified revoked.
+pub(crate) fn known_revoked(
+    identity: &PublicKey,
+    device: &PublicKey,
+    revoked: &[PublicKey],
+) -> bool {
+    revoked.contains(device) || seen_revoked(identity, device)
+}
+
+/// `keys` as keys, any that is not one left out.
+pub(crate) fn keys_of(keys: &[Vec<u8>]) -> Vec<PublicKey> {
+    keys.iter()
+        .filter_map(|k| k.as_slice().try_into().ok())
+        .collect()
+}
+
+/// `cert` signed by `id`, or None where its key is known revoked: the one
+/// place the core signs a device certificate, so no path signs past the
+/// check. A floor is each caller's: a device of another's below it comes
+/// back as a new key, and this phone's own is minted at it.
+pub(crate) fn sign_cert(
+    id: &IdentityKey,
+    cert: &DeviceCert,
+    revoked: &[PublicKey],
+) -> Option<Vec<u8>> {
+    (!known_revoked(&id.public(), &cert.device, revoked)).then(|| cert.sign(id))
 }
 
 /// `record`, verified from `identity`'s records, kept as evidence: the
