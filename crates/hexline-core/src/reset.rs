@@ -1308,7 +1308,7 @@ async fn retry_all<D: Desk>(
         retry_last_in: None,
     };
     let mut asked_last: Option<u64> = None;
-    for (mut chain, (listed, caught)) in caught {
+    for (mut chain, (listed, caught, asked)) in caught {
         out.published = out.published.max(listed);
         match caught {
             Caught::Done => out.done.push(chain.registrar),
@@ -1316,10 +1316,11 @@ async fn retry_all<D: Desk>(
             Caught::NotDone(r) => {
                 chain.tries = chain.tries.saturating_add(1);
                 let wait = wait_of(r.retry_after).max(backoff(chain.tries));
-                // The retry posted still asks it, given up on here or not, until this is kept; one
+                // The retry posted still asks it, given up on or dropped here or not, until this is
+                // kept, so the longest it asked to be left counts, its outcome what it was; one
                 // another holder took past the epoch has nothing left to be asked.
                 if r.why != NotYet::Overtaken {
-                    asked_last = asked_last.max(Some(wait));
+                    asked_last = asked_last.max(Some(wait.max(wait_of(asked))));
                 }
                 let gave_up = waits(&r) && given_up(&chain, at);
                 out.not_done.push(NotYetReset {
@@ -1346,12 +1347,31 @@ async fn retry_all<D: Desk>(
 }
 
 /// One registrar brought to `retry`'s epoch by `chain`: the highest epoch
-/// its list showed, and how it came out, done as [`Retry::done`] says.
+/// its list showed, how it came out, done as [`Retry::done`] says, and the
+/// longest it asked to be left, whatever it came out as.
 async fn catch_up<D: Desk>(
     retry: &Retry,
     chain: &Chain,
     desk: &mut D,
     kept: &impl Kept,
+) -> (u64, Caught, Option<u64>) {
+    let mut confirming = None;
+    let (listed, caught) = caught_up(retry, chain, desk, kept, &mut confirming).await;
+    let asked = match &caught {
+        Caught::NotDone(r) => r.retry_after.max(confirming),
+        _ => None,
+    };
+    (listed, caught, asked)
+}
+
+/// As [`catch_up`], the wait a confirming read asked for put in
+/// `confirming` where it does not decide how the registrar came out.
+async fn caught_up<D: Desk>(
+    retry: &Retry,
+    chain: &Chain,
+    desk: &mut D,
+    kept: &impl Kept,
+    confirming: &mut Option<u64>,
 ) -> (u64, Caught) {
     let found = tokio::time::timeout(WAIT, desk.discover())
         .await
@@ -1381,7 +1401,10 @@ async fn catch_up<D: Desk>(
         // one of the two asking to be left longer.
         Err(r) => match waits(&why) && r.retry_after > why.retry_after {
             true => (cur.epoch, Caught::NotDone(r)),
-            false => (cur.epoch, Caught::NotDone(why)),
+            false => {
+                *confirming = r.retry_after;
+                (cur.epoch, Caught::NotDone(why))
+            }
         },
     }
 }
@@ -2950,9 +2973,13 @@ mod tests {
         };
         sim.land(&signed(2, now() + 50)).unwrap();
         let got = retry(&for_r0(40, Current::default(), vec![]), &mut [&mut sim]).await;
+        // Dropped all the same, and the hour it asked for kept against the retry being posted again.
         assert_eq!(
             got,
-            retried(40, 2, &[], vec![not_done("r0", NotYet::DatedBefore, None)])
+            ResetRetried {
+                retry_last_in: Some(3600),
+                ..retried(40, 2, &[], vec![not_done("r0", NotYet::DatedBefore, None)])
+            }
         );
         assert_eq!(sim.posts, 0);
     }
