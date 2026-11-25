@@ -755,9 +755,16 @@ class ChatViewModel internal constructor(
                         val device = checkNotNull(deviceSeed)
                         val epoch = withContext(store) { identities.epoch(kept) }
                         val cert =
-                            held.use(fingerprint, authorizer) { seed ->
-                                val revoked = withContext(store) { revokedKeys(fingerprint) }
-                                setups.renew(seed, kept.card, device, kept.cert, epoch, revoked)
+                            try {
+                                held.use(fingerprint, authorizer) { seed ->
+                                    val revoked = withContext(store) { revokedKeys(fingerprint) }
+                                    setups.renew(seed, kept.card, device, kept.cert, epoch, revoked)
+                                }
+                            } catch (e: CoreException.Refused) {
+                                if (e.code != "this_device_revoked") throw e
+                                // Renew offers a new device from now on, as it does for a key a server refused.
+                                withContext(store) { publishIdentities() }
+                                return@keeping Renewing.Failed(SetupProblem.RenewRevoked)
                             }
                                 ?: return@keeping Renewing.Idle
                         // Only in place of the certificate it began from: one installed meanwhile stands.
@@ -1656,6 +1663,18 @@ class ChatViewModel internal constructor(
     private fun revokedKeys(fingerprint: String): List<ByteArray> =
         identities.seenRevoked(fingerprint) + identities.minted(fingerprint).filter { it.revoked }.map { it.device }
 
+    /** Whether [stored]'s own device key is known revoked, from what the core is handed and what it has read. */
+    private fun ownRevoked(stored: StoredIdentity): Boolean {
+        val kept =
+            try {
+                revokedKeys(stored.fingerprint)
+            } catch (_: IOException) {
+                // The core still refuses by what it has read, and by what a later read here keeps.
+                emptyList()
+            }
+        return (kept + setups.evidence(stored.card).revoked).any { it.contentEquals(stored.info.device) }
+    }
+
     /** [act] on [fingerprint]'s seed, opened behind [authorizer]'s prompt, at its registrar. */
     private fun backingUp(
         fingerprint: String,
@@ -2112,7 +2131,12 @@ class ChatViewModel internal constructor(
 
     // Called on the store queue alone, so a slower read is never shown over a newer one.
     private fun publishIdentities() {
-        kept.value = identities.list().filter { it.rotatingFrom == null }.map { if (held.isHeld(it.fingerprint)) it.held() else it }
+        kept.value =
+            identities
+                .list()
+                .filter { it.rotatingFrom == null }
+                .map { if (held.isHeld(it.fingerprint)) it.held() else it }
+                .map { it.copy(ownRevoked = ownRevoked(it)) }
         postedRotations.value = sentRotations(identities).associateBy { it.from }
         keptRead.value = true
     }

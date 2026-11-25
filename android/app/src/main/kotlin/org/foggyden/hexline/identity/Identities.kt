@@ -60,6 +60,12 @@ data class StoredIdentity(
     /** This phone holds the identity's key: never kept, the model says so as it reads the store. */
     val held: Boolean = false,
     /**
+     * This phone's own device key is known revoked, as the core is told and
+     * has read: never kept, the model says so as it reads the store, and only
+     * a new device is certified for it.
+     */
+    val ownRevoked: Boolean = false,
+    /**
      * The identity this one is the successor of, while that rotation is
      * unfinished: the model neither publishes it, so it is offered to sign
      * in with or renew nowhere, nor renews it quietly, nor demotes it.

@@ -259,6 +259,7 @@
     <string name="reset_confirm_again">This signs out every device again, including ones you\'ve added back since the last reset.</string>
     <string name="reset_done">Devices reset. Add back each device you still use: open it and enroll it again with a new code.</string>
     <string name="reset_reset_past">Another holder of this identity has already reset its devices past this reset, so the devices it certified before are signed out.</string>
+    <string name="renew_device_revoked">This phone\'s device key was revoked, so it can\'t be renewed. Renew again to certify a new device key for this phone.</string>
     <string name="reset_this_device_revoked">This phone\'s device key was revoked, so it can\'t reset devices. Reset from another device that holds this identity.</string>
     <string name="reset_not_kept">This phone couldn\'t keep what the reset came to, so it may not have finished. Reset again.</string>
     <string name="reset_reached_none">The reset didn\'t reach any registrar yet, so the devices shown as signed out are still signed in everywhere.</string>

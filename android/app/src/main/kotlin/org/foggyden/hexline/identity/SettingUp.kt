@@ -60,6 +60,9 @@ enum class SetupProblem {
 
     /** This phone's own device key known revoked: it certifies nothing, its own reset included. */
     ThisDeviceRevoked,
+
+    /** This phone's own device key known revoked, so it is not renewed: a new device is. */
+    RenewRevoked,
     Other,
 }
 

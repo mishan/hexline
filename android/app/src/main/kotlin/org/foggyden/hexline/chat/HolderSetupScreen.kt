@@ -350,5 +350,6 @@ internal fun describe(problem: SetupProblem): String =
         SetupProblem.NoRegistrarReached -> stringResource(R.string.reset_none_reached)
         SetupProblem.ResetNotKept -> stringResource(R.string.reset_not_kept)
         SetupProblem.ThisDeviceRevoked -> stringResource(R.string.reset_this_device_revoked)
+        SetupProblem.RenewRevoked -> stringResource(R.string.renew_device_revoked)
         SetupProblem.Other -> stringResource(R.string.holder_failed)
     }

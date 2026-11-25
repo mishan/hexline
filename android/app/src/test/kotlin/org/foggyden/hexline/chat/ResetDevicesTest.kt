@@ -7,6 +7,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import org.foggyden.hexline.core.Caps
 import org.foggyden.hexline.core.CoreException
+import org.foggyden.hexline.core.HeldRenewal
 import org.foggyden.hexline.core.HolderRequest
 import org.foggyden.hexline.core.NotYet
 import org.foggyden.hexline.core.NotYetReset
@@ -16,6 +17,7 @@ import org.foggyden.hexline.core.holderRenew
 import org.foggyden.hexline.core.shortHash
 import org.foggyden.hexline.identity.Absorbing
 import org.foggyden.hexline.identity.Certifying
+import org.foggyden.hexline.identity.Renewing
 import org.foggyden.hexline.identity.ResetRetrier
 import org.foggyden.hexline.identity.Resetting
 import org.foggyden.hexline.identity.SetupProblem
@@ -343,6 +345,9 @@ class ResetDevicesTest : ViewModelHarness() {
         vm.renewHeld(fingerprint, stores.keys.authorizer())
         settle()
         assertTrue("the renewal handed it", setups.renewRevoked.single().any { it.contentEquals(own) })
+        assertEquals(Renewing.Failed(SetupProblem.RenewRevoked), vm.renewing.value)
+        val held = vm.identityList.value.single { it.fingerprint == fingerprint }
+        assertEquals("Renew again makes a new device", HeldRenewal.NEW_DEVICE, heldRenewal(held, emptyMap()))
     }
 
     @Test
@@ -355,6 +360,20 @@ class ResetDevicesTest : ViewModelHarness() {
         assertEquals(Resetting.Failed(fingerprint, SetupProblem.ThisDeviceRevoked), vm.resetting.value)
         assertTrue("what was posted stands", checkNotNull(kept(fingerprint).reset).uncertain)
         assertEquals("its floor kept", 1L, kept(fingerprint).epoch)
+    }
+
+    @Test
+    fun aHeldDeviceWhoseKeyIsKnownRevokedIsRenewedAsANewDeviceWhateverNoServerSaid() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val own = kept(fingerprint).info.device
+        outside { identities.recordsRead(fingerprint, null, listOf(own)) }
+        // Its certificate run out, and nothing saved of any server's refusal.
+        now = kept(fingerprint).info.expires.toLong() + DAY
+        val again = model2()
+        val held = again.identityList.value.single { it.fingerprint == fingerprint }
+        assertEquals(HeldRenewal.NEW_DEVICE, heldRenewal(held, emptyMap()))
     }
 
     @Test
