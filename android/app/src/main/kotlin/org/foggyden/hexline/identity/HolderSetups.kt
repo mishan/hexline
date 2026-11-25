@@ -1,6 +1,7 @@
 package org.foggyden.hexline.identity
 
 import org.foggyden.hexline.core.DeviceStandings
+import org.foggyden.hexline.core.DevicesReset
 import org.foggyden.hexline.core.Evidence
 import org.foggyden.hexline.core.HeldRestore
 import org.foggyden.hexline.core.HolderKept
@@ -12,6 +13,7 @@ import org.foggyden.hexline.core.ListedDevice
 import org.foggyden.hexline.core.PostOutcome
 import org.foggyden.hexline.core.RecoveryCodeSetup
 import org.foggyden.hexline.core.RecoveryCodeSetupInterface
+import org.foggyden.hexline.core.ResetRetried
 import org.foggyden.hexline.core.RevokeReason
 import org.foggyden.hexline.core.SecretKind
 import org.foggyden.hexline.core.backupDelete
@@ -65,13 +67,14 @@ interface HolderSetups {
         deviceName: String,
     ): HeldRestore
 
-    /** A new certificate for this phone's device (the core's `holder_renew`), [epoch] the device epoch kept. */
+    /** A new certificate for this phone's device (the core's `holder_renew`), [epoch] the device epoch kept, [revoked] the keys kept as revoked. */
     fun renew(
         identitySeed: ByteArray,
         card: ByteArray,
         deviceSeed: ByteArray,
         cert: ByteArray,
         epoch: Long,
+        revoked: List<ByteArray>,
     ): ByteArray
 
     suspend fun putPassphrase(
@@ -127,6 +130,29 @@ interface HolderSetups {
         registrar: String,
         record: ByteArray,
     ): PostOutcome
+
+    /**
+     * Every device the identity certified signed out at [registrars] and
+     * those its [card] names, from [epoch], the device epoch kept, and this
+     * phone's own, [deviceSeed] with [cert], certified again past it unless
+     * its key is known revoked, of [revoked] the keys kept as revoked or of
+     * what the core has read (the core's `reset_devices`).
+     */
+    suspend fun resetDevices(
+        identitySeed: ByteArray,
+        card: ByteArray,
+        registrars: List<String>,
+        epoch: Long,
+        deviceSeed: ByteArray,
+        cert: ByteArray,
+        revoked: List<ByteArray>,
+    ): DevicesReset
+
+    /** A reset's [retry] posted to the registrars it is due at, for the identity whose card is [card] (the core's `retry_reset`). */
+    suspend fun retryReset(
+        retry: ByteArray,
+        card: ByteArray,
+    ): ResetRetried
 }
 
 object CoreHolderSetups : HolderSetups {
@@ -161,7 +187,8 @@ object CoreHolderSetups : HolderSetups {
         deviceSeed: ByteArray,
         cert: ByteArray,
         epoch: Long,
-    ) = holderRenew(identitySeed, card, deviceSeed, cert, epoch.toULong())
+        revoked: List<ByteArray>,
+    ) = holderRenew(identitySeed, card, deviceSeed, cert, epoch.toULong(), revoked)
 
     override suspend fun putPassphrase(
         identitySeed: ByteArray,
@@ -210,6 +237,23 @@ object CoreHolderSetups : HolderSetups {
         record: ByteArray,
     ) = org.foggyden.hexline.core
         .postRotation(registrar, record)
+
+    override suspend fun resetDevices(
+        identitySeed: ByteArray,
+        card: ByteArray,
+        registrars: List<String>,
+        epoch: Long,
+        deviceSeed: ByteArray,
+        cert: ByteArray,
+        revoked: List<ByteArray>,
+    ) = org.foggyden.hexline.core
+        .resetDevices(identitySeed, card, registrars, epoch.toULong(), deviceSeed, cert, revoked)
+
+    override suspend fun retryReset(
+        retry: ByteArray,
+        card: ByteArray,
+    ) = org.foggyden.hexline.core
+        .retryReset(retry, card)
 }
 
 private class CoreSession(

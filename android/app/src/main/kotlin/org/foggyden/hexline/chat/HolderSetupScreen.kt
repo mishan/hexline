@@ -134,6 +134,10 @@ interface SetupActions {
     fun revokingSeen()
 
     fun discardUnreadable(fingerprint: String)
+
+    fun resetDevices(fingerprint: String)
+
+    fun resettingSeen()
 }
 
 /**
@@ -342,5 +346,10 @@ internal fun describe(problem: SetupProblem): String =
         SetupProblem.NotKept -> stringResource(R.string.restore_not_kept)
         SetupProblem.RevocationUnconfirmed -> stringResource(R.string.revoke_unconfirmed)
         SetupProblem.OwnDevice -> stringResource(R.string.revoke_own_device)
+        SetupProblem.ResetUnderWay -> stringResource(R.string.reset_under_way)
+        SetupProblem.NoRegistrarReached -> stringResource(R.string.reset_none_reached)
+        SetupProblem.ResetNotKept -> stringResource(R.string.reset_not_kept)
+        SetupProblem.ThisDeviceRevoked -> stringResource(R.string.reset_this_device_revoked)
+        SetupProblem.RenewRevoked -> stringResource(R.string.renew_device_revoked)
         SetupProblem.Other -> stringResource(R.string.holder_failed)
     }

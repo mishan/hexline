@@ -101,11 +101,16 @@ data class ConnectForm(
     }
 }
 
-/** What Renew does for [kept], held here, by the core's reading of what servers said of its own device. */
+/**
+ * What Renew does for [kept], held here, by the core's reading of what
+ * servers said of its own device, and of what this phone knows: a key it
+ * knows revoked is renewed by no holder, as servers would refuse it.
+ */
 fun heldRenewal(
     kept: StoredIdentity,
     refusals: Map<String, String>,
 ): HeldRenewal {
     val device = "/" + shortHash(kept.info.device)
-    return heldRenewal(refusals.filterKeys { it.endsWith(device) }.values.toList())
+    val said = refusals.filterKeys { it.endsWith(device) }.values.toList()
+    return heldRenewal(if (kept.ownRevoked) said + "revoked" else said)
 }

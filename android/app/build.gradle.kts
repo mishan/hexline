@@ -122,6 +122,7 @@ dependencies {
     implementation(libs.lifecycle.viewmodel.compose)
     implementation(libs.lifecycle.runtime.compose)
     implementation(libs.lifecycle.process)
+    implementation(libs.work.runtime)
     implementation(libs.rustls.platform.verifier) { version { strictly(rustlsVerifierVersion) } }
 
     testImplementation(libs.junit)

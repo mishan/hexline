@@ -94,6 +94,9 @@ abstract class ViewModelHarness {
     protected val enrollments = mutableListOf<FakeEnrollment>()
     protected var setups = FakeSetups()
 
+    /** Each reset's retry the models ask for, as WorkManager would be asked. */
+    protected val retries = FakeRetries()
+
     /** What the store held of the identity's last try when the holder was asked. */
     protected var triedWhenAsked: Long? = null
     protected var now = ISSUED + DAY
@@ -152,10 +155,19 @@ abstract class ViewModelHarness {
 
         /** Whether a rotation's file fails to be written, as a full disk does. */
         var rotationsFail = false
+
+        /** How many identity file writes go through before the next one fails, once; null for none. */
+        var identityWriteFails: Int? = null
         val identities =
             Identities(app, secrets, identityDir, syncDir = { synced += it }) { file, bytes ->
                 if (rotationsFail && file.name.startsWith("rotation-")) throw IOException("disk full")
                 if (identitiesFail && file.name.startsWith("identity-")) throw IOException("disk full")
+                if (file.name.startsWith("identity-")) {
+                    identityWriteFails?.let { left ->
+                        identityWriteFails = if (left == 0) null else left - 1
+                        if (left == 0) throw IOException("disk full")
+                    }
+                }
                 if (listsFail > 0 && file.name.startsWith("minted-")) {
                     listsFail--
                     throw IOException("disk full")
@@ -207,7 +219,7 @@ abstract class ViewModelHarness {
                         connection(url, sink).also { opened += it }
                     }, { renewing, expecting ->
                         enrollment(renewing, expecting).also { enrollments += it }
-                    }, setups, { now }, process.lifecycle, { wait(it) }, { uptime }, { boot }) as T
+                    }, setups, { now }, process.lifecycle, { wait(it) }, { uptime }, { boot }, retries) as T
             }
         armed = true
         return ViewModelProvider.create(owner, factory)[ChatViewModel::class.java]

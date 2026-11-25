@@ -991,7 +991,8 @@ class CertifyFlowTest : ViewModelHarness() {
             assertFalse("a file's permissions hold, as they do not for root", list.canRead())
             vm.openDevices(fingerprint)
             settle()
-            assertEquals("not opened, and nothing set aside", DeviceList(fingerprint, listOf(own(vm)), unreadable = true), vm.devices.value)
+            val unopened = DeviceList(fingerprint, listOf(own(vm)), unreadable = true, registrar = "reg.example")
+            assertEquals("not opened, and nothing set aside", unopened, vm.devices.value)
             val session = shown(vm, fingerprint)
             asked(vm, fingerprint, session, Revoked.Unknown)
             vm.approveDevice(fingerprint, manage = false, stores.keys.authorizer())
@@ -1003,7 +1004,7 @@ class CertifyFlowTest : ViewModelHarness() {
         // Read again once it opens, it blocks nothing.
         vm.openDevices(fingerprint)
         settle()
-        assertEquals(DeviceList(fingerprint, listOf(own(vm))), vm.devices.value)
+        assertEquals(DeviceList(fingerprint, listOf(own(vm)), registrar = "reg.example"), vm.devices.value)
         assertEquals(Certifying.Asked(fingerprint, tablet), vm.certify.value)
         vm.approveDevice(fingerprint, manage = false, stores.keys.authorizer())
         settle()

@@ -821,7 +821,8 @@ impl HolderSession {
                 return Err(refused);
             }
             cert.epoch = floor;
-            Ok(cert.sign(&id))
+            let known: Vec<PublicKey> = self.revoked_here.iter().chain(&revoked).copied().collect();
+            crate::epoch::sign_cert(&id, &cert, &known).ok_or((SIGNED_OUT, "signed_out_request"))
         });
         let signed = match minted {
             Ok(signed) => signed,
@@ -861,13 +862,12 @@ impl HolderSession {
         revoked: &[PublicKey],
         published: &Published,
     ) -> Option<(&'static str, &'static str)> {
-        if self.revoked_here.iter().chain(revoked).any(|r| r == device) {
-            return Some((SIGNED_OUT, "signed_out_request"));
-        }
-        // Nor one any read of the records in this process verified revoked, whatever became of
-        // that read: the same evidence, never shrinking, that the app is handed.
+        // Marked or seen revoked here, or verified revoked by any read of the records in this
+        // process, whatever became of that read: the same evidence, never shrinking, that the app
+        // is handed, and the check every certificate is signed behind.
         let card = hl_identity::Card::parse(&self.card).ok()?;
-        if crate::epoch::seen_revoked(&card.identity, device) {
+        let known: Vec<PublicKey> = self.revoked_here.iter().chain(revoked).copied().collect();
+        if crate::epoch::known_revoked(&card.identity, device, &known) {
             return Some((SIGNED_OUT, "signed_out_request"));
         }
         let listed: Vec<_> = self.listed.iter().chain(listed).copied().collect();

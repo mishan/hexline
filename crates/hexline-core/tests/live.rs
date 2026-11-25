@@ -2251,6 +2251,7 @@ async fn a_holders_renewed_certificate_logs_its_device_in() {
         minted.device_seed.clone(),
         minted.cert.clone(),
         0,
+        Vec::new(),
     )
     .unwrap();
     let conn = ServerConnection::new(server.url.clone(), Arc::new(Sink::default()));
@@ -3425,6 +3426,7 @@ async fn a_reset_signs_out_the_devices_certified_before_it_and_not_this_phone() 
         0,
         minted.device_seed.clone(),
         minted.cert.clone(),
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -3480,6 +3482,7 @@ async fn a_reset_whose_reply_is_lost_is_posted_again_and_published_once() {
         0,
         minted.device_seed,
         minted.cert,
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -3509,6 +3512,7 @@ async fn a_registrar_down_at_a_reset_is_caught_up_by_the_next() {
             0,
             minted.device_seed.clone(),
             cert,
+            Vec::new(),
         )
     };
 
@@ -3557,20 +3561,28 @@ async fn a_registrar_down_at_a_reset_is_caught_up_by_its_retry_at_the_same_epoch
         0,
         minted.device_seed,
         minted.cert,
+        Vec::new(),
     )
     .await
     .unwrap();
     assert_eq!((reset.epoch, &reset.done), (1, &vec![home.http.clone()]));
     assert!(reset.retry_in.is_some());
+    assert!(reset.later.contains(&front.url), "{:?}", reset.later);
 
     front.down.store(false, Ordering::SeqCst);
-    let retried = hexline_core::retry_reset(reset.retry.unwrap(), card)
+    // Not asked before the backoff's first wait is up.
+    let early = hexline_core::retry_reset(reset.retry.clone().unwrap(), card.clone())
+        .await
+        .unwrap();
+    assert!(early.done.is_empty(), "{:?}", early.done);
+    let retried = hexline_core::retry_reset_ahead(reset.retry.unwrap(), card, 15 * 60)
         .await
         .unwrap();
     assert_eq!(
         (retried.published, &retried.done),
         (1, &vec![front.url.clone()])
     );
+    assert!(!retried.later.contains(&front.url), "{:?}", retried.later);
     assert_eq!(epochs_at(&other, &id).await, vec![1]);
     assert_eq!(epochs_at(&home, &id).await, vec![1]);
 }
@@ -3620,6 +3632,7 @@ async fn a_certificate_from_a_holder_behind_a_reset_is_refused_by_the_device() {
         0,
         minted.device_seed,
         minted.cert,
+        Vec::new(),
     )
     .await
     .unwrap();

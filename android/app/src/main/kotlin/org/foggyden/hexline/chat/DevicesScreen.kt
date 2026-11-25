@@ -44,19 +44,23 @@ import androidx.compose.ui.unit.dp
 import org.foggyden.hexline.R
 import org.foggyden.hexline.core.Caps
 import org.foggyden.hexline.core.CertifyEnd
-import org.foggyden.hexline.core.DeviceStanding
+import org.foggyden.hexline.core.NotYet
+import org.foggyden.hexline.core.NotYetReset
 import org.foggyden.hexline.core.Qr
 import org.foggyden.hexline.core.RevokeReason
 import org.foggyden.hexline.identity.Certifying
 import org.foggyden.hexline.identity.DeviceList
 import org.foggyden.hexline.identity.MintedDevice
+import org.foggyden.hexline.identity.ResetKept
+import org.foggyden.hexline.identity.ResetShown
+import org.foggyden.hexline.identity.Resetting
 import org.foggyden.hexline.identity.Revoked
 import org.foggyden.hexline.identity.Revoking
 
 /**
  * The devices a held identity's key certified on this phone (design
- * §2.1): another certified by a code it types or a QR code it scans, and
- * one revoked at the registrar.
+ * §2.1): another certified by a code it types or a QR code it scans, one
+ * revoked at the registrar, and all of them signed out by a reset.
  */
 @Composable
 fun DevicesScreen(
@@ -67,6 +71,7 @@ fun DevicesScreen(
     certifying: Certifying,
     revoking: Revoking,
     actions: SetupActions,
+    resetting: Resetting = Resetting.Idle,
     onClose: () -> Unit,
 ) {
     // A code shown here is this identity's alone, and admits nobody once the screen is gone.
@@ -76,18 +81,21 @@ fun DevicesScreen(
     }
     // Another identity's, under way or done, is not this screen's to show.
     // While any identity's answer or revocation is under way, no other is started.
-    val elsewhere = certifying is Certifying.Answering || revoking is Revoking.Working
+    val elsewhere = certifying is Certifying.Answering || revoking is Revoking.Working || resetting is Resetting.Working
     val certifying = certifying.takeIf { it.identity == fingerprint } ?: Certifying.Idle
     val revoking = revoking.takeIf { it.identity == fingerprint } ?: Revoking.Idle
+    val resetting = resetting.takeIf { it.identity == fingerprint } ?: Resetting.Idle
+    var confirmingReset by remember { mutableStateOf(false) }
     val devices = devices?.takeIf { it.identity == fingerprint }
     var mailbox by rememberSaveable { mutableStateOf(initialMailbox) }
     var manage by remember(certifying::class) { mutableStateOf(false) }
     var revokingDevice by remember { mutableStateOf<MintedDevice?>(null) }
-    val busy = certifying is Certifying.Answering || revoking is Revoking.Working
+    val busy = certifying is Certifying.Answering || revoking is Revoking.Working || resetting is Resetting.Working
     val close = {
         actions.cancelCertifying()
         actions.certifySeen()
         actions.revokingSeen()
+        actions.resettingSeen()
         onClose()
     }
     // A code shown: the whole screen kept from screenshots, recordings, casting and the recents thumbnail.
@@ -210,7 +218,7 @@ fun DevicesScreen(
         }
         for (device in devices?.devices.orEmpty()) {
             val revoked = devices?.revoked(device) == true
-            val signedOut = devices?.standing?.get(device.fingerprint) == DeviceStanding.SIGNED_OUT
+            val signedOut = devices?.signedOut(device) == true
             // Revoked here, and no read has shown the registrar holds it.
             val unconfirmed = device.revoked && devices?.confirmed?.contains(device.fingerprint) != true
             Column {
@@ -233,7 +241,50 @@ fun DevicesScreen(
                 }
             }
         }
+        if (devices != null && devices.devices.firstOrNull()?.let { it.own && devices.signedOut(it) } == true) {
+            Problem(stringResource(R.string.reset_own_signed_out))
+            TextButton({ actions.renew(fingerprint) }, enabled = !busy) { Text(stringResource(R.string.renew)) }
+        }
+        when (resetting) {
+            is Resetting.Working -> Text(stringResource(R.string.holder_working))
+            is Resetting.Failed -> Problem(describe(resetting.problem))
+            is Resetting.Done -> {
+                ResetLines(resetting.reset, devices?.reset)
+                Button({ actions.startCertifying(fingerprint, mailbox.trim()) }, enabled = mailbox.isNotBlank() && !busy) {
+                    Text(stringResource(R.string.certify_start))
+                }
+            }
+            Resetting.Idle -> devices?.reset?.let { KeptLines(it) }
+        }
+        val reset = devices?.reset
+        if (reset != null && (reset.uncertain || reset.unreset.isNotEmpty() || reset.givenUp.isNotEmpty())) {
+            TextButton({ confirmingReset = true }, enabled = !busy && !elsewhere) { Text(stringResource(R.string.reset_again)) }
+        }
+        Text(stringResource(R.string.reset_devices_about), style = MaterialTheme.typography.bodySmall)
+        Button({ confirmingReset = true }, enabled = !busy && !elsewhere && devices != null) {
+            Text(stringResource(R.string.reset_devices))
+        }
         TextButton(close, enabled = !busy) { Text(stringResource(R.string.dismiss)) }
+    }
+    if (confirmingReset) {
+        val registrar = devices?.registrar?.let(::hostOf) ?: name
+        AlertDialog(
+            onDismissRequest = { confirmingReset = false },
+            title = { Text(stringResource(R.string.reset_confirm_title, name)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(stringResource(R.string.reset_confirm_body, registrar))
+                    if (devices?.reset != null) Text(stringResource(R.string.reset_confirm_again))
+                }
+            },
+            confirmButton = {
+                TextButton({
+                    confirmingReset = false
+                    actions.resetDevices(fingerprint)
+                }) { Text(stringResource(R.string.reset_devices)) }
+            },
+            dismissButton = { TextButton({ confirmingReset = false }) { Text(stringResource(R.string.cancel)) } },
+        )
     }
     revokingDevice?.let { device ->
         var reason by remember { mutableStateOf(RevokeReason.LOST) }
@@ -264,6 +315,77 @@ fun DevicesScreen(
         )
     }
 }
+
+/** What a reset just made came to, registrar by registrar. */
+@Composable
+private fun ResetLines(
+    reset: ResetShown,
+    kept: ResetKept?,
+) {
+    // What retries have come to since, as kept: each registrar as it said, never as one missing from a list.
+    val owed = kept?.let { it.pending + it.unreset + it.givenUp }
+    val done = (reset.done + kept?.done.orEmpty()).distinct()
+    val noRegistrar = (reset.notRegistrars + kept?.notRegistrars.orEmpty()).distinct()
+    val past = kept?.overtaken.orEmpty()
+    val notDone = reset.notDone.filter { it.registrar !in done && it.registrar !in noRegistrar }
+    // Signed out only where a registrar took it, or another holder's reset went past it.
+    val headline =
+        when {
+            done.isNotEmpty() -> R.string.reset_done
+            notDone.any { it.why == NotYet.OVERTAKEN || it.registrar in past } -> R.string.reset_reset_past
+            else -> R.string.reset_reached_none
+        }
+    Text(stringResource(headline))
+    for (r in done) Text(stringResource(R.string.reset_at, hostOf(r)))
+    for (n in notDone) {
+        when (n.registrar) {
+            in past -> Text(stringResource(R.string.reset_overtaken, hostOf(n.registrar)))
+            in kept?.givenUp.orEmpty() -> Text(stringResource(R.string.reset_gave_up, hostOf(n.registrar)))
+            else -> Text(notYet(n, n.registrar in (kept?.pending ?: reset.later)))
+        }
+    }
+    for (r in noRegistrar) Text(stringResource(R.string.reset_not_a_registrar, hostOf(r)))
+    StillSignedIn(owed ?: notDone.filter { it.why != NotYet.OVERTAKEN }.map { it.registrar })
+}
+
+/** What is kept of the last reset, as a start finds it: what is still retried, and what never will be. */
+@Composable
+private fun KeptLines(reset: ResetKept) {
+    if (reset.uncertain) Problem(stringResource(R.string.reset_unfinished))
+    for (r in reset.pending) Text(stringResource(R.string.reset_retrying, hostOf(r)))
+    for (r in reset.unreset) Text(stringResource(R.string.reset_wont_retry, hostOf(r)))
+    for (r in reset.givenUp) Text(stringResource(R.string.reset_gave_up, hostOf(r)))
+    StillSignedIn(reset.pending + reset.unreset + reset.givenUp)
+}
+
+/** Where devices shown as signed out still are not, if anywhere. */
+@Composable
+private fun StillSignedIn(registrars: List<String>) {
+    if (registrars.isEmpty()) return
+    Text(stringResource(R.string.reset_still_signed_in, registrars.joinToString(", ", transform = ::hostOf)))
+}
+
+@Composable
+private fun notYet(
+    n: NotYetReset,
+    later: Boolean,
+): String {
+    val at = hostOf(n.registrar)
+    return when {
+        n.why == NotYet.OVERTAKEN -> stringResource(R.string.reset_overtaken, at)
+        n.why == NotYet.GAVE_UP -> stringResource(R.string.reset_gave_up, at)
+        n.why == NotYet.UNSUPPORTED -> stringResource(R.string.reset_unsupported, at)
+        n.why == NotYet.CONNECTION_REFUSED -> stringResource(R.string.reset_connection_refused, at)
+        n.why == NotYet.REFUSED && n.code != null && later -> stringResource(R.string.reset_refused_retrying, at, n.code!!)
+        n.why == NotYet.REFUSED && n.code != null -> stringResource(R.string.reset_refused, at, n.code!!)
+        n.why == NotYet.UNREACHABLE && later -> stringResource(R.string.reset_unreachable, at)
+        later -> stringResource(R.string.reset_not_yet, at)
+        else -> stringResource(R.string.reset_wont_retry, at)
+    }
+}
+
+/** A registrar as a person reads it: its host, where it is named by a URL. */
+private fun hostOf(registrar: String) = runCatching { java.net.URI(registrar).host }.getOrNull() ?: registrar
 
 /** [secs] of a certificate's life, in days, or in minutes where it is under one. */
 @Composable

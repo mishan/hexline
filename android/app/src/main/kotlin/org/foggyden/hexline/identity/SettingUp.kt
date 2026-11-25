@@ -48,6 +48,21 @@ enum class SetupProblem {
 
     /** This phone's own device, which goes with the identity rather than by revocation. */
     OwnDevice,
+
+    /** A reset of the identity under way already, here. */
+    ResetUnderWay,
+
+    /** None of the identity's registrars could be reached: nothing was reset. */
+    NoRegistrarReached,
+
+    /** A reset made, and what it came to not kept: it may not have finished. */
+    ResetNotKept,
+
+    /** This phone's own device key known revoked: it certifies nothing, its own reset included. */
+    ThisDeviceRevoked,
+
+    /** This phone's own device key known revoked, so it is not renewed: a new device is. */
+    RenewRevoked,
     Other,
 }
 
