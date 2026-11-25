@@ -98,7 +98,15 @@ fun ConnectFlow(
     connecting: Boolean,
     onConnect: (server: Server, password: String?, remember: Boolean, link: ClassicLogin?) -> Unit,
     onForget: (Server) -> Unit,
-    onRestore: (registrar: String, handle: String, kind: SecretKind, secret: String, deviceName: String, hold: Boolean) -> Unit,
+    onRestore: (
+        registrar: String,
+        handle: String,
+        kind: SecretKind,
+        secret: String,
+        deviceName: String,
+        hold: Boolean,
+        lost: Boolean,
+    ) -> Unit,
     onRestoreSeen: () -> Unit,
     onDelete: (fingerprint: String) -> Unit,
     onTryAgain: (server: Server, fingerprint: String) -> Unit,
@@ -139,13 +147,29 @@ fun ConnectFlow(
     // new identity, an identity's own to renew it. Null while it is closed.
     var restoreFor by rememberSaveable { mutableStateOf<Pair<String, String>?>(null) }
     LaunchedEffect(restore) { if (restore is Restoring.Done) restoreFor = null }
+    // Its Devices screen asks whether to sign out the old phone's devices, once per restore,
+    // whenever the restored identity reaches the list.
+    var offeredFor by rememberSaveable { mutableStateOf<String?>(null) }
+    LaunchedEffect(restore, identities) {
+        val done = restore as? Restoring.Done
+        if (done == null) {
+            offeredFor = null
+        } else if (offeredFor != done.fingerprint &&
+            identities.any { it.fingerprint == done.fingerprint && it.held && it.restored != null }
+        ) {
+            offeredFor = done.fingerprint
+            devicesFor = done.fingerprint
+        }
+    }
     val opened = restoreFor
     // Open while the view model has a run under way: it holds the device.
     val backing = backupFor?.let { fp -> identities.find { it.fingerprint == fp } }
     val certifier = devicesFor?.let { fp -> identities.find { it.fingerprint == fp && it.held } }
     // Held here no longer, or gone, its Devices screen is not to come back by itself.
     LaunchedEffect(identities, identitiesRead, devicesFor) {
-        if (identitiesRead && devicesFor != null && certifier == null) devicesFor = null
+        // Looked up as it runs, not as composed: a restore may have opened it in the same frame.
+        val open = devicesFor
+        if (identitiesRead && open != null && identities.none { it.fingerprint == open && it.held }) devicesFor = null
     }
     if (setup != null && (setupOpen || settingUp !is SettingUp.Idle && settingUp !is SettingUp.Done)) {
         HolderSetupScreen(settingUp, setup) { setupOpen = false }
@@ -693,11 +717,20 @@ fun RestoreScreen(
     restoring: Restoring,
     initialRegistrar: String,
     initialHandle: String,
-    onRestore: (registrar: String, handle: String, kind: SecretKind, secret: String, deviceName: String, hold: Boolean) -> Unit,
+    onRestore: (
+        registrar: String,
+        handle: String,
+        kind: SecretKind,
+        secret: String,
+        deviceName: String,
+        hold: Boolean,
+        lost: Boolean,
+    ) -> Unit,
     onCancel: () -> Unit,
 ) {
     var registrar by rememberSaveable { mutableStateOf(initialRegistrar) }
     var hold by rememberSaveable { mutableStateOf(false) }
+    var lost by rememberSaveable { mutableStateOf(false) }
     var handle by rememberSaveable { mutableStateOf(initialHandle) }
     var byCode by rememberSaveable { mutableStateOf(false) }
     // Not saveable: saved state is written to disk with the task.
@@ -746,6 +779,7 @@ fun RestoreScreen(
             modifier = Modifier.fillMaxWidth(),
         )
         Checked(hold, { hold = it }, stringResource(R.string.restore_hold))
+        if (hold) Checked(lost, { lost = it }, stringResource(R.string.restore_old_phone_lost))
         if (restoring is Restoring.NotHeld) {
             Text(
                 stringResource(R.string.restore_not_held),
@@ -763,7 +797,7 @@ fun RestoreScreen(
             Button(
                 onClick = {
                     val kind = if (byCode) SecretKind.RECOVERY_CODE else SecretKind.PASSPHRASE
-                    onRestore(registrar.trim(), handle.trim(), kind, secret, deviceName.trim(), hold)
+                    onRestore(registrar.trim(), handle.trim(), kind, secret, deviceName.trim(), hold, hold && lost)
                 },
                 enabled = registrar.isNotBlank() && handle.isNotBlank() && secret.isNotEmpty() && !working,
             ) { Text(stringResource(if (working) R.string.restoring else R.string.restore)) }

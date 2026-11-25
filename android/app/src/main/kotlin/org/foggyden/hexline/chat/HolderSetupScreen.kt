@@ -137,6 +137,9 @@ interface SetupActions {
 
     fun resetDevices(fingerprint: String)
 
+    /** A restore's offer to reset declined. */
+    fun declineRestoreReset(fingerprint: String)
+
     fun resettingSeen()
 }
 

@@ -78,6 +78,7 @@ import org.foggyden.hexline.identity.ResetRetrier
 import org.foggyden.hexline.identity.ResetRetries
 import org.foggyden.hexline.identity.ResetShown
 import org.foggyden.hexline.identity.Resetting
+import org.foggyden.hexline.identity.RestoreOffer
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
 import org.foggyden.hexline.identity.Revoked
@@ -522,6 +523,7 @@ class ChatViewModel internal constructor(
         secret: String,
         deviceName: String,
         holdWith: Authorizer? = null,
+        lost: Boolean = false,
     ) {
         if (restoring.value == Restoring.Working) return
         restoring.value = Restoring.Working
@@ -553,7 +555,9 @@ class ChatViewModel internal constructor(
                                         .find { it.fingerprint == device.fingerprint }
                                         ?.info
                                         ?.device
-                                identities.save(device.seed, device.cert, device.card, handle, registrar)
+                                // In the same write as the identity, so no restore to hold is left without its offer.
+                                val offer = RestoreOffer(lost).takeIf { holdWith != null }
+                                identities.save(device.seed, device.cert, device.card, handle, registrar, restored = offer)
                                 // What the restore read of its records is kept with it.
                                 absorbing(device.fingerprint, null)
                                 // The new device starts with no server's refusal; the old one's go with it.
@@ -569,6 +573,12 @@ class ChatViewModel internal constructor(
                     val seed = identitySeed
                     // Kept as a device first: a prompt refused leaves it one, and says so.
                     if (seed != null && holdWith != null && !held.hold(device.fingerprint, seed, holdWith)) {
+                        // With no key held there is no reset to offer: a restore holding it offers it again.
+                        // A key held from before is still held, and its offer stands.
+                        withContext(NonCancellable + store) {
+                            if (!held.isHeld(device.fingerprint)) stored { identities.restoreOfferDone(device.fingerprint) }
+                            publishIdentities()
+                        }
                         Restoring.NotHeld(device.fingerprint)
                     } else {
                         // Shown as held once it is.
@@ -977,13 +987,6 @@ class ChatViewModel internal constructor(
     /** The identity whose devices were last opened: on the main thread alone. */
     private var devicesFor: String? = null
 
-    /**
-     * Devices certified or revoked here that the list on disk could not take,
-     * by identity: shown from here, and written again at each read. On the
-     * store queue alone.
-     */
-    private val unkept = HashMap<String, List<MintedDevice>>()
-
     /** What each identity's registrars last said of its devices, by fingerprint, and whether a list read: on the store queue alone. */
     private val atRegistrars = HashMap<String, Pair<Map<String, DeviceStanding>, Boolean>>()
 
@@ -1102,11 +1105,6 @@ class ChatViewModel internal constructor(
                 epoch = info.epoch.toLong(),
             )
         val floor = identities.epoch(kept)
-        val pending =
-            unkept[fingerprint]
-                .orEmpty()
-                .filter { device -> !keep(fingerprint, device) }
-                .also { if (it.isEmpty()) unkept.remove(fingerprint) else unkept[fingerprint] = it }
         val (listed, unreadable) =
             try {
                 identities.minted(fingerprint) to false
@@ -1116,9 +1114,7 @@ class ChatViewModel internal constructor(
         val (standing, read) = atRegistrars[fingerprint] ?: (emptyMap<String, DeviceStanding>() to false)
         // A certificate past its time is dead whether or not it ever arrived; a revoked one stays,
         // as it is what refuses its key a renewal.
-        val merged =
-            (listed.filter { l -> pending.none { it.device.contentEquals(l.device) } } + pending)
-                .filter { it.listed(now()) }
+        val merged = listed.filter { it.listed(now()) }
         // One listed since the last read was not asked about; one below the floor is signed out whatever a read says.
         val unchecked = merged.any { (!read || it.fingerprint !in standing) && it.epoch >= floor }
         val setAside = identities.mintedUnreadable(fingerprint)
@@ -1145,35 +1141,22 @@ class ChatViewModel internal constructor(
             floor,
             kept.reset,
             kept.registrar,
+            // Every reset from a phone whose own key is known revoked is refused, so none is offered.
+            kept.restored?.takeIf { held.isHeld(fingerprint) && !ownRevoked(kept) },
         )
     }
 
-    /**
-     * [device] written to [fingerprint]'s list; if the disk will not take it
-     * now, kept in memory to be with [held], and false either way.
-     */
+    /** [device] written to [fingerprint]'s list, and whether the disk took it. */
     private fun keep(
         fingerprint: String,
         device: MintedDevice,
-        held: Boolean = true,
     ): Boolean =
         try {
             identities.minted(fingerprint, device, now())
-            // Written, it is the disk's to say from now on: an older state held here is not written over it.
-            unkeep(fingerprint, device.device)
             true
         } catch (_: IOException) {
-            if (held) unkept[fingerprint] = unkept[fingerprint].orEmpty().filter { !it.device.contentEquals(device.device) } + device
             false
         }
-
-    private fun unkeep(
-        fingerprint: String,
-        device: ByteArray,
-    ) {
-        val left = unkept[fingerprint].orEmpty().filter { !it.device.contentEquals(device) }
-        if (left.isEmpty()) unkept.remove(fingerprint) else unkept[fingerprint] = left
-    }
 
     /** Whether [device] was revoked, as [fingerprint]'s list and its registrars' records last read say now. */
     private fun revokedHere(
@@ -1378,7 +1361,7 @@ class ChatViewModel internal constructor(
                             epoch = certified.epoch.toLong(),
                         )
                     // A certificate this phone cannot list is not sent: nothing has left it.
-                    if (!withContext(store) { keep(fingerprint, minted, held = false) }) {
+                    if (!withContext(store) { keep(fingerprint, minted) }) {
                         return@keeping Certifying.Failed(fingerprint, SetupProblem.NotKept)
                     }
                     learn(fingerprint, minted.epoch)
@@ -1478,7 +1461,7 @@ class ChatViewModel internal constructor(
                             held.use(fingerprint, authorizer) { seed ->
                                 // Revoked here for good once the person has said so behind the prompt,
                                 // whatever the registrar answers; not asked of it unless that is kept.
-                                if (!withContext(store) { keep(fingerprint, device.with(revoked = true), held = false) }) {
+                                if (!withContext(store) { keep(fingerprint, device.with(revoked = true)) }) {
                                     return@use false
                                 }
                                 refreshDevices(fingerprint)
@@ -1528,6 +1511,17 @@ class ChatViewModel internal constructor(
             withContext(store) { stored { identities.discardUnread(fingerprint) } }
             refreshDevices(fingerprint)
             rejudge(fingerprint)
+        }
+    }
+
+    /** [fingerprint]'s restore offer declined: its devices stay signed in, and Reset devices is still there. */
+    fun declineRestoreReset(fingerprint: String) {
+        viewModelScope.launch {
+            withContext(store) {
+                stored { identities.restoreOfferDone(fingerprint) }
+                publishIdentities()
+            }
+            refreshDevices(fingerprint)
         }
     }
 
@@ -1587,6 +1581,8 @@ class ChatViewModel internal constructor(
                 }
             // Read again however it ended: what it signed out is shown as the registrars now say.
             if (devicesFor == fingerprint) refreshDevices(fingerprint)
+            // A list set aside it let go of no longer keeps a request shown from being judged.
+            rejudge(fingerprint)
         }
     }
 
@@ -1620,6 +1616,7 @@ class ChatViewModel internal constructor(
             // finds itself overtaken however its turn on the store falls.
             if (begun) standingReads[fingerprint] = (standingReads[fingerprint] ?: 0) + 1
             var unkept = false
+            var outcomeKept = false
             withContext(NonCancellable + store) {
                 got?.let { r ->
                     val later = r.later.toSet()
@@ -1636,16 +1633,41 @@ class ChatViewModel internal constructor(
                             notRegistrars = r.notRegistrars,
                         )
                     try {
-                        identities.resetDone(fingerprint, r.cert, kept.cert, outcome)
+                        outcomeKept = identities.resetDone(fingerprint, r.cert, kept.cert, outcome) != null
                         if (r.retry != null) retries.schedule(fingerprint, r.retryIn?.toLong() ?: 0) else retries.cancel(fingerprint)
                     } catch (e: IOException) {
-                        // Its note under way stays: another is offered, now and after a restart.
+                        // Not known kept, so told as such and nothing set aside is let go of on it. The
+                        // write may still have landed, its directory unsynced: what is on disk now says
+                        // whether its retry is asked for, or its note under way stands and another is offered.
                         Log.w("hexline", "a reset's outcome not kept", e)
                         unkept = true
+                        identities
+                            .list()
+                            .find { it.fingerprint == fingerprint }
+                            ?.reset
+                            ?.takeIf { it.underWay == null && it.epoch == r.epoch.toLong() }
+                            ?.let { on ->
+                                if (on.retry !=
+                                    null
+                                ) {
+                                    retries.schedule(fingerprint, maxOf(0, on.retryAt - now()))
+                                } else {
+                                    retries.cancel(fingerprint)
+                                }
+                            }
                     }
                 }
                 // What its reads verified, and the floor it raised, whatever it came to.
                 if (begun) absorbing(fingerprint, null)
+                // Every device a list set aside names is below the floor the reset kept, so the copies
+                // no longer block approving; only where all of them reads, so nothing is lost with them.
+                if (outcomeKept) {
+                    try {
+                        identities.discardUnread(fingerprint, onlyIfWhole = true)
+                    } catch (e: IOException) {
+                        Log.w("hexline", "a list set aside not carried after a reset", e)
+                    }
+                }
                 publishIdentities()
             }
             if (unkept) throw ResetUnkept()
@@ -2090,7 +2112,6 @@ class ChatViewModel internal constructor(
             held.forget(fingerprint)
             held.dismiss(fingerprint)
             identities.delete(fingerprint)
-            unkept.remove(fingerprint)
             atRegistrars.remove(fingerprint)
             heldLost.value = held.notices()
             publishIdentities()

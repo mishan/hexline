@@ -20,6 +20,7 @@ import org.foggyden.hexline.identity.Certifying
 import org.foggyden.hexline.identity.Renewing
 import org.foggyden.hexline.identity.ResetRetrier
 import org.foggyden.hexline.identity.Resetting
+import org.foggyden.hexline.identity.Revoked
 import org.foggyden.hexline.identity.SetupProblem
 import org.foggyden.hexline.identity.WorkResetRetries
 import org.foggyden.hexline.servers.StoreQueue
@@ -116,6 +117,165 @@ class ResetDevicesTest : ViewModelHarness() {
         setups.resetLater = listOf("other.example")
         setups.resetRetry = blob.toByteArray()
         setups.resetRetryIn = 900
+    }
+
+    private fun key(b: Int) = android.util.Base64.encodeToString(ByteArray(32) { b.toByte() }, android.util.Base64.NO_WRAP)
+
+    /** [fingerprint]'s list written as [text], which does not read, and read so it is set aside. */
+    private fun setAside(
+        vm: ChatViewModel,
+        fingerprint: String,
+        text: String,
+    ) {
+        File(stores.identityDir, "minted-" + shortHash(fingerprint.toByteArray())).writeText(text)
+        vm.openDevices(fingerprint)
+        settle()
+        assertTrue(checkNotNull(vm.devices.value).setAside)
+    }
+
+    private fun copies() =
+        stores.identityDir
+            .list()
+            .orEmpty()
+            .filter { it.contains(".unread-") }
+
+    /** The tablet asking at a code shown for [fingerprint], judged [revoked]. */
+    private fun asks(
+        vm: ChatViewModel,
+        fingerprint: String,
+        revoked: Revoked,
+    ) {
+        shown(vm, fingerprint).next.complete(tablet)
+        settle()
+        assertEquals(Certifying.Asked(fingerprint, tablet, revoked), vm.certify.value)
+        vm.cancelCertifying()
+        settle()
+    }
+
+    @Test
+    fun aResetLetsGoOfAListSetAsideThatAllReadsCarryingWhatItSaysAndApprovingIsUnblocked() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        // Every key reads; the device's entry, with no expiry, does not.
+        setAside(
+            vm,
+            fingerprint,
+            """{"devices":[{"device":"${key(6)}"}],"revoked":["${key(5)}"],"certified":[{"device":"${key(4)}","epoch":0}]}""",
+        )
+        asks(vm, fingerprint, Revoked.Unknown)
+        reset(vm, fingerprint)
+        assertTrue(vm.resetting.value is Resetting.Done)
+        assertEquals(emptyList<String>(), copies())
+        assertFalse(checkNotNull(vm.devices.value).setAside)
+        assertEquals(listOf(ByteArray(32) { 5 }.toList()), outside { identities.seenRevoked(fingerprint) }.map { it.toList() })
+        assertEquals(
+            setOf(4, 6).map { b -> ByteArray(32) { b.toByte() }.toList() }.toSet(),
+            outside { identities.everCertified(fingerprint) }.map { it.first.toList() }.toSet(),
+        )
+        asks(vm, fingerprint, Revoked.No)
+    }
+
+    @Test
+    fun aResetKeepsAListSetAsideThatDoesNotAllReadAndItsBlock() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        setAside(vm, fingerprint, """[{"device":"${key(5)}","revoked":true},{"device":12}]""")
+        reset(vm, fingerprint)
+        assertTrue(vm.resetting.value is Resetting.Done)
+        assertEquals("a revoked key it cannot read would go with it", 1, copies().size)
+        assertTrue(checkNotNull(vm.devices.value).setAsideLoses)
+        asks(vm, fingerprint, Revoked.Unknown)
+    }
+
+    @Test
+    fun aDiscardOfWholeCopiesOnlyLetsNoneGoWhileACopyItHoldsDoesNotReadWhole() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        setAside(vm, fingerprint, """{"devices":[{"device":"${key(6)}"}],"revoked":["${key(5)}"]}""")
+        // Set aside after any check made apart from the discard, as another reader of the list can.
+        setAside(vm, fingerprint, """[{"device":"${key(4)}","revoked":true},{"device":12}]""")
+        outside { identities.discardUnread(fingerprint, onlyIfWhole = true) }
+        assertEquals(2, copies().size)
+        File(stores.identityDir, copies().single { it.endsWith("-1") }).delete()
+        outside { identities.discardUnread(fingerprint, onlyIfWhole = true) }
+        assertEquals("once every copy reads whole, they go", emptyList<String>(), copies())
+    }
+
+    @Test
+    fun aResetsOutcomeWhoseSyncFailsIsNotKeptAndLetsGoOfNoListSetAside() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        setAside(vm, fingerprint, """{"devices":[{"device":"${key(6)}"}],"revoked":["${key(5)}"]}""")
+        // Once it has posted: the disk takes the identity's writes but says it could not sync them.
+        setups.onReset = { _, _, _, _ -> stores.identitySyncFails = true }
+        reset(vm, fingerprint)
+        stores.identitySyncFails = false
+        assertEquals(Resetting.Failed(fingerprint, SetupProblem.ResetNotKept), vm.resetting.value)
+        val reset = checkNotNull(kept(fingerprint).reset)
+        assertNotNull("the record from before it, still under way", reset.underWay)
+        assertEquals(0L, reset.epoch)
+        assertEquals(1, copies().size)
+    }
+
+    @Test
+    fun aResetsOutcomeRenamedIntoPlaceButNotSyncedIsRetriedFromWhatIsOnDiskAndNotToldDone() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        setAside(vm, fingerprint, """{"devices":[{"device":"${key(6)}"}],"revoked":["${key(5)}"]}""")
+        downAtReset()
+        // Once it has posted: each identity write lands, and syncing the directory after it fails.
+        setups.onReset = { _, _, _, _ -> stores.identityDirSyncFails = true }
+        val asked = retries.asked.size
+        reset(vm, fingerprint)
+        stores.identityDirSyncFails = false
+        assertEquals(Resetting.Failed(fingerprint, SetupProblem.ResetNotKept), vm.resetting.value)
+        val reset = checkNotNull(kept(fingerprint).reset)
+        assertNull("the outcome is on disk", reset.underWay)
+        assertArrayEquals("kept".toByteArray(), reset.retry)
+        assertEquals("its retry asked for all the same", listOf(Triple("schedule", fingerprint, 900L)), retries.asked.drop(asked))
+        assertEquals("nothing let go of on an outcome not known kept", 1, copies().size)
+    }
+
+    @Test
+    fun aListSetAsideTheDiskWillNotGiveBackIsNotLetGoOf() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        setAside(vm, fingerprint, """{"devices":[{"device":"${key(6)}"}],"revoked":["${key(5)}"]}""")
+        // Read once and then never again: the read that is carried is the one judged.
+        stores.copyReadsFailAfter = 1
+        outside { identities.discardUnread(fingerprint, onlyIfWhole = true) }
+        stores.copyReadsFailAfter = null
+        assertEquals("let go of only with what it says carried", emptyList<String>(), copies())
+        assertEquals(listOf(ByteArray(32) { 5 }.toList()), outside { identities.seenRevoked(fingerprint) }.map { it.toList() })
+        // Never read at all: kept, even by a discard the person asked for.
+        setAside(vm, fingerprint, """{"devices":[{"device":"${key(3)}"}],"revoked":["${key(2)}"]}""")
+        stores.copyReadsFailAfter = 0
+        vm.discardUnreadable(fingerprint)
+        settle()
+        stores.copyReadsFailAfter = null
+        assertEquals(1, copies().size)
+    }
+
+    @Test
+    fun aListSetAsideThatCannotBeCarriedAfterAResetStaysAndTheResetIsKept() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        setAside(vm, fingerprint, """{"devices":[{"device":"${key(6)}"}],"revoked":["${key(5)}"]}""")
+        // Once it has posted: the disk refuses the list from then on.
+        setups.onReset = { _, _, _, _ -> stores.listsFail = 100 }
+        reset(vm, fingerprint)
+        stores.listsFail = 0
+        assertTrue("${vm.resetting.value}", vm.resetting.value is Resetting.Done)
+        assertTrue(kept(fingerprint).reset!!.epoch > 0)
+        assertEquals(1, copies().size)
+        asks(vm, fingerprint, Revoked.Unknown)
     }
 
     @Test
@@ -545,8 +705,7 @@ class ResetDevicesTest : ViewModelHarness() {
         outside {
             val json = JSONObject(String(file.readBytes()))
             json.put("reset", JSONObject().put("under_way", "not a time"))
-            org.foggyden.hexline.identity
-                .writeAtomically(file, json.toString().toByteArray())
+            file.writeText(json.toString())
         }
         val again = model().also { settle() }
         assertTrue(checkNotNull(kept(fingerprint).reset).uncertain)
@@ -588,8 +747,7 @@ class ResetDevicesTest : ViewModelHarness() {
         outside {
             val json = JSONObject(String(file.readBytes()))
             json.getJSONObject("reset").put("retry", 5)
-            org.foggyden.hexline.identity
-                .writeAtomically(file, json.toString().toByteArray())
+            file.writeText(json.toString())
         }
         val again = model().also { settle() }
         again.openDevices(fingerprint)

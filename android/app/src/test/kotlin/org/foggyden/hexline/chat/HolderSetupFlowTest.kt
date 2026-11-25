@@ -11,6 +11,8 @@ import org.foggyden.hexline.identity.BackingUp
 import org.foggyden.hexline.identity.HolderRefusal
 import org.foggyden.hexline.identity.Identities
 import org.foggyden.hexline.identity.Renewing
+import org.foggyden.hexline.identity.Resetting
+import org.foggyden.hexline.identity.RestoreOffer
 import org.foggyden.hexline.identity.RestoreProblem
 import org.foggyden.hexline.identity.Restoring
 import org.foggyden.hexline.identity.SettingUp
@@ -345,6 +347,131 @@ class HolderSetupFlowTest : ViewModelHarness() {
         for (shown in listOf(SettingUp.Successor("SECRET"), SettingUp.Recovery("SECRET", false))) {
             assertFalse("$shown", "SECRET" in shown.toString())
         }
+    }
+
+    /** [identity] restored to hold here, [lost] as the person said; its offer as the Devices screen is given it. */
+    private fun restoredToHold(
+        vm: ChatViewModel,
+        identity: NewIdentity,
+        lost: Boolean,
+        authorizer: org.foggyden.hexline.secrets.Authorizer = stores.keys.authorizer(),
+    ): RestoreOffer? {
+        setups.restores = identity
+        vm.restore("reg.example", "dana", SecretKind.RECOVERY_CODE, "code", "Pixel", authorizer, lost)
+        settle()
+        return offered(vm, identity.fingerprint)
+    }
+
+    private fun offered(
+        vm: ChatViewModel,
+        fingerprint: String,
+    ): RestoreOffer? {
+        vm.openDevices(fingerprint)
+        settle()
+        return checkNotNull(vm.devices.value).restored
+    }
+
+    @Test
+    fun aRestoresOfferIsKeptInItsOwnSaveAcrossARestartAndAnsweredOnlyByAResetsKeptOutcome() {
+        val identity = newIdentity("Dana")
+        val vm = model()
+        settle()
+        // Every identity write after the save fails: an offer written apart from it would be lost.
+        stores.identityWriteFails = 1
+        assertEquals(RestoreOffer(lost = true), restoredToHold(vm, identity, lost = true))
+        stores.identityWriteFails = null
+        owner.clear()
+        settle()
+        val again = model().also { settle() }
+        assertEquals("after a restart", RestoreOffer(lost = true), offered(again, identity.fingerprint))
+        setups.resetFails = CoreException.Refused("no_registrar_reached", "", null)
+        again.resetDevices(identity.fingerprint, stores.keys.authorizer())
+        settle()
+        assertEquals("refused before posting", RestoreOffer(lost = true), offered(again, identity.fingerprint))
+        again.resetDevices(identity.fingerprint, stores.keys.authorizer())
+        settle()
+        assertTrue(again.resetting.value is Resetting.Done)
+        assertNull(offered(again, identity.fingerprint))
+        assertNull(keptIdentities().single().restored)
+    }
+
+    @Test
+    fun aRestoresOfferDeclinedIsGoneAndOneOfAPhoneNotLostIsKeptAsSuch() {
+        val identity = newIdentity("Dana")
+        val vm = model()
+        settle()
+        assertEquals(RestoreOffer(lost = false), restoredToHold(vm, identity, lost = false))
+        vm.declineRestoreReset(identity.fingerprint)
+        settle()
+        assertNull(offered(vm, identity.fingerprint))
+        assertEquals("nothing reset", emptyList<Long>(), setups.resets)
+    }
+
+    @Test
+    fun aRestoreWhoseHoldWasRefusedLeavesNoOffer() {
+        val identity = newIdentity("Dana")
+        val vm = model()
+        settle()
+        assertNull(restoredToHold(vm, identity, lost = true, stores.keys.authorizer { false }))
+        assertEquals(Restoring.NotHeld(identity.fingerprint), vm.restore.value)
+        assertNull("none on disk either", keptIdentities().single().restored)
+    }
+
+    @Test
+    fun aRefusedHoldOnARestoreOfAnIdentityStillHeldKeepsItsOffer() {
+        val identity = newIdentity("Dana")
+        val vm = model()
+        settle()
+        restoredToHold(vm, identity, lost = true)
+        vm.restoreSeen()
+        restoredToHold(vm, identity, lost = true, stores.keys.authorizer { false })
+        assertEquals(Restoring.NotHeld(identity.fingerprint), vm.restore.value)
+        assertTrue("the key held before is still held", stores.held.isHeld(identity.fingerprint))
+        assertEquals(RestoreOffer(lost = true), offered(vm, identity.fingerprint))
+    }
+
+    @Test
+    fun noOfferIsShownForAnIdentityWhoseOwnDeviceKeyIsKnownRevoked() {
+        val identity = newIdentity("Dana")
+        val vm = model()
+        settle()
+        assertEquals(RestoreOffer(lost = true), restoredToHold(vm, identity, lost = true))
+        setups.verified(identity.card, keptIdentities().single().info.device)
+        assertNull("every reset would be refused this_device_revoked", offered(vm, identity.fingerprint))
+    }
+
+    @Test
+    fun anOfferStandsThroughANewDeviceAndASecondRestoreOfAPhoneNotLost() {
+        val identity = newIdentity("Dana")
+        val vm = model()
+        settle()
+        restoredToHold(vm, identity, lost = true)
+        vm.newDeviceHeld(identity.fingerprint, stores.keys.authorizer())
+        settle()
+        assertEquals(Renewing.Done(identity.fingerprint), vm.renewing.value)
+        assertEquals("through the new device's save", RestoreOffer(lost = true), offered(vm, identity.fingerprint))
+        vm.restoreSeen()
+        assertEquals("a second restore does not make it less urgent", RestoreOffer(lost = true), restoredToHold(vm, identity, lost = false))
+    }
+
+    @Test
+    fun aRestoredFieldThatDoesNotReadIsOfferedAsAfterALostPhone() {
+        val identity = newIdentity("Dana")
+        val vm = model()
+        settle()
+        restoredToHold(vm, identity, lost = false)
+        val file =
+            stores.identityDir
+                .listFiles()
+                .orEmpty()
+                .single { it.name.startsWith("identity-") && !it.name.contains('.') }
+        file.writeText(
+            org.json
+                .JSONObject(file.readText())
+                .put("restored", "garbled")
+                .toString(),
+        )
+        assertEquals(RestoreOffer(lost = true), offered(vm, identity.fingerprint))
     }
 
     @Test

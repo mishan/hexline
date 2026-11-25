@@ -158,8 +158,23 @@ abstract class ViewModelHarness {
 
         /** How many identity file writes go through before the next one fails, once; null for none. */
         var identityWriteFails: Int? = null
+
+        /** Whether syncing an identity's file fails, as a disk's error a write hears of only then. */
+        var identitySyncFails = false
+
+        /** Whether syncing the directory after an identity's file is renamed into place fails. */
+        var identityDirSyncFails = false
+
+        /** How many reads of a list set aside go through before every later one fails; null for none. */
+        var copyReadsFailAfter: Int? = null
         val identities =
-            Identities(app, secrets, identityDir, syncDir = { synced += it }) { file, bytes ->
+            Identities(app, secrets, identityDir, syncDir = { synced += it }, readCopy = { copy ->
+                copyReadsFailAfter?.let { left ->
+                    if (left == 0) throw IOException("unreadable sector")
+                    copyReadsFailAfter = left - 1
+                }
+                copy.readBytes()
+            }) { file, bytes ->
                 if (rotationsFail && file.name.startsWith("rotation-")) throw IOException("disk full")
                 if (identitiesFail && file.name.startsWith("identity-")) throw IOException("disk full")
                 if (file.name.startsWith("identity-")) {
@@ -172,7 +187,16 @@ abstract class ViewModelHarness {
                     listsFail--
                     throw IOException("disk full")
                 }
-                if (!(losesLists && file.name.startsWith("minted-"))) writeAtomically(file, bytes)
+                // The directory is synced by the store's own seam: Robolectric opens none.
+                val sync = { out: java.io.FileOutputStream ->
+                    if (identitySyncFails && file.name.startsWith("identity-")) throw java.io.SyncFailedException("sync failed")
+                    out.fd.sync()
+                }
+                if (!(losesLists && file.name.startsWith("minted-"))) {
+                    writeAtomically(file, bytes, sync) {
+                        if (identityDirSyncFails && file.name.startsWith("identity-")) throw IOException("directory not synced")
+                    }
+                }
             }
         val keys = FakeHolderKeys()
         val held = HeldSeeds(File(app.filesDir, "held-$n"), keys, EmptyCoroutineContext)
