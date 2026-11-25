@@ -107,7 +107,7 @@ class ResetDevicesTest : ViewModelHarness() {
         notDone: List<NotYetReset> = later.map { NotYetReset(it, NotYet.UNREACHABLE, null, null) },
         done: List<String> = emptyList(),
         retry: ByteArray? = later.takeIf { it.isNotEmpty() }?.let { "retry for $epoch".toByteArray() },
-    ) = ResetRetried(epoch.toULong(), epoch.toULong(), done, notDone, emptyList(), retry, retry?.let { 900uL }, later)
+    ) = ResetRetried(epoch.toULong(), epoch.toULong(), done, notDone, emptyList(), retry, retry?.let { 900uL }, later, retry?.let { 900uL })
 
     private fun downAtReset(blob: String = "kept") {
         setups.resetNotDone = listOf(NotYetReset("other.example", NotYet.UNREACHABLE, null, null))
@@ -262,6 +262,24 @@ class ResetDevicesTest : ViewModelHarness() {
             write++
         }
         assertTrue("the retry's writes all refused in turn", write >= 1)
+    }
+
+    @Test
+    fun aRetryWhoseOutcomeIsNotKeptAsksNoRegistrarSoonerThanItAsked() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        downAtReset()
+        reset(vm, fingerprint)
+        now += 900
+        // One registrar asks for a day, the other is due again in the backoff's first wait.
+        setups.retryAnswers += { retried(1, listOf("slow.example", "other.example")).copy(retryLastIn = 86_400uL) }
+        stores.identityWriteFails = 0
+        var next: Long? = null
+        CoroutineScope(main).launch { next = retrier().run(fingerprint) }
+        settle()
+        assertNull("the write refused", stores.identityWriteFails)
+        assertEquals(86_400L, next)
     }
 
     @Test

@@ -153,7 +153,7 @@ class ResetRetrier(
                         identities.retried(fingerprint, reset.epoch) { it.copy(retry = null, pending = emptyList(), unread = true) }
                     }
                 } catch (e: IOException) {
-                    // What it came to is owed: the retry kept is posted again, no sooner than it would have been.
+                    // What it came to is owed, and the retry kept is posted again.
                     Log.w("hexline", "a reset's retry not kept", e)
                     unsaved = true
                 }
@@ -163,7 +163,8 @@ class ResetRetrier(
         }
         val kept = withContext(queue.dispatcher) { identities.list().find { it.fingerprint == fingerprint }?.reset }
         if (kept?.retry == null) return null
-        if (unsaved) return maxOf(got?.retryIn?.toLong() ?: 0, RETRY_EVERY)
+        // The retry kept is posted again whole: not before the last registrar it asks was told to wait.
+        if (unsaved) return maxOf(got?.retryLastIn?.toLong() ?: 0, RETRY_EVERY)
         // The same retry, not posted: asked again after a while. Anything else is when the kept one is due.
         if (failed != null && kept.epoch == reset.epoch) return failed
         return maxOf(0, kept.retryAt - now())

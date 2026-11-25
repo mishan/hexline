@@ -162,6 +162,10 @@ pub struct ResetRetried {
     pub retry_in: Option<u64>,
     /// As [`DevicesReset::later`], those not due counted among them.
     pub later: Vec<String>,
+    /// Seconds before the last of `retry`'s registrars is due: where this
+    /// outcome is not kept and the retry posted is posted again, no sooner,
+    /// so none is asked before the wait it was given.
+    pub retry_last_in: Option<u64>,
 }
 
 /// A registrar the reset is not at yet, and why.
@@ -1187,13 +1191,20 @@ fn given_up(chain: &Chain, at: u64) -> bool {
 /// Seconds from `at` until the next retry is worth making: when the first
 /// of `chains` is due, a while for one due already.
 fn retry_in(chains: &[Chain], at: u64) -> Option<u64> {
-    chains
-        .iter()
-        .map(|c| match c.due > at {
-            true => c.due - at,
-            false => RETRY_EVERY,
-        })
-        .min()
+    dues(chains, at).min()
+}
+
+/// Seconds from `at` until the last of `chains` is due.
+fn retry_last_in(chains: &[Chain], at: u64) -> Option<u64> {
+    dues(chains, at).max()
+}
+
+/// Seconds from `at` until each of `chains` is due: a while for one due already.
+fn dues(chains: &[Chain], at: u64) -> impl Iterator<Item = u64> + '_ {
+    chains.iter().map(move |c| match c.due > at {
+        true => c.due - at,
+        false => RETRY_EVERY,
+    })
 }
 
 /// Whether `chain` is to be asked at `at`: its time has come, or the
@@ -1293,6 +1304,7 @@ async fn retry_all<D: Desk>(
         retry: None,
         retry_in: None,
         later: Vec::new(),
+        retry_last_in: None,
     };
     for (mut chain, (listed, caught)) in caught {
         out.published = out.published.max(listed);
@@ -1317,6 +1329,7 @@ async fn retry_all<D: Desk>(
         }
     }
     out.retry_in = retry_in(&left, at);
+    out.retry_last_in = retry_last_in(&left, at);
     out.later = left.iter().map(|c| c.registrar.clone()).collect();
     out.retry = encode(&Retry {
         chains: left,
@@ -2442,6 +2455,7 @@ mod tests {
             retry: None,
             retry_in: None,
             later: vec![],
+            retry_last_in: None,
         }
     }
 
@@ -3079,5 +3093,27 @@ mod tests {
         let kept = lagging(&alice(), &report, |_| true, at).unwrap();
         let dues: Vec<u64> = kept.chains.iter().map(|c| c.due - at).collect();
         assert_eq!(dues, vec![RETRY_EVERY, 3600, RETRY_EVERY]);
+    }
+
+    #[tokio::test]
+    async fn a_retry_says_when_the_last_registrar_it_keeps_is_due_as_well_as_the_first() {
+        let mut slow = Sim {
+            limited_reads: Some(RETRY_MOST),
+            ..Sim::default()
+        };
+        let mut down = Sim {
+            unreachable: true,
+            ..Sim::default()
+        };
+        let mut kept = for_r0(1, Current::default(), vec![]);
+        let mut r1 = kept.chains[0].clone();
+        r1.registrar = "r1".into();
+        kept.chains.push(r1);
+        let at = now();
+        let got = retry_at(&kept, &mut [&mut slow, &mut down], at).await;
+        assert_eq!(
+            (got.retry_in, got.retry_last_in),
+            (Some(RETRY_EVERY), Some(RETRY_MOST))
+        );
     }
 }
