@@ -179,7 +179,13 @@
     <string name="holder_prompt_title">Hexline</string>
     <string name="holder_prompt_subtitle">Use this phone\'s identity key</string>
     <string name="restore_hold">Hold the identity key on this phone</string>
-    <string name="restore_not_held">Restored as this phone\'s device only: the prompt to hold its key was not answered. Restore it again to hold the key.</string>
+    <string name="restore_old_phone_lost">My old phone was lost or stolen</string>
+    <string name="restore_reset_title">Sign out the devices your old phone set up?</string>
+    <string name="restore_reset_body">Every device of this identity except this phone is signed out, including ones set up elsewhere. You\'ll add back the ones you still use.</string>
+    <string name="restore_reset_yes">Sign out</string>
+    <string name="restore_reset_no">Not now</string>
+    <string name="restore_reset_wait">This can be answered once what is under way has finished.</string>
+    <string name="restore_not_held">Restored as this phone\'s device only: the prompt to hold its key was not answered. Restore it again to hold the key and to sign out the devices your old phone set up.</string>
     <string name="holder_unrecoverable">Its key was lost before setup was finished: it can be neither finished nor recovered. It works as this phone\'s device until its certificate expires.</string>
     <string name="held_key_lost_unfinished">Your screen lock was removed before %1$s was set up, so its identity key is gone and there is no recovery code to restore it from. It still works as this phone\'s device until its certificate expires; you may delete it.</string>
     <string name="backup">Backup&#8230;</string>
@@ -245,9 +251,9 @@
     <string name="certify_never_vouch">It will never be able to certify other devices.</string>
     <string name="certify_revoked">This device was revoked. It cannot be certified again.</string>
     <string name="certify_revoked_unopened">This phone\'s list of devices it certified would not open, so it cannot tell whether this device was revoked. Try again below to approve it.</string>
-    <string name="certify_revoked_unknown">This phone\'s list of devices it certified could not be read, so it cannot tell whether this device was revoked. Discard the unreadable list below to approve it.</string>
+    <string name="certify_revoked_unknown">This phone\'s list of devices it certified could not be read, so it cannot tell whether this device was revoked. Discard the unreadable list or reset devices below to approve it.</string>
     <string name="devices_loading">Reading the list&#8230;</string>
-    <string name="devices_unreadable">This phone\'s list of devices it certified could not be read. It was kept aside, and devices certified before it may not be listed here. Until it is discarded, no device can be approved.</string>
+    <string name="devices_unreadable">This phone\'s list of devices it certified could not be read. It was kept aside, and devices certified before it may not be listed here. Until it is discarded or devices are reset, no device can be approved.</string>
     <string name="devices_discard_loses">Part of it can\'t be read at all, so a device revoked there would not be known here as revoked once it is discarded.</string>
     <string name="devices_discard_unreadable">Discard unreadable list</string>
     <string name="devices_unopened">This phone\'s list of devices it certified would not open just now. No device can be approved until it does.</string>

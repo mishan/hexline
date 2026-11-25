@@ -115,6 +115,9 @@ fun DevicesScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text(stringResource(R.string.devices_title, name), style = MaterialTheme.typography.headlineMedium)
+        // A reset that may have posted is offered again below instead, so it is asked once.
+        val offer = devices?.restored?.takeIf { devices.reset?.underWay == null && resetting !is Resetting.Working }
+        if (offer != null) RestoreOffered(offer.lost, devices.registrar?.let(::hostOf) ?: name, !busy && !elsewhere, fingerprint, actions)
         when (certifying) {
             is Certifying.Opening, is Certifying.Answering -> Text(stringResource(R.string.holder_working))
             is Certifying.Showing -> {
@@ -211,6 +214,7 @@ fun DevicesScreen(
             Problem(stringResource(R.string.devices_unreadable))
             if (devices.setAsideLoses) Problem(stringResource(R.string.devices_discard_loses))
             TextButton({ actions.discardUnreadable(fingerprint) }) { Text(stringResource(R.string.devices_discard_unreadable)) }
+            TextButton({ confirmingReset = true }, enabled = !busy && !elsewhere) { Text(stringResource(R.string.reset_devices)) }
         }
         if (devices?.unchecked == true) {
             Problem(stringResource(R.string.devices_unchecked))
@@ -313,6 +317,36 @@ fun DevicesScreen(
             },
             dismissButton = { TextButton({ revokingDevice = null }) { Text(stringResource(R.string.cancel)) } },
         )
+    }
+}
+
+/**
+ * A restore's question: whether to sign out the devices the old phone set
+ * up. Signing out leads where the person said the old phone was lost.
+ * While something else is under way it cannot start, and says so.
+ */
+@Composable
+private fun RestoreOffered(
+    lost: Boolean,
+    registrar: String,
+    enabled: Boolean,
+    fingerprint: String,
+    actions: SetupActions,
+) {
+    Text(stringResource(R.string.restore_reset_title), style = MaterialTheme.typography.titleMedium)
+    Text(stringResource(R.string.restore_reset_body))
+    Text(stringResource(R.string.reset_confirm_body, registrar), style = MaterialTheme.typography.bodySmall)
+    if (!enabled) Text(stringResource(R.string.restore_reset_wait), style = MaterialTheme.typography.bodySmall)
+    val yes = @Composable { Text(stringResource(R.string.restore_reset_yes)) }
+    val no = @Composable { Text(stringResource(R.string.restore_reset_no)) }
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (lost) {
+            Button({ actions.resetDevices(fingerprint) }, enabled = enabled) { yes() }
+            TextButton({ actions.declineRestoreReset(fingerprint) }, enabled = enabled) { no() }
+        } else {
+            Button({ actions.declineRestoreReset(fingerprint) }, enabled = enabled) { no() }
+            TextButton({ actions.resetDevices(fingerprint) }, enabled = enabled) { yes() }
+        }
     }
 }
 

@@ -22,11 +22,14 @@ import org.foggyden.hexline.core.RegistrarState
 import org.foggyden.hexline.core.RotationRegistrar
 import org.foggyden.hexline.core.RotationState
 import org.foggyden.hexline.identity.Enrolling
+import org.foggyden.hexline.identity.RestoreOffer
 import org.foggyden.hexline.identity.Restoring
 import org.foggyden.hexline.identity.StoredIdentity
+import org.junit.Assert.assertEquals
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.lang.reflect.Proxy
 
 @RunWith(AndroidJUnit4::class)
 class ConnectFlowTest {
@@ -51,7 +54,7 @@ class ConnectFlowTest {
                     false,
                     { _, _, _, _ -> },
                     {},
-                    { _, _, _, _, _, _ -> },
+                    { _, _, _, _, _, _, _ -> },
                     {},
                     {},
                     { _, _ -> },
@@ -70,6 +73,92 @@ class ConnectFlowTest {
         rule.onNode(hasText(text(R.string.restore_title))).assertExists()
         rule.onNode(hasText(text(R.string.cancel))).performClick()
         rule.onNode(hasSetTextAction() and hasText("wss://a.example/ng")).assertExists()
+    }
+
+    @Test
+    fun aRestoreToHoldAsksWhetherTheOldPhoneWasLostAndPassesItOn() {
+        val asked = mutableListOf<Pair<Boolean, Boolean>>()
+        rule.setContent {
+            MaterialTheme {
+                RestoreScreen(Restoring.Idle, "https://hl.example", "dana", { _, _, _, _, _, hold, lost -> asked += hold to lost }) {}
+            }
+        }
+        val lost = hasText(text(R.string.restore_old_phone_lost))
+        rule.onNode(lost).assertDoesNotExist()
+        rule.onNode(hasSetTextAction() and hasText(text(R.string.passphrase))).performTextInput("secret")
+        rule.onNode(hasText(text(R.string.restore_hold))).performClick()
+        rule.onNode(lost).performClick()
+        rule.onNode(hasText(text(R.string.restore))).performClick()
+        // Not holding the key, there is no reset to make, and nothing lost is said.
+        rule.onNode(hasText(text(R.string.restore_hold))).performClick()
+        rule.onNode(lost).assertDoesNotExist()
+        rule.onNode(hasText(text(R.string.restore))).performClick()
+        assertEquals(listOf(true to true, false to false), asked)
+    }
+
+    @Test
+    fun anIdentityRestoredWithAnOfferOpensOnItsDevices() {
+        rule.setContent {
+            MaterialTheme {
+                ConnectFlow(
+                    emptyList(),
+                    listOf(K0.copy(restored = RestoreOffer(lost = true))),
+                    emptyMap(),
+                    Restoring.Done(K0.fingerprint),
+                    null,
+                    false,
+                    { _, _, _, _ -> },
+                    {},
+                    { _, _, _, _, _, _, _ -> },
+                    {},
+                    {},
+                    { _, _ -> },
+                    Enrolling.Idle,
+                    {},
+                    { _, _, _, _ -> },
+                    { _, _ -> },
+                    {},
+                    {},
+                    setup = noActions,
+                    identitiesRead = true,
+                )
+            }
+        }
+        rule.onNode(hasText(text(R.string.devices_title, "alice@hl.example"))).assertExists()
+    }
+
+    @Test
+    fun anIdentityRestoredWithAnOfferOpensOnItsDevicesWhenItReachesTheListAfterTheRestoreIsDone() {
+        var identities by mutableStateOf(emptyList<StoredIdentity>())
+        rule.setContent {
+            MaterialTheme {
+                ConnectFlow(
+                    emptyList(),
+                    identities,
+                    emptyMap(),
+                    Restoring.Done(K0.fingerprint),
+                    null,
+                    false,
+                    { _, _, _, _ -> },
+                    {},
+                    { _, _, _, _, _, _, _ -> },
+                    {},
+                    {},
+                    { _, _ -> },
+                    Enrolling.Idle,
+                    {},
+                    { _, _, _, _ -> },
+                    { _, _ -> },
+                    {},
+                    {},
+                    setup = noActions,
+                    identitiesRead = true,
+                )
+            }
+        }
+        rule.waitForIdle()
+        identities = listOf(K0.copy(restored = RestoreOffer(lost = true)))
+        rule.onNode(hasText(text(R.string.devices_title, "alice@hl.example"))).assertExists()
     }
 
     @Test
@@ -156,6 +245,16 @@ class ConnectFlowTest {
         }
     }
 
+    /** Setup actions that do nothing, so the screens that need them are shown. */
+    private val noActions =
+        Proxy.newProxyInstance(SetupActions::class.java.classLoader, arrayOf(SetupActions::class.java)) { proxy, method, args ->
+            when (method.name) {
+                "equals" -> proxy === args?.get(0)
+                "hashCode" -> System.identityHashCode(proxy)
+                else -> null
+            }
+        } as SetupActions
+
     @Composable
     private fun Flow(rotations: Map<String, KeptRotation>) =
         MaterialTheme {
@@ -168,7 +267,7 @@ class ConnectFlowTest {
                 false,
                 { _, _, _, _ -> },
                 {},
-                { _, _, _, _, _, _ -> },
+                { _, _, _, _, _, _, _ -> },
                 {},
                 {},
                 { _, _ -> },

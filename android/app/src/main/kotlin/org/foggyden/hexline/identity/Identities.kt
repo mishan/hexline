@@ -80,6 +80,8 @@ data class StoredIdentity(
     val epoch: Long = 0,
     /** This phone's last reset of the identity's devices, as far as it knows it. */
     val reset: ResetKept? = null,
+    /** Restored to hold here, and not yet asked whether to sign out the devices its old phone set up. */
+    val restored: RestoreOffer? = null,
 ) {
     /** As held here, the model's word for it. */
     fun held(): StoredIdentity = copy(held = true)
@@ -87,6 +89,11 @@ data class StoredIdentity(
     /** The identity, in the form the core gives it: the only one to pass back. */
     val fingerprint: String get() = info.fingerprint
 }
+
+/** The offer a restore leaves: [lost], that the person said the old phone was lost, makes signing out the default. */
+data class RestoreOffer(
+    val lost: Boolean,
+)
 
 /**
  * A reset of an identity's devices made here: its epoch, what is left to
@@ -168,6 +175,7 @@ class Identities(
         unfinished: Boolean = false,
         rotatingFrom: String? = null,
         rotation: ByteArray? = null,
+        restored: RestoreOffer? = null,
     ): StoredIdentity =
         synchronized(LOCK) {
             val info = certForDevice(cert, card, seed)
@@ -196,6 +204,8 @@ class Identities(
                     epoch = maxOf(info.epoch.toLong(), before?.epoch ?: 0),
                     // A reset is the identity's: another device of it here still has one to finish.
                     reset = before?.reset,
+                    // Unanswered, it stands through every save; a second restore makes it no less urgent.
+                    restored = restored?.let { RestoreOffer(it.lost || before?.restored?.lost == true) } ?: before?.restored,
                 )
             write(file, stored)
             before?.let { old ->
@@ -374,13 +384,22 @@ class Identities(
             val info = certInfo(cert, stored.card, stored.info.device, stored.info.deviceEnc)
             val swap = stored.cert.contentEquals(replacing) || stored.info.epoch < info.epoch
             val cleared = reset.copy(underWay = null, unread = false)
+            // A restore's offer is answered by any reset whose outcome is kept.
             val done =
                 if (swap) {
-                    stored.copy(cert = cert, info = info, renewTried = 0, noHolder = false, reset = cleared)
+                    stored.copy(cert = cert, info = info, renewTried = 0, noHolder = false, reset = cleared, restored = null)
                 } else {
-                    stored.copy(reset = cleared)
+                    stored.copy(reset = cleared, restored = null)
                 }
             done.also { write(file, it) }
+        }
+
+    /** [fingerprint]'s restore offer answered without a reset, or left where the key is not held to reset with. */
+    fun restoreOfferDone(fingerprint: String): Unit =
+        synchronized(LOCK) {
+            val file = file(fingerprint)
+            val stored = load(file)?.takeIf { it.restored != null } ?: return
+            write(file, stored.copy(restored = null))
         }
 
     /**
@@ -734,12 +753,18 @@ class Identities(
      * back: each device revoked in them, at the higher epoch where the list
      * has it too, each key seen revoked, a listed device among them marked,
      * and each key certified. The copies stay where the list does not hold
-     * it all after.
+     * it all after, and, with [onlyIfWhole], where any of them cannot be
+     * read whole.
      */
-    fun discardUnread(fingerprint: String): Unit =
+    fun discardUnread(
+        fingerprint: String,
+        onlyIfWhole: Boolean = false,
+    ): Unit =
         synchronized(LOCK) {
             // Only the copies read here go: one the list is set aside into meanwhile was not.
             val copies = unread(fingerprint)
+            // Judged by the copies it would delete, under the same lock: one set aside since a look elsewhere is judged too.
+            if (onlyIfWhole && copies.any { !salvaged(it).whole }) return
             val salvaged = copies.map { salvaged(it) }
             val carried = salvaged.flatMap { it.revoked }
             val seen = distinct(salvaged.flatMap { it.seen })
@@ -1060,6 +1085,8 @@ class Identities(
                 rotation = json.optString("rotation").ifEmpty { null }?.let(::unb64),
                 epoch = json.optLong("epoch"),
                 reset = json.opt("reset")?.let(::resetOf),
+                // One that does not read is offered as after a lost phone: signing out is the safer default.
+                restored = json.opt("restored")?.let { (it as? JSONObject)?.opt("lost") as? Boolean ?: true }?.let(::RestoreOffer),
             )
         } catch (_: Exception) {
             null
@@ -1147,6 +1174,7 @@ class Identities(
                     stored.rotation?.let { put("rotation", b64(it)) }
                     if (stored.epoch != 0L) put("epoch", stored.epoch)
                     stored.reset?.let { put("reset", resetJson(it)) }
+                    stored.restored?.let { put("restored", JSONObject().put("lost", it.lost)) }
                 }
         commit(file, json.toString().toByteArray())
     }

@@ -1,8 +1,13 @@
 package org.foggyden.hexline.chat
 
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.getBoundsInRoot
 import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isDialog
@@ -14,6 +19,8 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.foggyden.hexline.R
+import org.foggyden.hexline.core.Caps
+import org.foggyden.hexline.core.HolderRequest
 import org.foggyden.hexline.core.NotYet
 import org.foggyden.hexline.core.NotYetReset
 import org.foggyden.hexline.identity.Certifying
@@ -22,6 +29,8 @@ import org.foggyden.hexline.identity.MintedDevice
 import org.foggyden.hexline.identity.ResetKept
 import org.foggyden.hexline.identity.ResetShown
 import org.foggyden.hexline.identity.Resetting
+import org.foggyden.hexline.identity.RestoreOffer
+import org.foggyden.hexline.identity.Revoked
 import org.foggyden.hexline.identity.Revoking
 import org.foggyden.hexline.identity.SetupProblem
 import org.junit.Assert.assertEquals
@@ -71,10 +80,12 @@ class DevicesResetScreenTest {
     private fun show(
         devices: DeviceList,
         resetting: Resetting = Resetting.Idle,
+        certifying: Certifying = Certifying.Idle,
+        revoking: Revoking = Revoking.Idle,
     ) {
         rule.setContent {
             MaterialTheme {
-                DevicesScreen("fp", "alice@hl.example", "mail.example", devices, Certifying.Idle, Revoking.Idle, actions, resetting) {}
+                DevicesScreen("fp", "alice@hl.example", "mail.example", devices, certifying, revoking, actions, resetting) {}
             }
         }
     }
@@ -199,5 +210,101 @@ class DevicesResetScreenTest {
         rule.onNodeWithText(text(R.string.renew)).performScrollTo().performClick()
         rule.waitForIdle()
         assertEquals(listOf("fp"), asked.single { it.first == "renew" }.second)
+    }
+
+    /** Each way a reset is started from the screen, and the list it shows on: every one asks for the same reset. */
+    @Test
+    fun everyWayToResetAsksForTheSameReset() {
+        val ways =
+            listOf(
+                Triple("the button", list(), text(R.string.reset_devices)),
+                Triple("beside a list set aside", list().copy(setAside = true), text(R.string.reset_devices)),
+                Triple("again", list(ResetKept(epoch = 1, unreset = listOf("https://ahead.example"))), text(R.string.reset_again)),
+            )
+        var shown by mutableStateOf(ways.first().second)
+        rule.setContent {
+            MaterialTheme {
+                DevicesScreen("fp", "alice@hl.example", "mail.example", shown, Certifying.Idle, Revoking.Idle, actions) {}
+            }
+        }
+        for ((way, devices, button) in ways) {
+            shown = devices
+            rule.waitForIdle()
+            asked.clear()
+            // The first such button on the screen: beside the list set aside, where it is, as well as below.
+            if (devices.setAside) rule.onAllNodesWithText(button).assertCountEquals(2)
+            rule.onAllNodesWithText(button)[0].performScrollTo().performClick()
+            inDialog(text(R.string.reset_devices)).performClick()
+            rule.waitForIdle()
+            assertEquals(way, listOf("fp"), asked.single { it.first == "resetDevices" }.second)
+        }
+    }
+
+    @Test
+    fun aRestoresOfferLeadsWithSigningOutOnlyWhereTheOldPhoneWasLost() {
+        var lost by mutableStateOf(true)
+        rule.setContent {
+            MaterialTheme {
+                DevicesScreen(
+                    "fp",
+                    "alice@hl.example",
+                    "mail.example",
+                    list().copy(restored = RestoreOffer(lost)),
+                    Certifying.Idle,
+                    Revoking.Idle,
+                    actions,
+                ) {
+                }
+            }
+        }
+        for (was in listOf(true, false)) {
+            lost = was
+            rule.waitForIdle()
+            asked.clear()
+            shows(text(R.string.restore_reset_title))
+            val yes = rule.onNodeWithText(text(R.string.restore_reset_yes)).performScrollTo()
+            val no = rule.onNodeWithText(text(R.string.restore_reset_no))
+            assertEquals("lost $lost: the default first", lost, yes.getBoundsInRoot().left < no.getBoundsInRoot().left)
+            yes.performClick()
+            no.performClick()
+            rule.waitForIdle()
+            assertEquals(listOf("resetDevices", "declineRestoreReset"), asked.map { it.first }.filter { it != "openDevices" })
+            assertEquals(listOf(listOf<Any?>("fp"), listOf<Any?>("fp")), asked.filter { it.first != "openDevices" }.map { it.second })
+        }
+    }
+
+    @Test
+    fun aRestoresOfferWaitsWhileSomethingElseIsUnderWayAndGivesWayToAResetThatMayNotHaveFinished() {
+        show(list().copy(restored = RestoreOffer(true)), revoking = Revoking.Working("fp"))
+        shows(text(R.string.restore_reset_wait))
+        rule.onNodeWithText(text(R.string.restore_reset_yes)).assertIsNotEnabled()
+    }
+
+    @Test
+    fun aRestoresOfferIsNotAskedBesideAResetThatMayNotHaveFinished() {
+        show(list(ResetKept(underWay = 1)).copy(restored = RestoreOffer(true)))
+        shows(text(R.string.reset_again))
+        rule.onNodeWithText(text(R.string.restore_reset_title)).assertDoesNotExist()
+    }
+
+    @Test
+    fun aRequestThatCannotBeJudgedForAListSetAsideNamesBothWaysOut() {
+        val device = ByteArray(32) { 7 }
+        val request =
+            HolderRequest(
+                device,
+                "TAB-FP",
+                "Tablet",
+                false,
+                false,
+                null,
+                null,
+                Caps(login = true, message = true, manage = false, vouch = false),
+                true,
+                86_400uL,
+            )
+        show(list().copy(setAside = true), certifying = Certifying.Asked("fp", request, Revoked.Unknown))
+        shows(text(R.string.certify_revoked_unknown))
+        shows(text(R.string.devices_discard_unreadable))
     }
 }

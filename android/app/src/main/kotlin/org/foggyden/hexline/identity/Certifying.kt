@@ -137,6 +137,8 @@ data class DeviceList(
     val reset: ResetKept? = null,
     /** The registrar the identity is kept at, which a reset is made at with those its card names. */
     val registrar: String? = null,
+    /** A restore's unanswered offer to reset, while this phone holds the key to make it. */
+    val restored: RestoreOffer? = null,
 ) {
     /** Whether [device] is revoked, as this phone marked it or as the registrars publish it. */
     fun revoked(device: MintedDevice) = device.revoked || standing[device.fingerprint] == DeviceStanding.REVOKED

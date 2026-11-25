@@ -125,6 +125,8 @@ fun setupActions(
 
     override fun resetDevices(fingerprint: String) = chat.resetDevices(fingerprint, authorizer)
 
+    override fun declineRestoreReset(fingerprint: String) = chat.declineRestoreReset(fingerprint)
+
     override fun resettingSeen() = chat.resettingSeen()
 }
 
@@ -161,8 +163,8 @@ fun Hexline(
                 connecting = link == Link.Connecting,
                 onConnect = chat::connect,
                 onForget = chat::forget,
-                onRestore = { registrar, handle, kind, secret, deviceName, hold ->
-                    chat.restore(registrar, handle, kind, secret, deviceName, authorizer.takeIf { hold })
+                onRestore = { registrar, handle, kind, secret, deviceName, hold, lost ->
+                    chat.restore(registrar, handle, kind, secret, deviceName, authorizer.takeIf { hold }, lost)
                 },
                 onRestoreSeen = chat::restoreSeen,
                 onDelete = chat::deleteIdentity,
