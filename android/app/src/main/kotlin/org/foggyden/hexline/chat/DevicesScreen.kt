@@ -322,26 +322,29 @@ private fun ResetLines(
     reset: ResetShown,
     kept: ResetKept?,
 ) {
-    // What retries have come to since, as kept: a registrar in none of its lists has taken it.
+    // What retries have come to since, as kept: each registrar as it said, never as one missing from a list.
     val owed = kept?.let { it.pending + it.unreset + it.givenUp }
-    val (since, notDone) = reset.notDone.partition { it.why != NotYet.OVERTAKEN && owed != null && it.registrar !in owed }
-    val done = reset.done + since.map { it.registrar }
+    val done = (reset.done + kept?.done.orEmpty()).distinct()
+    val noRegistrar = (reset.notRegistrars + kept?.notRegistrars.orEmpty()).distinct()
+    val past = kept?.overtaken.orEmpty()
+    val notDone = reset.notDone.filter { it.registrar !in done && it.registrar !in noRegistrar }
     // Signed out only where a registrar took it, or another holder's reset went past it.
     val headline =
         when {
             done.isNotEmpty() -> R.string.reset_done
-            notDone.any { it.why == NotYet.OVERTAKEN } -> R.string.reset_reset_past
+            notDone.any { it.why == NotYet.OVERTAKEN || it.registrar in past } -> R.string.reset_reset_past
             else -> R.string.reset_reached_none
         }
     Text(stringResource(headline))
     for (r in done) Text(stringResource(R.string.reset_at, hostOf(r)))
     for (n in notDone) {
         when (n.registrar) {
+            in past -> Text(stringResource(R.string.reset_overtaken, hostOf(n.registrar)))
             in kept?.givenUp.orEmpty() -> Text(stringResource(R.string.reset_gave_up, hostOf(n.registrar)))
             else -> Text(notYet(n, n.registrar in (kept?.pending ?: reset.later)))
         }
     }
-    for (r in reset.notRegistrars) Text(stringResource(R.string.reset_not_a_registrar, hostOf(r)))
+    for (r in noRegistrar) Text(stringResource(R.string.reset_not_a_registrar, hostOf(r)))
     StillSignedIn(owed ?: notDone.filter { it.why != NotYet.OVERTAKEN }.map { it.registrar })
 }
 

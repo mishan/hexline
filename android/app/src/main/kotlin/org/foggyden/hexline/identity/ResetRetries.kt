@@ -170,20 +170,24 @@ class ResetRetrier(
         return maxOf(0, kept.retryAt - now())
     }
 
-    /** [kept] as [r] leaves it: a registrar done no longer counted unreached, and one dropped from the retry counted so. */
+    /** [kept] as [r] leaves it: each registrar's outcome as it said, a settled one counted unreached no more, and one dropped from the retry counted so. */
     private fun after(
         kept: ResetKept,
         r: ResetRetried,
     ): ResetKept {
         val left = r.notDone.filter { it.registrar !in r.later && it.why != NotYet.OVERTAKEN }
         val (gaveUp, refused) = left.partition { it.why == NotYet.GAVE_UP }
-        val reached = (r.done + r.notRegistrars + r.notDone.filter { it.why == NotYet.OVERTAKEN }.map { it.registrar }).toSet()
+        val overtaken = r.notDone.filter { it.why == NotYet.OVERTAKEN }.map { it.registrar }
+        val settled = (r.done + r.notRegistrars + overtaken).toSet()
         return kept.copy(
             retry = r.retry,
             retryAt = r.retryIn?.let { now() + it.toLong() } ?: 0,
             pending = r.later,
-            unreset = (kept.unreset + refused.map { it.registrar }).distinct() - reached,
-            givenUp = (kept.givenUp + gaveUp.map { it.registrar }).distinct() - reached,
+            unreset = (kept.unreset + refused.map { it.registrar }).distinct() - settled,
+            givenUp = (kept.givenUp + gaveUp.map { it.registrar }).distinct() - settled,
+            done = (kept.done + r.done).distinct(),
+            overtaken = (kept.overtaken + overtaken).distinct(),
+            notRegistrars = (kept.notRegistrars + r.notRegistrars).distinct(),
         )
     }
 

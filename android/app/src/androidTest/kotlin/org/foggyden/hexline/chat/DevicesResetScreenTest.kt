@@ -162,10 +162,20 @@ class DevicesResetScreenTest {
         val down = listOf(NotYetReset("https://down.example", NotYet.UNREACHABLE, null, null))
         val shown = ResetShown(listOf("https://hl.example"), down, emptyList(), listOf("https://down.example"))
         // What the reset came to as it was made, and what a retry has kept since.
-        show(list(ResetKept(epoch = 1)), Resetting.Done("fp", shown))
+        show(list(ResetKept(epoch = 1, done = listOf("https://hl.example", "https://down.example"))), Resetting.Done("fp", shown))
         shows(text(R.string.reset_at, "down.example"))
         rule.onAllNodesWithText(text(R.string.reset_unreachable, "down.example")).assertCountEquals(0)
         rule.onAllNodesWithText(text(R.string.reset_still_signed_in, "down.example")).assertCountEquals(0)
+    }
+
+    @Test
+    fun aRegistrarARetryFoundIsNoRegistrarIsToldSoAndNotAsReset() {
+        val down = listOf(NotYetReset("https://down.example", NotYet.UNREACHABLE, null, null))
+        val shown = ResetShown(listOf("https://hl.example"), down, emptyList(), listOf("https://down.example"))
+        val kept = ResetKept(epoch = 1, done = listOf("https://hl.example"), notRegistrars = listOf("https://down.example"))
+        show(list(kept), Resetting.Done("fp", shown))
+        shows(text(R.string.reset_not_a_registrar, "down.example"))
+        rule.onAllNodesWithText(text(R.string.reset_at, "down.example")).assertCountEquals(0)
     }
 
     @Test

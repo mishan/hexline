@@ -283,6 +283,51 @@ class ResetDevicesTest : ViewModelHarness() {
     }
 
     @Test
+    fun aReadThatAnswersAsAResetComesBackKeepsNoWholeRead() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        val other = heldHere(vm)
+        val held = CompletableDeferred<Unit>()
+        setups.standingWaits = held
+        vm.openDevices(fingerprint)
+        settle()
+        setups.standingWaits = null
+        // The screen on another identity, so nothing reads this one again after the reset.
+        vm.openDevices(other)
+        settle()
+        vm.resetDevices(fingerprint, stores.keys.authorizer())
+        // Up to the reset's return, what it came to asked of the store and not yet kept.
+        while (true) {
+            onMain()
+            if (setups.resets.isNotEmpty()) break
+            onDisk()
+        }
+        // It answers now, its turn on the store behind what the reset came to.
+        held.complete(Unit)
+        settle()
+        assertTrue(vm.resetting.value is Resetting.Done)
+        assertNull(outside { identities.lastRead(fingerprint) })
+    }
+
+    @Test
+    fun aRegistrarARetryFindsIsNoRegistrarIsKeptSoAndNotAsReset() {
+        val vm = model()
+        settle()
+        val fingerprint = heldHere(vm)
+        downAtReset()
+        reset(vm, fingerprint)
+        now += 900
+        setups.retryAnswers += { retried(1, emptyList(), notDone = emptyList()).copy(notRegistrars = listOf("other.example")) }
+        retry(fingerprint)
+        settle()
+        val reset = checkNotNull(kept(fingerprint).reset)
+        assertEquals(listOf("other.example"), reset.notRegistrars)
+        assertEquals("only what the registrars said was done", listOf("reg.example"), reset.done)
+        assertEquals(emptyList<String>(), reset.pending)
+    }
+
+    @Test
     fun aRetryIsMadeOnlyWithANetwork() {
         val request = WorkResetRetries.request("fp", 900)
         assertEquals(NetworkType.CONNECTED, request.workSpec.constraints.requiredNetworkType)

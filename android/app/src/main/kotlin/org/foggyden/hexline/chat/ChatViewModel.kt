@@ -1599,6 +1599,10 @@ class ChatViewModel internal constructor(
             if (noted && e.code in BEFORE_POSTING) withContext(NonCancellable + store) { stored { identities.resetNotBegun(fingerprint) } }
             throw e
         } finally {
+            // A read of the records begun before the reset answers for a floor it may not know: it is
+            // overtaken before what the reset came to is asked of the store, so one that answers now
+            // finds itself overtaken however its turn on the store falls.
+            if (begun) standingReads[fingerprint] = (standingReads[fingerprint] ?: 0) + 1
             var unkept = false
             withContext(NonCancellable + store) {
                 got?.let { r ->
@@ -1611,6 +1615,9 @@ class ChatViewModel internal constructor(
                             r.retryIn?.let { now() + it.toLong() } ?: 0,
                             r.later,
                             unreset,
+                            done = r.done,
+                            overtaken = r.notDone.filter { it.why == NotYet.OVERTAKEN }.map { it.registrar },
+                            notRegistrars = r.notRegistrars,
                         )
                     try {
                         identities.resetDone(fingerprint, r.cert, kept.cert, outcome)
@@ -1625,8 +1632,6 @@ class ChatViewModel internal constructor(
                 if (begun) absorbing(fingerprint, null)
                 publishIdentities()
             }
-            // A read of the records begun before the reset answers for a floor it may not know: it is overtaken.
-            if (begun) standingReads[fingerprint] = (standingReads[fingerprint] ?: 0) + 1
             if (unkept) throw ResetUnkept()
         }
     }

@@ -162,9 +162,10 @@ pub struct ResetRetried {
     pub retry_in: Option<u64>,
     /// As [`DevicesReset::later`], those not due counted among them.
     pub later: Vec<String>,
-    /// Seconds before the last of `retry`'s registrars is due: where this
-    /// outcome is not kept and the retry posted is posted again, no sooner,
-    /// so none is asked before the wait it was given.
+    /// Seconds before the last registrar the retry posted is due again, each
+    /// it asked and was not done at counted, given up on or dropped too:
+    /// where this outcome is not kept and that retry is posted again, no
+    /// sooner, so none is asked before the wait it was given.
     pub retry_last_in: Option<u64>,
 }
 
@@ -1306,6 +1307,7 @@ async fn retry_all<D: Desk>(
         later: Vec::new(),
         retry_last_in: None,
     };
+    let mut asked_last: Option<u64> = None;
     for (mut chain, (listed, caught)) in caught {
         out.published = out.published.max(listed);
         match caught {
@@ -1313,6 +1315,12 @@ async fn retry_all<D: Desk>(
             Caught::NotARegistrar => out.not_registrars.push(chain.registrar),
             Caught::NotDone(r) => {
                 chain.tries = chain.tries.saturating_add(1);
+                let wait = wait_of(r.retry_after).max(backoff(chain.tries));
+                // The retry posted still asks it, given up on here or not, until this is kept; one
+                // another holder took past the epoch has nothing left to be asked.
+                if r.why != NotYet::Overtaken {
+                    asked_last = asked_last.max(Some(wait));
+                }
                 let gave_up = waits(&r) && given_up(&chain, at);
                 out.not_done.push(NotYetReset {
                     registrar: chain.registrar.clone(),
@@ -1321,7 +1329,6 @@ async fn retry_all<D: Desk>(
                     retry_after: r.retry_after,
                 });
                 if waits(&r) && !gave_up {
-                    let wait = wait_of(r.retry_after).max(backoff(chain.tries));
                     chain.due = at.saturating_add(wait);
                     left.push(chain);
                 }
@@ -1329,7 +1336,7 @@ async fn retry_all<D: Desk>(
         }
     }
     out.retry_in = retry_in(&left, at);
-    out.retry_last_in = retry_last_in(&left, at);
+    out.retry_last_in = retry_last_in(&left, at).max(asked_last);
     out.later = left.iter().map(|c| c.registrar.clone()).collect();
     out.retry = encode(&Retry {
         chains: left,
@@ -2446,6 +2453,8 @@ mod tests {
         done: &[&str],
         not_done: Vec<NotYetReset>,
     ) -> ResetRetried {
+        // Each registrar asked and not done is left the backoff's first wait at least.
+        let asked = not_done.iter().any(|n| n.why != NotYet::Overtaken);
         ResetRetried {
             epoch,
             published,
@@ -2455,7 +2464,7 @@ mod tests {
             retry: None,
             retry_in: None,
             later: vec![],
-            retry_last_in: None,
+            retry_last_in: asked.then_some(RETRY_EVERY),
         }
     }
 
@@ -3111,6 +3120,32 @@ mod tests {
         kept.chains.push(r1);
         let at = now();
         let got = retry_at(&kept, &mut [&mut slow, &mut down], at).await;
+        assert_eq!(
+            (got.retry_in, got.retry_last_in),
+            (Some(RETRY_EVERY), Some(RETRY_MOST))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_registrar_given_up_on_asking_to_be_left_counts_toward_when_the_last_is_due() {
+        // Its last try, a week on, asking to be left a day.
+        let mut slow = Sim {
+            limited_reads: Some(RETRY_MOST),
+            ..Sim::default()
+        };
+        let mut down = Sim {
+            unreachable: true,
+            ..Sim::default()
+        };
+        let mut kept = for_r0(1, Current::default(), vec![]);
+        kept.chains[0].tries = TRIES_LEAST - 1;
+        let mut r1 = kept.chains[0].clone();
+        (r1.registrar, r1.tries) = ("r1".into(), 0);
+        kept.chains.push(r1);
+        let at = kept.chains[0].records[0].time + RETRY_FOR + 1;
+        let got = retry_at(&kept, &mut [&mut slow, &mut down], at).await;
+        assert_eq!(got.not_done[0].why, NotYet::GaveUp);
+        assert_eq!(got.later, vec!["r1".to_string()]);
         assert_eq!(
             (got.retry_in, got.retry_last_in),
             (Some(RETRY_EVERY), Some(RETRY_MOST))

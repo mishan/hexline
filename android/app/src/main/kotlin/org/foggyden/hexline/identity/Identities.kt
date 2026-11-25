@@ -100,6 +100,12 @@ data class ResetKept(
     val unreset: List<String> = emptyList(),
     /** Of the registrars no retry will reach, those retried until they were given up on. */
     val givenUp: List<String> = emptyList(),
+    /** Registrars whose list shows the reset, as each said: never taken from one missing elsewhere. */
+    val done: List<String> = emptyList(),
+    /** Registrars another holder's reset went past this one at, as each said. */
+    val overtaken: List<String> = emptyList(),
+    /** Origins that answered as no registrar, as each did. */
+    val notRegistrars: List<String> = emptyList(),
     /**
      * When a reset was begun whose outcome is not kept: it may have posted
      * anything, so the screen offers another. Null when none is.
@@ -1090,6 +1096,9 @@ class Identities(
                 pending = names("pending"),
                 unreset = names("unreset"),
                 givenUp = names("given_up"),
+                done = names("done"),
+                overtaken = names("overtaken"),
+                notRegistrars = names("not_registrars"),
                 underWay = part("under_way", null) { json.getLong("under_way") },
             )
         return reset.copy(unread = unread || json.optBoolean("unread"))
@@ -1103,6 +1112,9 @@ class Identities(
             if (reset.pending.isNotEmpty()) put("pending", JSONArray(reset.pending))
             if (reset.unreset.isNotEmpty()) put("unreset", JSONArray(reset.unreset))
             if (reset.givenUp.isNotEmpty()) put("given_up", JSONArray(reset.givenUp))
+            if (reset.done.isNotEmpty()) put("done", JSONArray(reset.done))
+            if (reset.overtaken.isNotEmpty()) put("overtaken", JSONArray(reset.overtaken))
+            if (reset.notRegistrars.isNotEmpty()) put("not_registrars", JSONArray(reset.notRegistrars))
             reset.underWay?.let { put("under_way", it) }
             if (reset.unread) put("unread", true)
         }
